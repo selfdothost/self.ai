@@ -101,12 +101,17 @@
 
       git add -A
       if git diff --cached --quiet; then
-        echo "no changes since last sync — nothing to push"
-        exit 0
+        echo "no local changes since last sync — committing nothing, but still"
+        echo "pushing both remotes below (idempotent) in case a prior run"
+        echo "landed on one remote and not the other (e.g. GitHub rejected a"
+        echo "push a GitLab push already succeeded for)."
+      else
+        git commit -m "sync: mirror main@$(git rev-parse --short origin/main) to public-alpha"
       fi
 
-      git commit -m "sync: mirror main@$(git rev-parse --short origin/main) to public-alpha"
-
+      # Always push to both remotes, even with nothing new to commit — see
+      # above. A push to an already-up-to-date remote is a harmless no-op.
+      #
       # Push as the selfai-publish bot (group access token, Developer role,
       # write_repository only) — NOT CI_JOB_TOKEN, which can't push to a
       # protected branch here. public-alpha's protected-branch push access is
