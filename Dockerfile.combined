@@ -1,0 +1,27 @@
+# syntax=docker/dockerfile:1
+# Combined image — the self.ai API backend serving the built self.chat SPA from
+# ONE container. This is the easy single-container on-ramp ("just plug it in").
+# It is assembled on top of the two split images, so it stays in lock-step with
+# them and adds no app code.
+#
+# selfai_ui mounts the SPA at `/` whenever FRONTEND_BUILD_DIR (/app/build) exists
+# (see api/selfai_ui/env.py + main.py); otherwise it "Serves API only". We simply
+# drop the built frontend at /app/build.
+#
+# Build (from the two published images, the default):
+#   docker build -f Dockerfile.combined -t selfdothost/self.ai:combined .
+# Build against local/other tags:
+#   docker build -f Dockerfile.combined \
+#     --build-arg API_IMAGE=... --build-arg CHAT_IMAGE=... -t self.ai:combined .
+
+ARG API_IMAGE=ghcr.io/selfdothost/self.ai/api:latest
+ARG CHAT_IMAGE=ghcr.io/selfdothost/self.chat:latest
+
+# Frontend source: the self.chat image already contains the static build.
+FROM ${CHAT_IMAGE} AS chat
+
+# Base: the api image, unchanged (uvicorn on 8080, CMD/HEALTHCHECK inherited).
+FROM ${API_IMAGE} AS combined
+COPY --from=chat /usr/share/nginx/html /app/build
+# No CMD/EXPOSE override — inherited from the api image. With /app/build present,
+# selfai_ui serves the UI at / and the API under the same origin.

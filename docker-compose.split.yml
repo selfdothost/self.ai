@@ -1,0 +1,43 @@
+# Split deployment — api + self.chat as separate services behind a small
+# reverse proxy that serves them same-origin (so the SPA's relative /api calls
+# work with no CORS).
+#
+#   cp .env.example .env    # then set WEBUI_SECRET_KEY
+#   docker compose -f docker-compose.split.yml up
+#
+# Open http://localhost:3000
+
+services:
+  api:
+    image: ghcr.io/selfdothost/self.ai/api:latest
+    # build: ./api        # to build from source instead
+    environment:
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:?set WEBUI_SECRET_KEY in your .env}
+      # DATABASE_URL unset -> local SQLite under the data volume.
+      # Add provider keys/URLs as needed (see docs/config-reference.md).
+    volumes:
+      - api-data:/app/backend/data
+    expose:
+      - "8080"
+    restart: unless-stopped
+
+  chat:
+    image: ghcr.io/selfdothost/self.chat:latest
+    # build: ../self.chat # to build from source (requires the self.chat repo)
+    expose:
+      - "8080"
+    restart: unless-stopped
+
+  proxy:
+    image: nginx:1.27-alpine
+    depends_on:
+      - api
+      - chat
+    ports:
+      - "3000:8080"
+    volumes:
+      - ./deploy/proxy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    restart: unless-stopped
+
+volumes:
+  api-data:

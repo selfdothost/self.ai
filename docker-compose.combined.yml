@@ -1,0 +1,27 @@
+# Combined single-container deployment — the easiest way to try self.ai.
+# One image serves the API and the web UI together.
+#
+#   cp .env.example .env    # then set WEBUI_SECRET_KEY
+#   docker compose -f docker-compose.combined.yml up
+#
+# Open http://localhost:3000
+
+services:
+  selfai:
+    image: ghcr.io/selfdothost/self.ai/combined:latest
+    # To build locally instead of pulling:
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile.combined
+    environment:
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:?set WEBUI_SECRET_KEY in your .env}
+      # DATABASE_URL unset -> local SQLite under the data volume.
+      # Add provider keys/URLs as needed (see docs/config-reference.md).
+    volumes:
+      - selfai-data:/app/backend/data
+    ports:
+      - "3000:8080"
+    restart: unless-stopped
+
+volumes:
+  selfai-data:

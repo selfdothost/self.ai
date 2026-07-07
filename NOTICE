@@ -1,0 +1,38 @@
+self.ai
+Copyright (C) 2026 selfdothost / the self.ai contributors
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License version 3, as published by the Free
+Software Foundation. The full text is in LICENSE.
+
+--------------------------------------------------------------------------------
+Retained upstream notice
+--------------------------------------------------------------------------------
+
+self.ai's API + web client are a hard fork of Open-WebUI v0.5.4 — the last
+MIT-licensed release. The original MIT-licensed portions are retained under the
+license below. The combined work and all self.ai additions are licensed under
+GPLv3 (see LICENSE). self.ai is not affiliated with, endorsed by, or connected
+to the Open-WebUI project. See DIVERGENCE.md for the full fork record.
+
+MIT License
+
+Copyright (c) 2023 Timothy Jaeryang Baek
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

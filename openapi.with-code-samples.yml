@@ -1,0 +1,746 @@
+openapi: 3.0.3
+info:
+  title: OpenAI API (Unofficial Swagger Template)
+  version: "2026-02-16"
+  description: >
+    Swagger-ready OpenAPI spec for common OpenAI endpoints.
+    This is a pragmatic template (not an official full schema). Unknown fields are allowed.
+
+servers:
+  - url: https://api.openai.com/v1
+
+tags:
+  - name: Models
+  - name: Responses
+  - name: Chat
+  - name: Embeddings
+  - name: Images
+  - name: Audio
+  - name: Moderations
+  - name: Files
+  - name: Uploads
+
+security:
+  - bearerAuth: []
+
+paths:
+  /models:
+    get:
+      tags: [Models]
+      operationId: listModels
+      summary: List models
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelsList"
+        default:
+          $ref: "#/components/responses/ErrorResponse"
+
+  /models/{model}:
+    get:
+      tags: [Models]
+      operationId: retrieveModel
+      summary: Retrieve a model
+      parameters:
+        - name: model
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Model"
+        default:
+          $ref: "#/components/responses/ErrorResponse"
+
+  /responses:
+    post:
+      tags: [Responses]
+      operationId: createResponse
+      summary: Create a model response
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResponseCreateRequest"
+            examples:
+              basic:
+                value:
+                  model: gpt-4.1-mini
+                  input: "Say hello in one sentence."
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResponseObject"
+        default:
+          $ref: "#/components/responses/ErrorResponse"
+
+  /responses/{response_id}:
+    get:
+      tags: [Responses]
+      operationId: getResponse
+      summary: Get a model response
+      parameters:
+        - name: response_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResponseObject"
+        default:
+          $ref: "#/components/responses/ErrorResponse"
+    delete:
+      tags: [Responses]
+      operationId: deleteResponse
+      summary: Delete a model response
+      parameters:
+        - name: response_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeleteObject"
+        default:
+          $ref: "#/components/responses/ErrorResponse"
+
+  /responses/{response_id}/cancel:
+    post:
+      tags: [Responses]
+      operationId: cancelResponse
+      summary: Cancel a model response (background responses only)
+      parameters:
+        - name: response_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Cancelled
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResponseObject"
+        default:
+          $ref: "#/components/responses/ErrorResponse"
+
+  /chat/completions:
+    post:
+      tags: [Chat]
+      operationId: createChatCompletion
+      summary: Create a chat completion (legacy-style)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatCompletionCreateRequest"
+            examples:
+              basic:
+                value:
+                  model: gpt-4.1-mini
+                  messages:
+                    - role: system
+                      content: "You are helpful."
+                    - role: user
+                      content: "Write a haiku about Ceph."
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatCompletionObject"
+        default:
+          $ref: "#/components/responses/ErrorResponse"
+
+  /embeddings:
+    post:
+      tags: [Embeddings]
+      operationId: createEmbeddings
+      summary: Create embeddings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmbeddingsCreateRequest"
+            examples:
+              basic:
+                value:
+                  model: text-embedding-3-large
+                  input: "Hello world"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EmbeddingsResponse"
+        default:
+          $ref: "#/components/responses/ErrorResponse"
+
+  /images/generations:
+    post:
+      tags: [Images]
+      operationId: createImage
+      summary: Create an image
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ImageGenerateRequest"
+            examples:
+              basic:
+                value:
+                  model: gpt-image-1
+                  prompt: "A minimalist diagram of a Kubernetes cluster, flat design."
+                  size: "1024x1024"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImagesResponse"
+        default:
+          $ref: "#/components/responses/ErrorResponse"
+
+  /audio/transcriptions:
+    post:
+      tags: [Audio]
+      operationId: createTranscription
+      summary: Create a transcription
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/AudioTranscriptionRequest"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        default:
+          $ref: "#/components/responses/ErrorResponse"
+
+  /moderations:
+    post:
+      tags: [Moderations]
+      operationId: createModeration
+      summary: Create a moderation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ModerationCreateRequest"
+            examples:
+              basic:
+                value:
+                  model: omni-moderation-latest
+                  input: "Some text to classify."
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        default:
+          $ref: "#/components/responses/ErrorResponse"
+
+  /files:
+    get:
+      tags: [Files]
+      operationId: listFiles
+      summary: List files
+      parameters:
+        - name: after
+          in: query
+          required: false
+          schema: { type: string }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 10000 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FileList"
+        default:
+          $ref: "#/components/responses/ErrorResponse"
+    post:
+      tags: [Files]
+      operationId: createFile
+      summary: Upload a file
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/FileCreateRequest"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FileObject"
+        default:
+          $ref: "#/components/responses/ErrorResponse"
+
+  /files/{file_id}:
+    get:
+      tags: [Files]
+      operationId: retrieveFile
+      summary: Retrieve a file
+      parameters:
+        - name: file_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FileObject"
+        default:
+          $ref: "#/components/responses/ErrorResponse"
+    delete:
+      tags: [Files]
+      operationId: deleteFile
+      summary: Delete a file
+      parameters:
+        - name: file_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeleteObject"
+        default:
+          $ref: "#/components/responses/ErrorResponse"
+
+  /files/{file_id}/content:
+    get:
+      tags: [Files]
+      operationId: retrieveFileContent
+      summary: Retrieve file content
+      parameters:
+        - name: file_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Raw file content
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        default:
+          $ref: "#/components/responses/ErrorResponse"
+
+  /uploads:
+    post:
+      tags: [Uploads]
+      operationId: createUpload
+      summary: Create an upload (multipart upload workflow)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UploadCreateRequest"
+            examples:
+              basic:
+                value:
+                  filename: "dataset.jsonl"
+                  bytes: 123456
+                  mime_type: "application/jsonl"
+                  purpose: "fine-tune"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadObject"
+        default:
+          $ref: "#/components/responses/ErrorResponse"
+
+  /uploads/{upload_id}/cancel:
+    post:
+      tags: [Uploads]
+      operationId: cancelUpload
+      summary: Cancel an upload
+      parameters:
+        - name: upload_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Cancelled
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadObject"
+        default:
+          $ref: "#/components/responses/ErrorResponse"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: "API key"
+
+  responses:
+    ErrorResponse:
+      description: Error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+
+  schemas:
+    ErrorEnvelope:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            message: { type: string }
+            type: { type: string }
+            param: { type: string, nullable: true }
+            code: { type: string, nullable: true }
+          required: [message, type]
+      required: [error]
+
+    DeleteObject:
+      type: object
+      properties:
+        id: { type: string }
+        object: { type: string }
+        deleted: { type: boolean }
+      required: [id, deleted, object]
+      additionalProperties: true
+
+    Model:
+      type: object
+      properties:
+        id: { type: string }
+        object: { type: string, example: "model" }
+        created: { type: integer, nullable: true }
+        owned_by: { type: string, nullable: true }
+      required: [id, object]
+      additionalProperties: true
+
+    ModelsList:
+      type: object
+      properties:
+        object: { type: string, example: "list" }
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Model"
+      required: [object, data]
+      additionalProperties: true
+
+    ResponseCreateRequest:
+      type: object
+      required: [model, input]
+      properties:
+        model: { type: string }
+        input:
+          description: >
+            Accepts string or structured input items. Kept loose to stay compatible.
+          oneOf:
+            - type: string
+            - type: array
+              items: { type: object, additionalProperties: true }
+            - type: object
+              additionalProperties: true
+        stream: { type: boolean, default: false }
+        background: { type: boolean, default: false }
+        metadata:
+          type: object
+          additionalProperties: true
+      additionalProperties: true
+
+    ResponseObject:
+      type: object
+      properties:
+        id: { type: string }
+        object: { type: string, example: "response" }
+        created_at: { type: integer, nullable: true }
+        model: { type: string, nullable: true }
+        status: { type: string, nullable: true }
+        output:
+          type: array
+          items: { type: object, additionalProperties: true }
+        usage:
+          type: object
+          additionalProperties: true
+      required: [id, object]
+      additionalProperties: true
+
+    ChatCompletionMessage:
+      type: object
+      required: [role, content]
+      properties:
+        role:
+          type: string
+          enum: [system, user, assistant, tool, developer]
+        content:
+          oneOf:
+            - type: string
+            - type: array
+              items: { type: object, additionalProperties: true }
+        name: { type: string }
+      additionalProperties: true
+
+    ChatCompletionCreateRequest:
+      type: object
+      required: [model, messages]
+      properties:
+        model: { type: string }
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChatCompletionMessage"
+        temperature: { type: number, nullable: true }
+        top_p: { type: number, nullable: true }
+        max_tokens: { type: integer, nullable: true }
+        stream: { type: boolean, default: false }
+        response_format:
+          type: object
+          additionalProperties: true
+        tools:
+          type: array
+          items: { type: object, additionalProperties: true }
+      additionalProperties: true
+
+    ChatCompletionObject:
+      type: object
+      properties:
+        id: { type: string }
+        object: { type: string, example: "chat.completion" }
+        created: { type: integer }
+        model: { type: string }
+        choices:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        usage:
+          type: object
+          additionalProperties: true
+      required: [id, object, choices]
+      additionalProperties: true
+
+    EmbeddingsCreateRequest:
+      type: object
+      required: [model, input]
+      properties:
+        model: { type: string }
+        input:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                oneOf:
+                  - type: string
+                  - type: array
+                    items: { type: integer }
+        encoding_format: { type: string, nullable: true }
+        user: { type: string, nullable: true }
+      additionalProperties: true
+
+    EmbeddingsResponse:
+      type: object
+      properties:
+        object: { type: string, example: "list" }
+        data:
+          type: array
+          items:
+            type: object
+            properties:
+              object: { type: string, example: "embedding" }
+              index: { type: integer }
+              embedding:
+                type: array
+                items: { type: number }
+            required: [object, index, embedding]
+            additionalProperties: true
+        model: { type: string }
+        usage:
+          type: object
+          additionalProperties: true
+      required: [object, data, model]
+      additionalProperties: true
+
+    ImageGenerateRequest:
+      type: object
+      required: [model, prompt]
+      properties:
+        model: { type: string }
+        prompt: { type: string }
+        size: { type: string, nullable: true }
+        quality: { type: string, nullable: true }
+        background: { type: string, nullable: true }
+        n: { type: integer, nullable: true }
+        response_format: { type: string, nullable: true }
+      additionalProperties: true
+
+    ImagesResponse:
+      type: object
+      properties:
+        created: { type: integer }
+        data:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+      required: [created, data]
+      additionalProperties: true
+
+    AudioTranscriptionRequest:
+      type: object
+      required: [file, model]
+      properties:
+        file:
+          type: string
+          format: binary
+        model:
+          type: string
+        language:
+          type: string
+          nullable: true
+        prompt:
+          type: string
+          nullable: true
+        response_format:
+          type: string
+          nullable: true
+        temperature:
+          type: number
+          nullable: true
+      additionalProperties: true
+
+    ModerationCreateRequest:
+      type: object
+      required: [input]
+      properties:
+        model: { type: string, nullable: true }
+        input:
+          description: "String, array of strings, or multimodal input objects."
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                oneOf:
+                  - type: string
+                  - type: object
+                    additionalProperties: true
+            - type: object
+              additionalProperties: true
+      additionalProperties: true
+
+    FileObject:
+      type: object
+      properties:
+        id: { type: string }
+        object: { type: string, example: "file" }
+        bytes: { type: integer, nullable: true }
+        created_at: { type: integer, nullable: true }
+        filename: { type: string, nullable: true }
+        purpose: { type: string, nullable: true }
+      required: [id, object]
+      additionalProperties: true
+
+    FileList:
+      type: object
+      properties:
+        object: { type: string, example: "list" }
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/FileObject"
+      required: [object, data]
+      additionalProperties: true
+
+    FileCreateRequest:
+      type: object
+      required: [file, purpose]
+      properties:
+        file:
+          type: string
+          format: binary
+        purpose:
+          type: string
+      additionalProperties: true
+
+    UploadCreateRequest:
+      type: object
+      required: [filename, bytes]
+      properties:
+        filename: { type: string }
+        bytes: { type: integer }
+        mime_type: { type: string, nullable: true }
+        purpose: { type: string, nullable: true }
+      additionalProperties: true
+
+    UploadObject:
+      type: object
+      properties:
+        id: { type: string }
+        object: { type: string, example: "upload" }
+        bytes: { type: integer }
+        created_at: { type: integer }
+        expires_at: { type: integer, nullable: true }
+        filename: { type: string, nullable: true }
+        status: { type: string, nullable: true }
+      required: [id, object]
+      additionalProperties: true

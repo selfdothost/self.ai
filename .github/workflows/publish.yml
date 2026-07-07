@@ -1,0 +1,37 @@
+# self.ai publish — builds the api image (and the combined image) on a push to
+# the protected public-alpha branch, via the reusable GHCR workflow.
+# The git mirror that populates public-alpha is configured on the GitLab side
+# (see docs/publish-secrets.md); this workflow only builds + pushes images.
+name: publish
+
+on:
+  push:
+    branches: [public-alpha]
+    paths:
+      - "api/**"
+      - "Dockerfile.combined"
+      - ".github/workflows/**"
+
+jobs:
+  api:
+    uses: ./.github/workflows/publish-ghcr.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      image: self.ai/api
+      context: ./api
+      dockerfile: ./api/Dockerfile
+
+  # The combined image is assembled from the published api + self.chat images.
+  # Runs after api so the freshly built api:latest is available to pull.
+  combined:
+    needs: api
+    uses: ./.github/workflows/publish-ghcr.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      image: self.ai/combined
+      context: .
+      dockerfile: ./Dockerfile.combined

@@ -1,0 +1,18 @@
+[submodule "self.kokoro-fastapi"]
+	path = self.kokoro-fastapi
+	url = ../self.kokoro-fastapi.git
+[submodule "self.faster-whisper"]
+	path = self.faster-whisper
+	url = ../self.faster-whisper.git
+[submodule "self.curator"]
+	path = self.curator
+	url = ../self.curator.git
+[submodule "self.llamolotl"]
+	path = self.llamolotl
+	url = ../self.llamolotl.git
+[submodule "self.code-eval"]
+	path = self.code-eval
+	url = ../self.code-eval.git
+[submodule "self.language-eval"]
+	path = self.language-eval
+	url = ../self.language-eval.git

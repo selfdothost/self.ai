@@ -1,0 +1,58 @@
+# self.ai CI — build the API server image and publish to container.home.
+#
+# Builds the backend only (api) into a slim, torch-free API image.
+# kaniko (daemonless) NOT buildah — the runner pods have no /dev/fuse. Image
+# lands at $CI_REGISTRY_IMAGE/api:<short-sha> (container.home...selfai/self.ai/api).
+# Nothing builds on the bastion; Flux's ImagePolicy promotes from the registry.
+#
+# Runner #28 is run_untagged=false → every job carries a tag. The image build
+# runs on `yard-midbuild` (2x 8c/16Gi floating) — off `bigbuild`, which is
+# reserved for the heavy from-source builds (e.g. llamolotl).
+#
+# Submodules (eval/speech/inference repos) are NOT fetched — the API build needs
+# only the backend tree.
+
+stages: [build, publish]
+
+include:
+  - local: '.gitlab/ci-templates/sync-public-alpha.yml'
+
+default:
+  tags: [yard]
+
+variables:
+  GIT_SUBMODULE_STRATEGY: none
+  API_IMAGE: $CI_REGISTRY_IMAGE/api
+
+# --- build: slim FastAPI (selfai_ui) API image ------------------------------
+# Runs on MR + main when the backend changes (not on doc/manifest-only commits).
+build:api:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  tags: [yard-midbuild]
+  timeout: 1h
+  before_script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_JOB_TOKEN" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
+  script:
+    - >
+      /kaniko/executor
+      --context "$CI_PROJECT_DIR/api"
+      --dockerfile "$CI_PROJECT_DIR/api/Dockerfile"
+      --build-arg BUILD_HASH="$CI_COMMIT_SHORT_SHA"
+      --cache=false
+      --destination "$API_IMAGE:$CI_COMMIT_SHORT_SHA"
+      --destination "$API_IMAGE:latest"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: [api/**/*]
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      changes: [api/**/*]
+
+# --- publish: mirror main -> public-alpha (GitLab + GitHub), scheduled only -
+sync:public-alpha:
+  extends: .sync-public-alpha
+  variables:
+    MIRROR_EXCLUDE_PATHS: "context manifests"

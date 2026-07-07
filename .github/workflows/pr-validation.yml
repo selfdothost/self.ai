@@ -1,0 +1,24 @@
+# Validation for incoming pull requests. Uses the `pull_request` trigger, which
+# runs fork PRs in a read-only, secret-less context — never `pull_request_target`
+# with an untrusted checkout. Combined with the repo setting "require approval for
+# first-time contributors" (see docs/publish-secrets.md), this keeps an open-to-PR
+# repo safe.
+name: pr-validation
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build api image (no push)
+        run: docker build -f api/Dockerfile -t selfai-api:pr ./api
+
+      # Lint/test steps are added here as the suites solidify. They must not
+      # require secrets, so fork PRs validate without any privileged access.

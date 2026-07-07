@@ -1,0 +1,11 @@
+.env
+*/.env
+*/data
+notes/
+CLAUDE.md
+
+# Per-environment Traefik routes (contain host-specific domains + cert paths)
+traefik/config/code.toml
+
+# Per-machine Claude Code state (settings.local.json, ralph loop notes, etc.)
+.claude/
