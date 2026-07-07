@@ -36,8 +36,16 @@
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
   variables:
     GIT_DEPTH: 0
+    # GIT_LFS_SKIP_SMUDGE alone isn't enough: the post-checkout hook checks
+    # whether the git-lfs BINARY exists on PATH before it ever consults this
+    # variable, and fails checkout entirely if it doesn't (hit in practice
+    # against self.curator, which has one LFS-tracked test fixture). Installing
+    # the real binary below makes the hook find it and then correctly skip the
+    # actual smudge — the sync job only reads/copies tracked files for the
+    # public mirror, never real LFS object content.
+    GIT_LFS_SKIP_SMUDGE: "1"
   before_script:
-    - apk add --no-cache git bash grep
+    - apk add --no-cache git git-lfs bash grep
   script:
     - |
       set -euo pipefail

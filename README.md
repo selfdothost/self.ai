@@ -1,12 +1,17 @@
 # self.ai
 
-self.ai is a self-hosted, open-source AI-serving stack: an OpenAI-compatible API
-server plus a web chat client, with optional inference, evaluation, speech, and
-data-curation components. Bring your own infrastructure — models, database, and
+self.ai is a self-hosted, open-source AI-serving stack: a chat WebUI, an
+OpenAI-compatible API, local inference and fine-tuning, dataset curation, and
+evaluation harnesses. Bring your own infrastructure — models, database, and
 inference endpoints are all yours to point at.
 
-This repo (`self.ai`) is the **API server** (FastAPI, `selfai_ui`) and the deploy
-surface. The web client lives in [`self.chat`](../self.chat).
+**This repo is the flagship** of the stack — the API server (FastAPI,
+`selfai_ui`) and the docker files for the whole thing. Start here; the
+other pieces are [`self.chat`](https://github.com/selfdothost/self.chat) (the
+web client), [`self.llamolotl`](https://github.com/selfdothost/self.llamolotl)
+(inference + training), [`self.curator`](https://github.com/selfdothost/self.curator)
+(data curation), and [`self.language-eval`](https://github.com/selfdothost/self.language-eval) /
+[`self.code-eval`](https://github.com/selfdothost/self.code-eval) (evaluation).
 
 > **Alpha.** This is the first public release. Expect rough edges. See
 > `DIVERGENCE.md` for the fork history and `docs/` for configuration.
@@ -41,12 +46,25 @@ is in [`deploy/README.md`](deploy/README.md) and
   knowledge base needs an embeddings endpoint — the image is torch-free, so set
   `RAG_EMBEDDING_ENGINE=openai` at an OpenAI-compatible embeddings server (see
   [`docs/config-reference.md`](docs/config-reference.md)).
-- **Web client** ([`self.chat`](../self.chat)) — SvelteKit SPA, same-origin API.
-- **Optional components** (separate images) — llama.cpp inference + training
-  (`self.llamolotl`), STT (`self.faster-whisper`), TTS (`self.kokoro-fastapi`),
-  eval harnesses (`self.language-eval`, `self.code-eval`), and data
-  curation (`self.curator`). See [`docs/image-publish-policy.md`](docs/image-publish-policy.md)
-  for which ship as images vs. build-from-source.
+- **Web client** ([`self.chat`](https://github.com/selfdothost/self.chat)) — SvelteKit SPA, same-origin API.
+- **Inference + training** ([`self.llamolotl`](https://github.com/selfdothost/self.llamolotl),
+  separate image) — llama.cpp serving over an OpenAI-compatible endpoint,
+  swappable for chat like any other inference backend. It's currently the
+  only backend wired to self.ai's training pipelines and qLoRA deployment.
+- **Data curation** ([`self.curator`](https://github.com/selfdothost/self.curator),
+  separate image) — the curation pipelines are built against self.curator's
+  own bespoke API today.
+- **Evaluation** ([`self.language-eval`](https://github.com/selfdothost/self.language-eval),
+  [`self.code-eval`](https://github.com/selfdothost/self.code-eval), separate
+  images) — same story: the bundled harnesses' bespoke API is what the eval
+  pipelines are built against today.
+
+None of this is a hard technical wall — if you know of (or build) another
+backend that could plug into these pipelines, we'd love to hear about it.
+Open an issue or a PR.
+
+See [`docs/image-publish-policy.md`](docs/image-publish-policy.md) for which
+ship as images vs. build-from-source.
 
 Nothing here bundles a database, cache, or ingress — self.ai consumes those,
 it doesn't ship them.
