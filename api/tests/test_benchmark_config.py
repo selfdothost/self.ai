@@ -2,7 +2,11 @@
 import time
 import uuid
 
-from selfai_ui.models.benchmark_config import BenchmarkConfig, BenchmarkConfigs, BenchmarkConfigUpdate
+from selfai_ui.models.benchmark_config import (
+    BenchmarkConfig,
+    BenchmarkConfigs,
+    BenchmarkConfigUpdate,
+)
 
 
 def _make_config(db_session, *, benchmark="hellaswag", eval_type="language-eval", max_duration_minutes=30):
@@ -44,7 +48,12 @@ def test_get_by_id_not_found(db_session):
 
 
 def test_get_by_benchmark_found(db_session):
-    _make_config(db_session, benchmark="hellaswag", eval_type="language-eval", max_duration_minutes=45)
+    _make_config(
+        db_session,
+        benchmark="hellaswag",
+        eval_type="language-eval",
+        max_duration_minutes=45,
+    )
     result = BenchmarkConfigs.get_by_benchmark("hellaswag", "language-eval")
     assert result is not None
     assert result.max_duration_minutes == 45

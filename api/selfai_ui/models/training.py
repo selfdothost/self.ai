@@ -4,11 +4,11 @@ import uuid
 from typing import Optional
 
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import BigInteger, Column, Text, JSON
+from sqlalchemy import JSON, BigInteger, Column, Text
 
-from selfai_ui.internal.db import Base, get_db
 from selfai_ui.env import SRC_LOG_LEVELS
-from selfai_ui.models.users import Users, UserResponse
+from selfai_ui.internal.db import Base, get_db
+from selfai_ui.models.users import UserResponse, Users
 from selfai_ui.utils.access_control import has_access
 
 log = logging.getLogger(__name__)
@@ -150,9 +150,7 @@ class TrainingJobStatusUpdate(BaseModel):
 
 
 class TrainingCourseTable:
-    def insert_new_course(
-        self, user_id: str, form_data: TrainingCourseForm
-    ) -> Optional[TrainingCourseModel]:
+    def insert_new_course(self, user_id: str, form_data: TrainingCourseForm) -> Optional[TrainingCourseModel]:
         with get_db() as db:
             course = TrainingCourseModel(
                 **{
@@ -175,11 +173,7 @@ class TrainingCourseTable:
     def get_all_courses(self) -> list[TrainingCourseUserModel]:
         with get_db() as db:
             courses = []
-            for course in (
-                db.query(TrainingCourse)
-                .order_by(TrainingCourse.updated_at.desc())
-                .all()
-            ):
+            for course in db.query(TrainingCourse).order_by(TrainingCourse.updated_at.desc()).all():
                 user = Users.get_user_by_id(course.user_id)
                 courses.append(
                     TrainingCourseUserModel.model_validate(
@@ -191,16 +185,9 @@ class TrainingCourseTable:
                 )
             return courses
 
-    def get_courses_by_user_id(
-        self, user_id: str, permission: str = "read"
-    ) -> list[TrainingCourseUserModel]:
+    def get_courses_by_user_id(self, user_id: str, permission: str = "read") -> list[TrainingCourseUserModel]:
         all_courses = self.get_all_courses()
-        return [
-            c
-            for c in all_courses
-            if c.user_id == user_id
-            or has_access(user_id, permission, c.access_control)
-        ]
+        return [c for c in all_courses if c.user_id == user_id or has_access(user_id, permission, c.access_control)]
 
     def get_course_by_id(self, id: str) -> Optional[TrainingCourseModel]:
         try:
@@ -210,9 +197,7 @@ class TrainingCourseTable:
         except Exception:
             return None
 
-    def update_course_by_id(
-        self, id: str, form_data: TrainingCourseForm
-    ) -> Optional[TrainingCourseModel]:
+    def update_course_by_id(self, id: str, form_data: TrainingCourseForm) -> Optional[TrainingCourseModel]:
         try:
             with get_db() as db:
                 db.query(TrainingCourse).filter_by(id=id).update(
@@ -238,9 +223,7 @@ class TrainingCourseTable:
 
 
 class TrainingJobTable:
-    def insert_new_job(
-        self, user_id: str, form_data: TrainingJobForm
-    ) -> Optional[TrainingJobModel]:
+    def insert_new_job(self, user_id: str, form_data: TrainingJobForm) -> Optional[TrainingJobModel]:
         with get_db() as db:
             initial_status = "scheduled" if form_data.scheduled_for else "pending"
             job = TrainingJobModel(
@@ -267,11 +250,7 @@ class TrainingJobTable:
     def get_all_jobs(self) -> list[TrainingJobWithDetails]:
         with get_db() as db:
             jobs = []
-            for job in (
-                db.query(TrainingJob)
-                .order_by(TrainingJob.created_at.desc())
-                .all()
-            ):
+            for job in db.query(TrainingJob).order_by(TrainingJob.created_at.desc()).all():
                 user = Users.get_user_by_id(job.user_id)
                 course = TrainingCourses.get_course_by_id(job.course_id)
                 jobs.append(
@@ -297,9 +276,7 @@ class TrainingJobTable:
         except Exception:
             return None
 
-    def update_job_status(
-        self, id: str, update: TrainingJobStatusUpdate
-    ) -> Optional[TrainingJobModel]:
+    def update_job_status(self, id: str, update: TrainingJobStatusUpdate) -> Optional[TrainingJobModel]:
         try:
             with get_db() as db:
                 fields: dict = {"status": update.status, "updated_at": int(time.time())}
@@ -325,7 +302,6 @@ class TrainingJobTable:
         except Exception:
             return False
 
-
     def get_due_scheduled_jobs(self) -> list[TrainingJobModel]:
         """Return scheduled jobs whose scheduled_for time has passed."""
         now = int(time.time())
@@ -341,9 +317,7 @@ class TrainingJobTable:
             )
             return [TrainingJobModel.model_validate(r) for r in rows]
 
-    def update_job_scheduled_for(
-        self, id: str, scheduled_for: Optional[int]
-    ) -> Optional[TrainingJobModel]:
+    def update_job_scheduled_for(self, id: str, scheduled_for: Optional[int]) -> Optional[TrainingJobModel]:
         try:
             with get_db() as db:
                 fields: dict = {"updated_at": int(time.time())}

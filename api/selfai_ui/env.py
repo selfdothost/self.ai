@@ -3,12 +3,13 @@ import json
 import logging
 import os
 import pkgutil
-import sys
 import shutil
+import sys
 from pathlib import Path
 
 import markdown
 from bs4 import BeautifulSoup
+
 from selfai_ui.constants import ERROR_MESSAGES
 
 ####################################
@@ -33,7 +34,8 @@ except ImportError:
 
 DOCKER = os.environ.get("DOCKER", "False").lower() == "true"
 
-# device type embedding models - "cpu" (default), "cuda" (nvidia gpu required) or "mps" (apple silicon) - choosing this right can lead to better performance
+# device type embedding models - "cpu" (default), "cuda" (nvidia gpu required)
+# or "mps" (apple silicon) - choosing this right can lead to better performance
 USE_CUDA = os.environ.get("USE_CUDA_DOCKER", "false")
 
 if USE_CUDA.lower() == "true":
@@ -43,10 +45,7 @@ if USE_CUDA.lower() == "true":
         assert torch.cuda.is_available(), "CUDA not available"
         DEVICE_TYPE = "cuda"
     except Exception as e:
-        cuda_error = (
-            "Error when testing CUDA but USE_CUDA_DOCKER is true. "
-            f"Resetting USE_CUDA_DOCKER to false: {e}"
-        )
+        cuda_error = "Error when testing CUDA but USE_CUDA_DOCKER is true. " f"Resetting USE_CUDA_DOCKER to false: {e}"
         os.environ["USE_CUDA_DOCKER"] = "false"
         USE_CUDA = "false"
         DEVICE_TYPE = "cpu"
@@ -118,7 +117,6 @@ WEBUI_FAVICON_URL = os.environ.get(
     "WEBUI_FAVICON_URL",
     f"{os.environ.get('WEBUI_URL', 'http://localhost:3000')}/static/favicon.png",
 )
-
 
 
 ####################################
@@ -218,9 +216,7 @@ SAFE_MODE = os.environ.get("SAFE_MODE", "false").lower() == "true"
 # ENABLE_FORWARD_USER_INFO_HEADERS
 ####################################
 
-ENABLE_FORWARD_USER_INFO_HEADERS = (
-    os.environ.get("ENABLE_FORWARD_USER_INFO_HEADERS", "False").lower() == "true"
-)
+ENABLE_FORWARD_USER_INFO_HEADERS = os.environ.get("ENABLE_FORWARD_USER_INFO_HEADERS", "False").lower() == "true"
 
 
 ####################################
@@ -265,9 +261,7 @@ FONTS_DIR = Path(os.getenv("FONTS_DIR", SELFAI_UI_DIR / "static" / "fonts"))
 FRONTEND_BUILD_DIR = Path(os.getenv("FRONTEND_BUILD_DIR", BASE_DIR / "build")).resolve()
 
 if FROM_INIT_PY:
-    FRONTEND_BUILD_DIR = Path(
-        os.getenv("FRONTEND_BUILD_DIR", SELFAI_UI_DIR / "frontend")
-    ).resolve()
+    FRONTEND_BUILD_DIR = Path(os.getenv("FRONTEND_BUILD_DIR", SELFAI_UI_DIR / "frontend")).resolve()
 
 
 ####################################
@@ -328,14 +322,10 @@ else:
     except Exception:
         DATABASE_POOL_RECYCLE = 3600
 
-RESET_CONFIG_ON_START = (
-    os.environ.get("RESET_CONFIG_ON_START", "False").lower() == "true"
-)
+RESET_CONFIG_ON_START = os.environ.get("RESET_CONFIG_ON_START", "False").lower() == "true"
 
 
-ENABLE_REALTIME_CHAT_SAVE = (
-    os.environ.get("ENABLE_REALTIME_CHAT_SAVE", "False").lower() == "true"
-)
+ENABLE_REALTIME_CHAT_SAVE = os.environ.get("ENABLE_REALTIME_CHAT_SAVE", "False").lower() == "true"
 
 ####################################
 # REDIS
@@ -348,14 +338,10 @@ REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 ####################################
 
 WEBUI_AUTH = os.environ.get("WEBUI_AUTH", "True").lower() == "true"
-WEBUI_AUTH_TRUSTED_EMAIL_HEADER = os.environ.get(
-    "WEBUI_AUTH_TRUSTED_EMAIL_HEADER", None
-)
+WEBUI_AUTH_TRUSTED_EMAIL_HEADER = os.environ.get("WEBUI_AUTH_TRUSTED_EMAIL_HEADER", None)
 WEBUI_AUTH_TRUSTED_NAME_HEADER = os.environ.get("WEBUI_AUTH_TRUSTED_NAME_HEADER", None)
 
-BYPASS_MODEL_ACCESS_CONTROL = (
-    os.environ.get("BYPASS_MODEL_ACCESS_CONTROL", "False").lower() == "true"
-)
+BYPASS_MODEL_ACCESS_CONTROL = os.environ.get("BYPASS_MODEL_ACCESS_CONTROL", "False").lower() == "true"
 
 ####################################
 # WEBUI_SECRET_KEY
@@ -363,9 +349,7 @@ BYPASS_MODEL_ACCESS_CONTROL = (
 
 WEBUI_SECRET_KEY = os.environ.get(
     "WEBUI_SECRET_KEY",
-    os.environ.get(
-        "WEBUI_JWT_SECRET_KEY", "t0p-s3cr3t"
-    ),  # DEPRECATED: remove at next major version
+    os.environ.get("WEBUI_JWT_SECRET_KEY", "t0p-s3cr3t"),  # DEPRECATED: remove at next major version
 )
 
 WEBUI_SESSION_COOKIE_SAME_SITE = os.environ.get(
@@ -390,9 +374,25 @@ if WEBUI_AUTH and WEBUI_SECRET_KEY == "t0p-s3cr3t":
         "Set WEBUI_SECRET_KEY to a unique, random value in your environment."
     )
 
-ENABLE_WEBSOCKET_SUPPORT = (
-    os.environ.get("ENABLE_WEBSOCKET_SUPPORT", "True").lower() == "true"
-)
+####################################
+# SERVICE_AUTH (internal ticket-granting mesh — self.ai#25)
+####################################
+
+# Shared HMAC secret self.ai signs internal service tickets with. Distinct
+# from WEBUI_SECRET_KEY (that one signs user session tokens; this one signs
+# short-lived, scoped tickets self.ai mints for itself right before calling
+# a backend like self.llamolotl). Empty by default: minting simply isn't
+# attempted until wiring is deployed, so an unset secret does not block
+# self.ai booting for deployments that don't have a backend needing tickets
+# yet — see selfai_ui/utils/service_auth.py, which raises at call time
+# (not import time) if this is unset when a mint is actually requested.
+SERVICE_AUTH_SECRET = os.environ.get("SERVICE_AUTH_SECRET", "")
+# The `iss` claim on every ticket self.ai mints. Backends can use this to
+# confirm the ticket came from self.ai specifically (defense alongside the
+# signature check, not instead of it).
+SERVICE_AUTH_ISSUER = os.environ.get("SERVICE_AUTH_ISSUER", "self.ai")
+
+ENABLE_WEBSOCKET_SUPPORT = os.environ.get("ENABLE_WEBSOCKET_SUPPORT", "True").lower() == "true"
 
 WEBSOCKET_MANAGER = os.environ.get("WEBSOCKET_MANAGER", "")
 
@@ -413,17 +413,13 @@ else:
     except Exception:
         AIOHTTP_CLIENT_TIMEOUT = 300
 
-AIOHTTP_CLIENT_TIMEOUT_OPENAI_MODEL_LIST = os.environ.get(
-    "AIOHTTP_CLIENT_TIMEOUT_OPENAI_MODEL_LIST", ""
-)
+AIOHTTP_CLIENT_TIMEOUT_OPENAI_MODEL_LIST = os.environ.get("AIOHTTP_CLIENT_TIMEOUT_OPENAI_MODEL_LIST", "")
 
 if AIOHTTP_CLIENT_TIMEOUT_OPENAI_MODEL_LIST == "":
     AIOHTTP_CLIENT_TIMEOUT_OPENAI_MODEL_LIST = None
 else:
     try:
-        AIOHTTP_CLIENT_TIMEOUT_OPENAI_MODEL_LIST = int(
-            AIOHTTP_CLIENT_TIMEOUT_OPENAI_MODEL_LIST
-        )
+        AIOHTTP_CLIENT_TIMEOUT_OPENAI_MODEL_LIST = int(AIOHTTP_CLIENT_TIMEOUT_OPENAI_MODEL_LIST)
     except Exception:
         AIOHTTP_CLIENT_TIMEOUT_OPENAI_MODEL_LIST = 5
 

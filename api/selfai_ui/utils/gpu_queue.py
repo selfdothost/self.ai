@@ -19,30 +19,49 @@ import logging
 import os
 import time
 import uuid
-from pathlib import Path
 from typing import Optional
 
 import httpx
 
 from selfai_ui.env import SRC_LOG_LEVELS, WEBSOCKET_REDIS_URL
-from selfai_ui.socket.utils import RedisLock
-from selfai_ui.models.eval_jobs import EvalJob, EvalJobModel, EvalJobs, EvalJobStatusUpdate
-from selfai_ui.models.training import TrainingJob, TrainingJobModel, TrainingJobs, TrainingJobStatusUpdate
-from selfai_ui.models.curator_jobs import CuratorJob, CuratorJobModel, CuratorJobs, CuratorJobStatusUpdate
-from selfai_ui.models.knowledge import Knowledges, KnowledgeForm, KnowledgeFiles
-from selfai_ui.models.files import Files, FileForm
-from selfai_ui.models.job_windows import JobWindowWithSlots, JobWindows
-from selfai_ui.models.benchmark_config import BenchmarkConfigs
 from selfai_ui.internal.db import get_db
+from selfai_ui.models.benchmark_config import BenchmarkConfigs
+from selfai_ui.models.curator_jobs import (
+    CuratorJob,
+    CuratorJobModel,
+    CuratorJobs,
+    CuratorJobStatusUpdate,
+)
+from selfai_ui.models.eval_jobs import (
+    EvalJob,
+    EvalJobModel,
+    EvalJobs,
+    EvalJobStatusUpdate,
+)
+from selfai_ui.models.files import FileForm, Files
+from selfai_ui.models.job_windows import JobWindows, JobWindowWithSlots
+from selfai_ui.models.knowledge import KnowledgeFiles, KnowledgeForm, Knowledges
+from selfai_ui.models.training import (
+    TrainingJob,
+    TrainingJobModel,
+    TrainingJobs,
+    TrainingJobStatusUpdate,
+)
+from selfai_ui.socket.utils import RedisLock
+from selfai_ui.utils.service_auth import TICKET_HEADER, mint_service_ticket
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS.get("MAIN", logging.INFO))
+
+# Same audience string as routers/llamolotl.py and routers/training.py — must
+# match self.llamolotl's SERVICE_AUTH_AUDIENCE (self.llamolotl#12).
+LLAMOLOTL_AUDIENCE = "self.llamolotl"
 
 # Set by main.py lifespan handler so the dispatcher can access app config.
 _app_state = None
 
 POLL_INTERVAL = 30  # seconds
-LOCK_TIMEOUT = 60   # seconds -- must be > POLL_INTERVAL
+LOCK_TIMEOUT = 60  # seconds -- must be > POLL_INTERVAL
 STALE_RUNNING_TIMEOUT = 24 * 3600  # seconds before a stuck "running" job is auto-failed
 
 
@@ -115,9 +134,12 @@ def _resolve_worker_url(job_type: str) -> Optional[str]:
 async def _sync_running_jobs() -> None:
     """Poll remote workers for status of all running jobs."""
     from selfai_ui.routers.evaluations import (
-        _sync_running_jobs as _sync_eval,
         _reconcile_missing_results,
     )
+    from selfai_ui.routers.evaluations import (
+        _sync_running_jobs as _sync_eval,
+    )
+
     await _sync_eval()
     # Backfill results for completed code-eval jobs whose details never persisted
     # (e.g. the code-eval harness was busy at finish). Idempotent + capped.
@@ -142,11 +164,7 @@ async def _sync_running_training_jobs() -> None:
         return
 
     with get_db() as db:
-        rows = (
-            db.query(TrainingJob)
-            .filter(TrainingJob.status.in_(("running", "queued")))
-            .all()
-        )
+        rows = db.query(TrainingJob).filter(TrainingJob.status.in_(("running", "queued"))).all()
         jobs = [TrainingJobModel.model_validate(r) for r in rows]
 
     status_map = {
@@ -172,7 +190,10 @@ async def _sync_running_training_jobs() -> None:
 
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(endpoint)
+                resp = await client.get(
+                    endpoint,
+                    headers={TICKET_HEADER: mint_service_ticket(LLAMOLOTL_AUDIENCE, "jobs:read")},
+                )
                 if resp.status_code == 404:
                     TrainingJobs.update_job_status(
                         id=job.id,
@@ -214,17 +235,15 @@ def _expire_stale_training_jobs() -> None:
     stale_before = int(time.time()) - STALE_RUNNING_TIMEOUT
     with get_db() as db:
         rows = (
-            db.query(TrainingJob)
-            .filter(TrainingJob.status == "running", TrainingJob.updated_at < stale_before)
-            .all()
+            db.query(TrainingJob).filter(TrainingJob.status == "running", TrainingJob.updated_at < stale_before).all()
         )
         for row in rows:
             age_h = (int(time.time()) - row.updated_at) / 3600
             log.warning(f"Training job {row.id} stuck running for {age_h:.1f}h — marking failed")
         if rows:
-            db.query(TrainingJob).filter(
-                TrainingJob.status == "running", TrainingJob.updated_at < stale_before
-            ).update({"status": "failed", "updated_at": int(time.time())})
+            db.query(TrainingJob).filter(TrainingJob.status == "running", TrainingJob.updated_at < stale_before).update(
+                {"status": "failed", "updated_at": int(time.time())}
+            )
             db.commit()
 
 
@@ -261,17 +280,13 @@ async def _finalize_curator_job(job: CuratorJobModel, curator_url: str) -> bool:
         downloaded = 0
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
-                listing = await client.get(
-                    f"{curator_url}/api/jobs/{job.curator_job_id}/output"
-                )
+                listing = await client.get(f"{curator_url}/api/jobs/{job.curator_job_id}/output")
                 files = listing.json().get("files", []) if listing.status_code == 200 else []
                 for f in files:
                     fn = f.get("filename")
                     if not fn:
                         continue
-                    r = await client.get(
-                        f"{curator_url}/api/jobs/{job.curator_job_id}/output/{fn}"
-                    )
+                    r = await client.get(f"{curator_url}/api/jobs/{job.curator_job_id}/output/{fn}")
                     if r.status_code != 200:
                         continue
                     dest = os.path.join(local_out, fn)
@@ -404,9 +419,14 @@ async def _promote_scheduled_jobs() -> None:
             log.info(f"GPU queue: training job {row.id} pending with no schedule, promoting to queued")
             TrainingJobs.update_job_status(id=row.id, update=TrainingJobStatusUpdate(status="queued"))
 
-        pending_curator = db.query(CuratorJob).filter(
-            CuratorJob.status == "pending", CuratorJob.scheduled_for == None  # noqa: E711
-        ).all()
+        pending_curator = (
+            db.query(CuratorJob)
+            .filter(
+                CuratorJob.status == "pending",
+                CuratorJob.scheduled_for == None,  # noqa: E711
+            )
+            .all()
+        )
         for row in pending_curator:
             log.info(f"GPU queue: curator job {row.id} pending with no schedule, promoting to queued")
             CuratorJobs.update_job_status(id=row.id, update=CuratorJobStatusUpdate(status="queued"))
@@ -419,14 +439,18 @@ async def _promote_scheduled_jobs() -> None:
 
 async def _dispatch_training_job(job: TrainingJobModel) -> None:
     from selfai_ui.routers.training import _dispatch_scheduled_job
+
     await _dispatch_scheduled_job(job)
 
 
 async def _dispatch_eval_job_by_type(job: EvalJobModel) -> None:
     from selfai_ui.routers.evaluations import (
         _dispatch_eval_job as _code_eval_dispatch,
+    )
+    from selfai_ui.routers.evaluations import (
         _dispatch_language_eval_job as _language_eval_dispatch,
     )
+
     eval_type = getattr(job, "eval_type", "code-eval") or "code-eval"
     if eval_type == "language-eval":
         await _language_eval_dispatch(job)
@@ -486,9 +510,7 @@ async def _dispatch_curator_job(job: CuratorJobModel) -> None:
 
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
-            api_input = (pipeline_config.get("input_path") or "").replace(
-                "/workspace/ui-data", str(DATA_DIR)
-            )
+            api_input = (pipeline_config.get("input_path") or "").replace("/workspace/ui-data", str(DATA_DIR))
             if api_input and os.path.exists(api_input):
                 with open(api_input, "rb") as fh:
                     content = fh.read()
@@ -503,8 +525,7 @@ async def _dispatch_curator_job(job: CuratorJobModel) -> None:
                 pipeline_config["output_path"] = paths["output_path"]
             else:
                 log.warning(
-                    f"Curator job {job.id}: input {api_input!r} not on the API volume; "
-                    "dispatching config as-is"
+                    f"Curator job {job.id}: input {api_input!r} not on the API volume; " "dispatching config as-is"
                 )
             resp = await client.post(f"{curator_url}/api/jobs", json=pipeline_config)
             resp.raise_for_status()
@@ -622,11 +643,7 @@ def _running_count(job_type: str) -> int:
         if job_type == "training":
             return db.query(TrainingJob).filter_by(status="running").count()
         elif job_type in ("language-eval", "code-eval"):
-            return (
-                db.query(EvalJob)
-                .filter(EvalJob.status == "running", EvalJob.eval_type == job_type)
-                .count()
-            )
+            return db.query(EvalJob).filter(EvalJob.status == "running", EvalJob.eval_type == job_type).count()
         elif job_type == "curator":
             return db.query(CuratorJob).filter_by(status="running").count()
     return 0
@@ -659,9 +676,7 @@ async def _dispatch_window_jobs(window: JobWindowWithSlots) -> None:
         for jtype in slots:
             if jtype == "training":
                 for r in (
-                    db.query(TrainingJob)
-                    .filter(TrainingJob.priority == "high", TrainingJob.status == "queued")
-                    .all()
+                    db.query(TrainingJob).filter(TrainingJob.priority == "high", TrainingJob.status == "queued").all()
                 ):
                     high_candidates.append((r.created_at, jtype, TrainingJobModel.model_validate(r)))
             elif jtype in ("language-eval", "code-eval"):
@@ -677,9 +692,7 @@ async def _dispatch_window_jobs(window: JobWindowWithSlots) -> None:
                     high_candidates.append((r.created_at, jtype, EvalJobModel.model_validate(r)))
             elif jtype == "curator":
                 for r in (
-                    db.query(CuratorJob)
-                    .filter(CuratorJob.priority == "high", CuratorJob.status == "queued")
-                    .all()
+                    db.query(CuratorJob).filter(CuratorJob.priority == "high", CuratorJob.status == "queued").all()
                 ):
                     high_candidates.append((r.created_at, jtype, CuratorJobModel.model_validate(r)))
 
@@ -824,8 +837,10 @@ async def process_gpu_queue_v2() -> None:
             finally:
                 try:
                     lock.release_lock()
-                except Exception:
-                    pass  # Lock expires naturally after LOCK_TIMEOUT seconds
+                except Exception as e:
+                    # Lock expires naturally after LOCK_TIMEOUT seconds, but log
+                    # in case release is failing for a different reason.
+                    log.debug(f"GPU queue lock release failed (will expire naturally): {e}")
 
         except Exception as e:
             log.error(f"GPU queue error: {e}", exc_info=True)

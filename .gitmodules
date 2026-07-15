@@ -1,9 +1,9 @@
-[submodule "self.kokoro-fastapi"]
-	path = self.kokoro-fastapi
-	url = ../self.kokoro-fastapi.git
-[submodule "self.faster-whisper"]
-	path = self.faster-whisper
-	url = ../self.faster-whisper.git
+[submodule "self.speak"]
+	path = self.speak
+	url = ../self.speak.git
+[submodule "self.transcribe"]
+	path = self.transcribe
+	url = ../self.transcribe.git
 [submodule "self.curator"]
 	path = self.curator
 	url = ../self.curator.git

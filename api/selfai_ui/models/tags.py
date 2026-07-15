@@ -1,14 +1,11 @@
 import logging
-import time
-import uuid
 from typing import Optional
 
-from selfai_ui.internal.db import Base, get_db
-
+from pydantic import BaseModel, ConfigDict
+from sqlalchemy import JSON, Column, PrimaryKeyConstraint, String
 
 from selfai_ui.env import SRC_LOG_LEVELS
-from pydantic import BaseModel, ConfigDict
-from sqlalchemy import BigInteger, Column, String, JSON, PrimaryKeyConstraint
+from selfai_ui.internal.db import Base, get_db
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MODELS"])
@@ -64,9 +61,7 @@ class TagTable:
                 print(e)
                 return None
 
-    def get_tag_by_name_and_user_id(
-        self, name: str, user_id: str
-    ) -> Optional[TagModel]:
+    def get_tag_by_name_and_user_id(self, name: str, user_id: str) -> Optional[TagModel]:
         try:
             id = name.replace(" ", "_").lower()
             with get_db() as db:
@@ -77,20 +72,13 @@ class TagTable:
 
     def get_tags_by_user_id(self, user_id: str) -> list[TagModel]:
         with get_db() as db:
-            return [
-                TagModel.model_validate(tag)
-                for tag in (db.query(Tag).filter_by(user_id=user_id).all())
-            ]
+            return [TagModel.model_validate(tag) for tag in (db.query(Tag).filter_by(user_id=user_id).all())]
 
-    def get_tags_by_ids_and_user_id(
-        self, ids: list[str], user_id: str
-    ) -> list[TagModel]:
+    def get_tags_by_ids_and_user_id(self, ids: list[str], user_id: str) -> list[TagModel]:
         with get_db() as db:
             return [
                 TagModel.model_validate(tag)
-                for tag in (
-                    db.query(Tag).filter(Tag.id.in_(ids), Tag.user_id == user_id).all()
-                )
+                for tag in (db.query(Tag).filter(Tag.id.in_(ids), Tag.user_id == user_id).all())
             ]
 
     def delete_tag_by_name_and_user_id(self, name: str, user_id: str) -> bool:

@@ -10,19 +10,18 @@ These smoke tests verify that the test infrastructure itself is sound:
 import pytest
 from sqlalchemy import text
 
-
 # ---------------------------------------------------------------------------
 # T-236: Test isolation
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.tier0
 def test_isolation_first_insert(db_session):
     """Insert a row, confirm it's visible within this test."""
     from tests.factories import UserFactory
+
     user = UserFactory.create(db_session, email="isolation-test@test.local")
-    row = db_session.execute(
-        text("SELECT email FROM [user] WHERE id = :id"), {"id": user.id}
-    ).fetchone()
+    row = db_session.execute(text("SELECT email FROM [user] WHERE id = :id"), {"id": user.id}).fetchone()
     assert row is not None
     assert row[0] == "isolation-test@test.local"
 
@@ -34,14 +33,13 @@ def test_isolation_second_sees_no_prior_data(db_session):
         text("SELECT COUNT(*) FROM [user] WHERE email = :e"),
         {"e": "isolation-test@test.local"},
     ).fetchone()
-    assert row[0] == 0, (
-        "Truncation teardown failed — data from previous test leaked!"
-    )
+    assert row[0] == 0, "Truncation teardown failed — data from previous test leaked!"
 
 
 # ---------------------------------------------------------------------------
 # T-237: Collection validation
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.tier0
 def test_markers_are_functional():
@@ -59,6 +57,7 @@ def test_markers_are_functional():
 # T-238: CI smoke
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.tier0
 def test_app_state_config_has_required_attrs(test_app):
     """Test app state has all the config attributes needed by tests."""
@@ -69,9 +68,7 @@ def test_app_state_config_has_required_attrs(test_app):
         "USER_PERMISSIONS",
     ]
     for attr in required:
-        assert hasattr(test_app.state.config, attr), (
-            f"test_app.state.config missing required attribute: {attr}"
-        )
+        assert hasattr(test_app.state.config, attr), f"test_app.state.config missing required attribute: {attr}"
 
 
 @pytest.mark.tier0
@@ -90,12 +87,13 @@ def test_authenticated_admin_fixture_works(authenticated_admin):
 def test_external_service_mocks_importable():
     """Verify external service mock fixtures are importable."""
     from tests.mocks.external_services import (
-        mock_ollama,
-        mock_openai,
-        mock_llamolotl,
         mock_curator,
         mock_eval_harness,
+        mock_llamolotl,
+        mock_ollama,
+        mock_openai,
     )
+
     # All fixture objects are pytest fixtures (functions with _pytestfixturefunction)
     # Just importing without error is the smoke test
     assert callable(mock_ollama)

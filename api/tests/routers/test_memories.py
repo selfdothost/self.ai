@@ -19,8 +19,10 @@ def test_list_memories_empty(authenticated_user):
 @pytest.mark.tier0
 def test_list_memories_with_data(authenticated_user, db_session, test_user):
     """Memories inserted for the user appear in the list."""
+    import time
+    import uuid
+
     from selfai_ui.models.memories import Memory
-    import uuid, time
 
     mem = Memory(
         id=str(uuid.uuid4()),
@@ -40,13 +42,13 @@ def test_list_memories_with_data(authenticated_user, db_session, test_user):
 
 
 @pytest.mark.tier0
-def test_memories_cross_user_isolation(
-    authenticated_user, db_session, test_user
-):
+def test_memories_cross_user_isolation(authenticated_user, db_session, test_user):
     """User A does not see user B's memories."""
-    from tests.factories import UserFactory
+    import time
+    import uuid
+
     from selfai_ui.models.memories import Memory
-    import uuid, time
+    from tests.factories import UserFactory
 
     user_b = UserFactory.create(db_session)
     mem_b = Memory(
@@ -66,18 +68,19 @@ def test_memories_cross_user_isolation(
 
 
 @pytest.mark.tier0
-def test_delete_memory_by_id(
-    authenticated_user, db_session, test_user, monkeypatch
-):
+def test_delete_memory_by_id(authenticated_user, db_session, test_user, monkeypatch):
     """User can delete their own memory."""
-    from selfai_ui.models.memories import Memory
-    import uuid, time
+    import time
+    import uuid
+
     import selfai_ui.routers.memories as memories_mod
+    from selfai_ui.models.memories import Memory
 
     # Mock the vector DB client so no real qdrant call happens
     class _FakeVDB:
         def delete(self, **kwargs):
             return True
+
     monkeypatch.setattr(memories_mod, "VECTOR_DB_CLIENT", _FakeVDB())
 
     mem = Memory(
@@ -100,21 +103,23 @@ def test_delete_memory_by_id(
 
 
 @pytest.mark.tier0
-def test_delete_other_user_memory_fails(
-    authenticated_user, db_session, test_user, monkeypatch
-):
+def test_delete_other_user_memory_fails(authenticated_user, db_session, test_user, monkeypatch):
     """User A cannot delete user B's memory."""
     import selfai_ui.routers.memories as memories_mod
 
     class _FakeVDB:
         def delete(self, **kwargs):
             return True
+
     monkeypatch.setattr(memories_mod, "VECTOR_DB_CLIENT", _FakeVDB())
 
-    from tests.factories import UserFactory
-    from selfai_ui.models.memories import Memory
-    import uuid, time
+    import time
+    import uuid
+
     from sqlalchemy import text
+
+    from selfai_ui.models.memories import Memory
+    from tests.factories import UserFactory
 
     user_b = UserFactory.create(db_session)
     mem_b = Memory(
@@ -135,26 +140,28 @@ def test_delete_other_user_memory_fails(
     # (known minor bug), so HTTP status is 200. Data protection is what
     # matters — the row must still exist.
     assert resp.status_code == 200
-    row = db_session.execute(
-        text("SELECT id FROM memory WHERE id = :id"), {"id": mem_b_id}
-    ).fetchone()
+    row = db_session.execute(text("SELECT id FROM memory WHERE id = :id"), {"id": mem_b_id}).fetchone()
     assert row is not None, "User A deleted user B's memory!"
 
 
 @pytest.mark.tier0
 def test_delete_all_user_memories(authenticated_user, db_session, test_user):
     """User can delete all their own memories in one shot."""
+    import time
+    import uuid
+
     from selfai_ui.models.memories import Memory
-    import uuid, time
 
     for i in range(3):
-        db_session.add(Memory(
-            id=str(uuid.uuid4()),
-            user_id=test_user["id"],
-            content=f"Memory {i}",
-            created_at=int(time.time()),
-            updated_at=int(time.time()),
-        ))
+        db_session.add(
+            Memory(
+                id=str(uuid.uuid4()),
+                user_id=test_user["id"],
+                content=f"Memory {i}",
+                created_at=int(time.time()),
+                updated_at=int(time.time()),
+            )
+        )
     db_session.commit()
 
     resp = authenticated_user.delete("/api/v1/memories/delete/user")

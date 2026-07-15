@@ -19,11 +19,8 @@ VAULT_PATH="secret/selfshipyard/selfai/publish/github"
 PROTECTED_BRANCH="public-alpha"
 
 # Repos to publish under selfdothost (crew-code excluded). See docs/selfdothost-repos.md.
-# self.faster-whisper (STT) and self.kokoro-fastapi (TTS) are STRETCH / post-alpha:
-# excluded from the first public mirror. Their submodule entries are mirror-excluded
-# alongside context/ + manifests/ (see the recursive-clone note in selfdothost-repos.md).
 REPOS=(self.ai self.chat self.code-eval self.language-eval \
-       self.curator self.llamolotl)
+       self.curator self.llamolotl self.transcribe self.speak)
 
 # --- read credential from vault --------------------------------------------
 GH_USER=""; GH_TOKEN=""

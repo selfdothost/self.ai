@@ -16,9 +16,7 @@ import pytest
 def test_audio_models_returns_models_dict(authenticated_user, test_app):
     """GET /audio/models returns {models: [...]} shape."""
     resp = authenticated_user.get("/api/v1/audio/models")
-    assert resp.status_code == 200, (
-        f"Audio models returned {resp.status_code}: {resp.text[:200]}"
-    )
+    assert resp.status_code == 200, f"Audio models returned {resp.status_code}: {resp.text[:200]}"
     body = resp.json()
     assert isinstance(body, dict)
     assert "models" in body
@@ -28,24 +26,43 @@ def test_audio_models_returns_models_dict(authenticated_user, test_app):
 def test_audio_voices_returns_voices_dict(authenticated_user):
     """GET /audio/voices returns a dict of available voices."""
     resp = authenticated_user.get("/api/v1/audio/voices")
-    assert resp.status_code == 200, (
-        f"Audio voices returned {resp.status_code}: {resp.text[:200]}"
-    )
+    assert resp.status_code == 200, f"Audio voices returned {resp.status_code}: {resp.text[:200]}"
     assert isinstance(resp.json(), dict)
 
 
 @pytest.mark.tier1
 def test_audio_config_update_persists(authenticated_admin):
-    """Config update round-trip with the currently-returned config succeeds."""
+    """Config round-trip with an external STT engine configured succeeds.
+
+    STT_ENGINE="" means "use the local faster-whisper engine" -- not
+    supported on the API-tier image (self.ai#26), so the round-trip must
+    use an external engine to exercise the actually-supported path. See
+    test_audio_config_update_local_whisper_unavailable below for the local
+    case, which is expected to 501 here, not 200.
+    """
     current = authenticated_admin.get("/api/v1/audio/config").json()
+    current["stt"]["ENGINE"] = "openai"
     resp = authenticated_admin.post(
         "/api/v1/audio/config/update",
         json=current,
     )
-    assert resp.status_code == 200, (
-        f"Config round-trip unexpectedly returned {resp.status_code}: "
-        f"{resp.text[:200]}"
+    assert resp.status_code == 200, f"Config round-trip unexpectedly returned {resp.status_code}: " f"{resp.text[:200]}"
+
+
+@pytest.mark.tier1
+def test_audio_config_update_local_whisper_unavailable(authenticated_admin):
+    """STT_ENGINE="" (local whisper) 501s on the API-tier image (self.ai#26)
+    instead of crashing with ModuleNotFoundError."""
+    current = authenticated_admin.get("/api/v1/audio/config").json()
+    current["stt"]["ENGINE"] = ""
+    resp = authenticated_admin.post(
+        "/api/v1/audio/config/update",
+        json=current,
     )
+    assert resp.status_code == 501, (
+        f"Expected 501 for the unavailable local engine, got {resp.status_code}: " f"{resp.text[:200]}"
+    )
+    assert "not available on this image" in resp.json()["detail"]
 
 
 @pytest.mark.tier1
@@ -57,8 +74,13 @@ def test_audio_transcribe_requires_file(authenticated_user):
 
 
 @pytest.mark.tier1
-def test_audio_speech_requires_payload(authenticated_user):
-    """POST /audio/speech without a payload returns 4xx."""
+def test_audio_speech_unconfigured_engine_rejected(authenticated_user):
+    """POST /audio/speech with no TTS engine configured returns 400, not a
+    silent 200/null (self.ai#26) -- speech()'s engine dispatch previously had
+    no else clause, so an unmatched TTS_ENGINE fell through with an implicit
+    return, which FastAPI turns into a 200 with an empty body."""
     resp = authenticated_user.post("/api/v1/audio/speech", json={})
-    # Missing required field
-    assert resp.status_code in (400, 422, 500)
+    assert resp.status_code == 400, (
+        f"Expected 400 for an unconfigured TTS engine, got {resp.status_code}: " f"{resp.text[:200]}"
+    )
+    assert resp.json()["detail"] == "TTS engine is not configured"

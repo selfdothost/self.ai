@@ -38,6 +38,29 @@ More detail — including the reverse-proxy setup and every environment variable
 is in [`deploy/README.md`](deploy/README.md) and
 [`docs/config-reference.md`](docs/config-reference.md).
 
+## Bring your own inference backend
+
+Neither compose file above runs local inference. self.ai's API server already
+speaks to **any OpenAI-compatible endpoint** — if you already have a token
+factory (a hosted OpenAI-compatible API, an existing vLLM/SGLang deployment,
+your own llama.cpp/Ollama setup), point self.ai at it and skip
+[`self.llamolotl`](https://github.com/selfdothost/self.llamolotl) entirely:
+
+```bash
+# .env
+OPENAI_API_BASE_URLS=https://your-endpoint/v1
+OPENAI_API_KEYS=sk-your-key
+```
+
+Multiple backends work too — semicolon-separate both `OPENAI_API_BASE_URLS`
+and `OPENAI_API_KEYS` (same order, same count) to register more than one
+endpoint. This is exactly the setup for anyone choosing
+`docker-compose.split.yml`: `api` + `chat` + `proxy`, no local model server
+required. See [`docs/config-reference.md`](docs/config-reference.md) for the
+full variable list — note that self.llamolotl remains the only backend
+currently wired to self.ai's training/qLoRA pipelines, so bring-your-own
+covers chat inference, not fine-tuning.
+
 ## What's in the box
 
 - **API server** — OpenAI-compatible chat/completions, knowledge base (RAG),

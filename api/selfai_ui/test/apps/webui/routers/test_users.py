@@ -58,9 +58,7 @@ class TestUsers(AbstractPostgresTest):
 
         # update role
         with mock_webui_user(id="3"):
-            response = self.fast_api_client.post(
-                self.create_url("/update/role"), json={"id": "2", "role": "admin"}
-            )
+            response = self.fast_api_client.post(self.create_url("/update/role"), json={"id": "2", "role": "admin"})
         assert response.status_code == 200
         _assert_user([response.json()], "2", role="admin")
 

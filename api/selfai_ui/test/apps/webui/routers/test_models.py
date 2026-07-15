@@ -41,18 +41,14 @@ class TestModels(AbstractPostgresTest):
         assert len(response.json()) == 1
 
         with mock_webui_user(id="2"):
-            response = self.fast_api_client.get(
-                self.create_url(query_params={"id": "my-model"})
-            )
+            response = self.fast_api_client.get(self.create_url(query_params={"id": "my-model"}))
         assert response.status_code == 200
         data = response.json()[0]
         assert data["id"] == "my-model"
         assert data["name"] == "Hello World"
 
         with mock_webui_user(id="2"):
-            response = self.fast_api_client.delete(
-                self.create_url("/delete?id=my-model")
-            )
+            response = self.fast_api_client.delete(self.create_url("/delete?id=my-model"))
         assert response.status_code == 200
 
         with mock_webui_user(id="2"):

@@ -5,10 +5,9 @@ import time
 import docker
 import pytest
 from docker import DockerClient
-from pytest_docker.plugin import get_docker_ip
 from fastapi.testclient import TestClient
-from sqlalchemy import text, create_engine
-
+from pytest_docker.plugin import get_docker_ip
+from sqlalchemy import create_engine, text
 
 log = logging.getLogger(__name__)
 
@@ -32,9 +31,7 @@ class AbstractIntegrationTest:
         path_parts = [part.strip() for part in path_parts if part.strip() != ""]
         query_parts = ""
         if query_params:
-            query_parts = "&".join(
-                [f"{key}={value}" for key, value in query_params.items()]
-            )
+            query_parts = "&".join([f"{key}={value}" for key, value in query_params.items()])
             query_parts = f"?{query_parts}"
         return "/".join(parts + path_parts) + query_parts
 
@@ -92,7 +89,6 @@ class AbstractPostgresTest(AbstractIntegrationTest):
             db = None
             while retries > 0:
                 try:
-                    from selfai_ui.config import SELFAI_UI_DIR
 
                     db = create_engine(database_url, pool_pre_ping=True)
                     db = db.connect()

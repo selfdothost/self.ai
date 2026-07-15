@@ -1,7 +1,8 @@
-from typing import Optional, Union, List, Dict, Any
-from selfai_ui.models.users import Users, UserModel
-from selfai_ui.models.groups import Groups
 import json
+from typing import Any, Dict, List, Optional
+
+from selfai_ui.models.groups import Groups
+from selfai_ui.models.users import UserModel, Users
 
 
 def get_permissions(
@@ -14,9 +15,7 @@ def get_permissions(
     Permissions are nested in a dict with the permission key as the key and a boolean as the value.
     """
 
-    def combine_permissions(
-        permissions: Dict[str, Any], group_permissions: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    def combine_permissions(permissions: Dict[str, Any], group_permissions: Dict[str, Any]) -> Dict[str, Any]:
         """Combine permissions from multiple groups by taking the most permissive value."""
         for key, value in group_permissions.items():
             if isinstance(value, dict):
@@ -91,15 +90,11 @@ def has_access(
     permitted_group_ids = permission_access.get("group_ids", [])
     permitted_user_ids = permission_access.get("user_ids", [])
 
-    return user_id in permitted_user_ids or any(
-        group_id in permitted_group_ids for group_id in user_group_ids
-    )
+    return user_id in permitted_user_ids or any(group_id in permitted_group_ids for group_id in user_group_ids)
 
 
 # Get all users with access to a resource
-def get_users_with_access(
-    type: str = "write", access_control: Optional[dict] = None
-) -> List[UserModel]:
+def get_users_with_access(type: str = "write", access_control: Optional[dict] = None) -> List[UserModel]:
     if access_control is None:
         return Users.get_users()
 

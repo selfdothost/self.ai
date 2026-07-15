@@ -17,12 +17,12 @@ def test_user_cannot_access_queue(authenticated_user):
 
 
 @pytest.mark.tier0
-def test_queue_with_pending_jobs_shows_them(
-    authenticated_admin, db_session, test_admin
-):
+def test_queue_with_pending_jobs_shows_them(authenticated_admin, db_session, test_admin):
     """A pending curator job appears in the queue."""
+    import time
+    import uuid
+
     from selfai_ui.models.curator_jobs import CuratorJob
-    import uuid, time
 
     job = CuratorJob(
         id=str(uuid.uuid4()),
@@ -45,17 +45,13 @@ def test_queue_with_pending_jobs_shows_them(
 
 @pytest.mark.tier0
 def test_run_now_nonexistent_job_rejected(authenticated_admin):
-    resp = authenticated_admin.post(
-        "/api/jobs/curator/nonexistent-id/run-now"
-    )
+    resp = authenticated_admin.post("/api/jobs/curator/nonexistent-id/run-now")
     assert resp.status_code in (400, 404)
 
 
 @pytest.mark.tier0
 def test_promote_nonexistent_job_rejected(authenticated_admin):
-    resp = authenticated_admin.post(
-        "/api/jobs/curator/nonexistent-id/promote"
-    )
+    resp = authenticated_admin.post("/api/jobs/curator/nonexistent-id/promote")
     assert resp.status_code in (400, 404)
 
 
@@ -63,10 +59,14 @@ def test_promote_nonexistent_job_rejected(authenticated_admin):
 # T-R16: Queue ordering + promotion + entry shape
 # ---------------------------------------------------------------------------
 
+
 def _make_curator_job(db_session, user_id, priority="normal", offset_seconds=0):
     """Insert a curator job with specified priority and created_at offset."""
+    import time
+    import uuid
+
     from selfai_ui.models.curator_jobs import CuratorJob
-    import uuid, time
+
     job = CuratorJob(
         id=str(uuid.uuid4()),
         user_id=user_id,
@@ -96,9 +96,7 @@ def test_queue_entry_shape(authenticated_admin, db_session, test_admin):
 
 
 @pytest.mark.tier0
-def test_queue_ordered_by_created_at(
-    authenticated_admin, db_session, test_admin
-):
+def test_queue_ordered_by_created_at(authenticated_admin, db_session, test_admin):
     """Queue items are sorted by created_at ascending."""
     _make_curator_job(db_session, test_admin["id"], offset_seconds=10)
     _make_curator_job(db_session, test_admin["id"], offset_seconds=0)
@@ -114,9 +112,7 @@ def test_queue_ordered_by_created_at(
 
 
 @pytest.mark.tier0
-def test_queue_includes_multiple_job_types(
-    authenticated_admin, db_session, test_admin
-):
+def test_queue_includes_multiple_job_types(authenticated_admin, db_session, test_admin):
     """Queue returns jobs of all active types (curator, training, eval)."""
     _make_curator_job(db_session, test_admin["id"])
     # Training + eval jobs would need similar helpers; here we just
@@ -128,24 +124,26 @@ def test_queue_includes_multiple_job_types(
 
 
 @pytest.mark.tier0
-def test_queue_excludes_terminal_states(
-    authenticated_admin, db_session, test_admin
-):
+def test_queue_excludes_terminal_states(authenticated_admin, db_session, test_admin):
     """Completed/failed/cancelled jobs do not appear in the active queue."""
+    import time
+    import uuid
+
     from selfai_ui.models.curator_jobs import CuratorJob
-    import uuid, time
 
     for terminal_status in ("completed", "failed", "cancelled"):
-        db_session.add(CuratorJob(
-            id=str(uuid.uuid4()),
-            user_id=test_admin["id"],
-            pipeline_id="p1",
-            status=terminal_status,
-            priority="normal",
-            meta={},
-            created_at=int(time.time()),
-            updated_at=int(time.time()),
-        ))
+        db_session.add(
+            CuratorJob(
+                id=str(uuid.uuid4()),
+                user_id=test_admin["id"],
+                pipeline_id="p1",
+                status=terminal_status,
+                priority="normal",
+                meta={},
+                created_at=int(time.time()),
+                updated_at=int(time.time()),
+            )
+        )
     db_session.commit()
 
     resp = authenticated_admin.get("/api/queue")

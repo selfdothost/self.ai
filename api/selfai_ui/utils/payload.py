@@ -1,9 +1,9 @@
-from selfai_ui.utils.task import prompt_template
+from typing import Callable
+
 from selfai_ui.utils.misc import (
     add_or_update_system_message,
 )
-
-from typing import Callable, Optional
+from selfai_ui.utils.task import prompt_template
 
 
 # inplace function: form_data is modified
@@ -20,16 +20,12 @@ def apply_model_system_prompt_to_body(params: dict, form_data: dict, user) -> di
     else:
         template_params = {}
     system = prompt_template(system, **template_params)
-    form_data["messages"] = add_or_update_system_message(
-        system, form_data.get("messages", [])
-    )
+    form_data["messages"] = add_or_update_system_message(system, form_data.get("messages", []))
     return form_data
 
 
 # inplace function: form_data is modified
-def apply_model_params_to_body(
-    params: dict, form_data: dict, mappings: dict[str, Callable]
-) -> dict:
+def apply_model_params_to_body(params: dict, form_data: dict, mappings: dict[str, Callable]) -> dict:
     if not params:
         return form_data
 
@@ -149,9 +145,7 @@ def convert_payload_openai_to_ollama(openai_payload: dict) -> dict:
 
     # Mapping basic model and message details
     ollama_payload["model"] = openai_payload.get("model")
-    ollama_payload["messages"] = convert_messages_openai_to_ollama(
-        openai_payload.get("messages")
-    )
+    ollama_payload["messages"] = convert_messages_openai_to_ollama(openai_payload.get("messages"))
     ollama_payload["stream"] = openai_payload.get("stream", False)
 
     if "format" in openai_payload:

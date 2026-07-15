@@ -1,18 +1,13 @@
-import json
 import logging
 import time
-from typing import Optional
 import uuid
-
-from selfai_ui.internal.db import Base, get_db
-from selfai_ui.env import SRC_LOG_LEVELS
-
-from selfai_ui.models.files import FileMetadataResponse
-
+from typing import Optional
 
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import BigInteger, Column, String, Text, JSON, func
+from sqlalchemy import JSON, BigInteger, Column, String, Text, func
 
+from selfai_ui.env import SRC_LOG_LEVELS
+from selfai_ui.internal.db import Base, get_db
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MODELS"])
@@ -89,9 +84,7 @@ class GroupUpdateForm(GroupForm):
 
 
 class GroupTable:
-    def insert_new_group(
-        self, user_id: str, form_data: GroupForm
-    ) -> Optional[GroupModel]:
+    def insert_new_group(self, user_id: str, form_data: GroupForm) -> Optional[GroupModel]:
         with get_db() as db:
             group = GroupModel(
                 **{
@@ -119,8 +112,7 @@ class GroupTable:
     def get_groups(self) -> list[GroupModel]:
         with get_db() as db:
             return [
-                GroupModel.model_validate(group)
-                for group in db.query(Group).order_by(Group.updated_at.desc()).all()
+                GroupModel.model_validate(group) for group in db.query(Group).order_by(Group.updated_at.desc()).all()
             ]
 
     def get_groups_by_member_id(self, user_id: str) -> list[GroupModel]:
@@ -128,12 +120,8 @@ class GroupTable:
             return [
                 GroupModel.model_validate(group)
                 for group in db.query(Group)
-                .filter(
-                    func.json_array_length(Group.user_ids) > 0
-                )  # Ensure array exists
-                .filter(
-                    Group.user_ids.cast(String).like(f'%"{user_id}"%')
-                )  # String-based check
+                .filter(func.json_array_length(Group.user_ids) > 0)  # Ensure array exists
+                .filter(Group.user_ids.cast(String).like(f'%"{user_id}"%'))  # String-based check
                 .order_by(Group.updated_at.desc())
                 .all()
             ]
@@ -153,9 +141,7 @@ class GroupTable:
         else:
             return None
 
-    def update_group_by_id(
-        self, id: str, form_data: GroupUpdateForm, overwrite: bool = False
-    ) -> Optional[GroupModel]:
+    def update_group_by_id(self, id: str, form_data: GroupUpdateForm, overwrite: bool = False) -> Optional[GroupModel]:
         try:
             with get_db() as db:
                 # Filter the dump to columns that exist on the Group model —
@@ -163,11 +149,7 @@ class GroupTable:
                 # so an unfiltered update() fails with a no-such-attribute
                 # error on SQLAlchemy's bulk update path.
                 group_columns = {c.name for c in Group.__table__.columns}
-                update_dict = {
-                    k: v
-                    for k, v in form_data.model_dump(exclude_none=True).items()
-                    if k in group_columns
-                }
+                update_dict = {k: v for k, v in form_data.model_dump(exclude_none=True).items() if k in group_columns}
                 update_dict["updated_at"] = int(time.time())
                 db.query(Group).filter_by(id=id).update(update_dict)
                 db.commit()

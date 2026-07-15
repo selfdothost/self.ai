@@ -12,10 +12,11 @@ Usage in tests:
 """
 
 import json
+from contextlib import contextmanager
+
 import httpx
 import pytest
 import respx
-
 
 # ---------------------------------------------------------------------------
 # Service base URLs (match selfai_ui/config.py and env defaults)
@@ -33,6 +34,7 @@ CODE_EVAL_BASE_URL = "http://self-code-eval:5001"
 # Helper: SSE stream builder
 # ---------------------------------------------------------------------------
 
+
 def _sse_stream(events: list[dict]) -> bytes:
     """Build a well-formed SSE byte stream from a list of event dicts."""
     lines = []
@@ -46,6 +48,7 @@ def _sse_stream(events: list[dict]) -> bytes:
 # Mock wrapper class
 # ---------------------------------------------------------------------------
 
+
 class ServiceMock:
     """Wrapper around a respx router for a single external service."""
 
@@ -53,21 +56,29 @@ class ServiceMock:
         self.router = router
         self.base_url = base_url
 
-    def success(self, path: str = "", method: str = "GET",
-                json_body: dict | None = None, status_code: int = 200):
+    def success(
+        self,
+        path: str = "",
+        method: str = "GET",
+        json_body: dict | None = None,
+        status_code: int = 200,
+    ):
         """Mock a successful JSON response."""
         body = json_body or {"status": "ok"}
         route = self.router.request(method, f"{self.base_url}{path}")
         route.mock(return_value=httpx.Response(status_code, json=body))
         return route
 
-    def error(self, path: str = "", method: str = "GET",
-              status_code: int = 500, detail: str = "Internal Server Error"):
+    def error(
+        self,
+        path: str = "",
+        method: str = "GET",
+        status_code: int = 500,
+        detail: str = "Internal Server Error",
+    ):
         """Mock an error response."""
         route = self.router.request(method, f"{self.base_url}{path}")
-        route.mock(return_value=httpx.Response(
-            status_code, json={"detail": detail}
-        ))
+        route.mock(return_value=httpx.Response(status_code, json={"detail": detail}))
         return route
 
     def timeout(self, path: str = "", method: str = "GET"):
@@ -76,17 +87,18 @@ class ServiceMock:
         route.mock(side_effect=httpx.ConnectTimeout("Connection timed out"))
         return route
 
-    def stream(self, path: str = "", method: str = "POST",
-               events: list[dict] | None = None):
+    def stream(self, path: str = "", method: str = "POST", events: list[dict] | None = None):
         """Mock an SSE streaming response."""
         events = events or [{"token": "Hello"}, {"token": " world"}]
         content = _sse_stream(events)
         route = self.router.request(method, f"{self.base_url}{path}")
-        route.mock(return_value=httpx.Response(
-            200,
-            content=content,
-            headers={"content-type": "text/event-stream"},
-        ))
+        route.mock(
+            return_value=httpx.Response(
+                200,
+                content=content,
+                headers={"content-type": "text/event-stream"},
+            )
+        )
         return route
 
     def catch_all(self, status_code: int = 200, json_body: dict | None = None):
@@ -100,6 +112,7 @@ class ServiceMock:
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 def _ollama_base_urls(test_app):
     """Read current Ollama base URLs from app config (list)."""
@@ -171,6 +184,7 @@ def mock_curator():
 # without enforcing that all registered mocks were called. Use sparingly.
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def mock_ollama_lenient(test_app):
     """Ollama mock that blocks unmocked requests but does not require all mocks to be called."""
@@ -178,9 +192,7 @@ def mock_ollama_lenient(test_app):
     with respx.mock(assert_all_called=False, assert_all_mocked=True) as router:
         mock = ServiceMock(router, urls[0])
         # Health check pre-registered to avoid surprise hits during startup
-        router.get(f"{urls[0]}/").mock(
-            return_value=httpx.Response(200, text="Ollama is running")
-        )
+        router.get(f"{urls[0]}/").mock(return_value=httpx.Response(200, text="Ollama is running"))
         router.head(f"{urls[0]}/").mock(return_value=httpx.Response(200))
         yield mock
 
@@ -190,9 +202,7 @@ def mock_llamolotl_lenient(test_app):
     urls = _llamolotl_base_urls(test_app)
     with respx.mock(assert_all_called=False, assert_all_mocked=True) as router:
         mock = ServiceMock(router, urls[0])
-        router.get(f"{urls[0]}/").mock(
-            return_value=httpx.Response(200, json={"status": "ok"})
-        )
+        router.get(f"{urls[0]}/").mock(return_value=httpx.Response(200, json={"status": "ok"}))
         router.head(f"{urls[0]}/").mock(return_value=httpx.Response(200))
         yield mock
 
@@ -201,9 +211,7 @@ def mock_llamolotl_lenient(test_app):
 def mock_curator_lenient():
     with respx.mock(assert_all_called=False, assert_all_mocked=True) as router:
         mock = ServiceMock(router, CURATOR_BASE_URL)
-        router.get(f"{CURATOR_BASE_URL}/health").mock(
-            return_value=httpx.Response(200, json={"status": "healthy"})
-        )
+        router.get(f"{CURATOR_BASE_URL}/health").mock(return_value=httpx.Response(200, json={"status": "healthy"}))
         yield mock
 
 
@@ -228,8 +236,6 @@ def mock_eval_harness_lenient():
 # ---------------------------------------------------------------------------
 # aioresponses strict helper — enforces "at least one mock was called"
 # ---------------------------------------------------------------------------
-
-from contextlib import contextmanager
 
 
 @contextmanager

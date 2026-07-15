@@ -8,29 +8,37 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 
 from selfai_ui.constants import ERROR_MESSAGES
-from selfai_ui.env import SRC_LOG_LEVELS, AIOHTTP_CLIENT_TIMEOUT
-from selfai_ui.models.knowledge import Knowledges, KnowledgeFiles
+from selfai_ui.env import AIOHTTP_CLIENT_TIMEOUT, SRC_LOG_LEVELS
 from selfai_ui.models.files import Files
+from selfai_ui.models.knowledge import KnowledgeFiles, Knowledges
 from selfai_ui.models.training import (
-    TrainingCourses,
     TrainingCourseForm,
     TrainingCourseModel,
+    TrainingCourses,
     TrainingCourseUserModel,
-    TrainingJobs,
     TrainingJobForm,
     TrainingJobModel,
-    TrainingJobWithDetails,
+    TrainingJobs,
     TrainingJobStatusUpdate,
+    TrainingJobWithDetails,
 )
+from selfai_ui.utils.access_control import has_access, has_permission
+from selfai_ui.utils.auth import get_admin_user, get_verified_user
+from selfai_ui.utils.service_auth import TICKET_HEADER, mint_service_ticket
+
+log = logging.getLogger(__name__)
+log.setLevel(SRC_LOG_LEVELS["MODELS"])
 
 # Reference to the running FastAPI app state — set by gpu_queue at startup.
 # Used by _dispatch_scheduled_job to access config (e.g. LLAMOLOTL_CONTROL_BASE_URLS).
 _app_state = None
-from selfai_ui.utils.auth import get_admin_user, get_verified_user
-from selfai_ui.utils.access_control import has_access, has_permission
 
-log = logging.getLogger(__name__)
-log.setLevel(SRC_LOG_LEVELS["MODELS"])
+# Same audience string as routers/llamolotl.py — must match self.llamolotl's
+# SERVICE_AUTH_AUDIENCE (self.llamolotl#12). This module makes its own direct
+# aiohttp calls to the control port instead of going through llamolotl.py's
+# send_get_request/send_post_request/send_delete_request helpers, so it mints
+# and attaches tickets independently here.
+LLAMOLOTL_AUDIENCE = "self.llamolotl"
 
 router = APIRouter()
 
@@ -64,9 +72,7 @@ async def _detect_hf_dataset_format(hf_path: str) -> dict:
     fallback = {"type": "chat_template", "field_messages": "messages"}
     try:
         url = f"{HF_DATASETS_SERVER}/info?dataset={hf_path}"
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=15)
-        ) as session:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
             async with session.get(url) as resp:
                 if resp.status != 200:
                     return fallback
@@ -169,11 +175,7 @@ async def get_course_by_id(id: str, user=Depends(get_verified_user)):
             status_code=status.HTTP_404_NOT_FOUND,
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
-    if (
-        user.role != "admin"
-        and course.user_id != user.id
-        and not has_access(user.id, "read", course.access_control)
-    ):
+    if user.role != "admin" and course.user_id != user.id and not has_access(user.id, "read", course.access_control):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=ERROR_MESSAGES.UNAUTHORIZED,
@@ -328,7 +330,8 @@ async def cancel_job(
                     timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
                 ) as session:
                     await session.delete(
-                        f"{control_url}/api/jobs/{job.llamolotl_job_id}"
+                        f"{control_url}/api/jobs/{job.llamolotl_job_id}",
+                        headers={TICKET_HEADER: mint_service_ticket(LLAMOLOTL_AUDIENCE, "jobs:write")},
                     )
         except Exception as e:
             log.warning(f"Failed to cancel llamolotl job {job.llamolotl_job_id}: {e}")
@@ -374,13 +377,14 @@ async def _upload_local_dataset(kb, control_url: str) -> list[dict]:
             continue
 
         try:
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
-            ) as session:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)) as session:
                 async with session.post(
                     f"{control_url}/api/datasets",
                     json={"name": kb.name or kb.id, "content": content},
-                    headers={"Content-Type": "application/json"},
+                    headers={
+                        "Content-Type": "application/json",
+                        TICKET_HEADER: mint_service_ticket(LLAMOLOTL_AUDIENCE, "jobs:write"),
+                    },
                 ) as resp:
                     if resp.status not in (200, 201):
                         body = await resp.text()
@@ -438,14 +442,15 @@ async def approve_job(
     # ── Heretic jobs: dispatch to /api/heretic/run instead of training ──
     if job.course_id == "heretic":
         try:
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
-            ) as session:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)) as session:
                 payload = {"model_name": job.model_id}
                 async with session.post(
                     f"{control_url}/api/heretic/run",
                     json=payload,
-                    headers={"Content-Type": "application/json"},
+                    headers={
+                        "Content-Type": "application/json",
+                        TICKET_HEADER: mint_service_ticket(LLAMOLOTL_AUDIENCE, "jobs:create"),
+                    },
                 ) as resp:
                     if resp.status not in (200, 201):
                         body = await resp.text()
@@ -553,16 +558,17 @@ async def approve_job(
     )
 
     try:
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
-        ) as session:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)) as session:
             payload = {
                 "config_inline": config_yaml,
             }
             async with session.post(
                 f"{control_url}/api/jobs",
                 json=payload,
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    TICKET_HEADER: mint_service_ticket(LLAMOLOTL_AUDIENCE, "jobs:create"),
+                },
             ) as resp:
                 if resp.status not in (200, 201):
                     body = await resp.text()
@@ -582,12 +588,13 @@ async def approve_job(
 
     # Approve the job in llamolotl too
     try:
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
-        ) as session:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)) as session:
             await session.post(
                 f"{control_url}/api/jobs/{llamolotl_job_id}/approve",
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    TICKET_HEADER: mint_service_ticket(LLAMOLOTL_AUDIENCE, "jobs:write"),
+                },
             )
     except Exception as e:
         log.warning(f"Failed to auto-approve llamolotl job {llamolotl_job_id}: {e}")
@@ -674,11 +681,10 @@ async def sync_job_status(
     # Heretic jobs use the pipeline task API, not the training jobs API
     if job.course_id == "heretic":
         try:
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as session:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
                 async with session.get(
-                    f"{control_url}/api/heretic/status/{job.llamolotl_job_id}"
+                    f"{control_url}/api/heretic/status/{job.llamolotl_job_id}",
+                    headers={TICKET_HEADER: mint_service_ticket(LLAMOLOTL_AUDIENCE, "jobs:read")},
                 ) as resp:
                     if resp.status == 404:
                         raise HTTPException(
@@ -718,11 +724,10 @@ async def sync_job_status(
 
     # Standard training jobs
     try:
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=30)
-        ) as session:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
             async with session.get(
-                f"{control_url}/api/jobs/{job.llamolotl_job_id}"
+                f"{control_url}/api/jobs/{job.llamolotl_job_id}",
+                headers={TICKET_HEADER: mint_service_ticket(LLAMOLOTL_AUDIENCE, "jobs:read")},
             ) as resp:
                 if resp.status == 404:
                     raise HTTPException(
@@ -799,9 +804,7 @@ async def schedule_job(
             detail="Scheduled time must be in the future",
         )
 
-    return TrainingJobs.update_job_scheduled_for(
-        id=id, scheduled_for=form_data.scheduled_for
-    )
+    return TrainingJobs.update_job_scheduled_for(id=id, scheduled_for=form_data.scheduled_for)
 
 
 @router.post("/jobs/{id}/unschedule", response_model=Optional[TrainingJobModel])
@@ -940,14 +943,15 @@ async def _dispatch_scheduled_job(job: TrainingJobModel) -> None:
     )
 
     try:
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
-        ) as session:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)) as session:
             payload = {"config_inline": config_yaml}
             async with session.post(
                 f"{control_url}/api/jobs",
                 json=payload,
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    TICKET_HEADER: mint_service_ticket(LLAMOLOTL_AUDIENCE, "jobs:create"),
+                },
             ) as resp:
                 if resp.status not in (200, 201):
                     body = await resp.text()
@@ -973,12 +977,13 @@ async def _dispatch_scheduled_job(job: TrainingJobModel) -> None:
 
     # Auto-approve on Llamolotl side
     try:
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
-        ) as session:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)) as session:
             await session.post(
                 f"{control_url}/api/jobs/{llamolotl_job_id}/approve",
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    TICKET_HEADER: mint_service_ticket(LLAMOLOTL_AUDIENCE, "jobs:write"),
+                },
             )
     except Exception as e:
         log.warning(f"Failed to auto-approve llamolotl job {llamolotl_job_id}: {e}")
@@ -996,10 +1001,7 @@ async def _dispatch_scheduled_job(job: TrainingJobModel) -> None:
             llamolotl_url_idx=url_idx,
         ),
     )
-    log.info(
-        f"Scheduled training job {job.id} dispatched as llamolotl job {llamolotl_job_id}"
-    )
-
+    log.info(f"Scheduled training job {job.id} dispatched as llamolotl job {llamolotl_job_id}")
 
     # Standalone process_training_schedule removed — the unified
     # gpu_queue.process_gpu_queue() handles both training and eval jobs.

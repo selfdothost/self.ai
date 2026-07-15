@@ -1,38 +1,41 @@
-from typing import List, Optional
-from pydantic import BaseModel
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+import json
 import logging
 import os
-import json
 import re
-import aiohttp
+from typing import List, Optional
 
+import aiohttp
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from pydantic import BaseModel
+
+from selfai_ui.config import UPLOAD_DIR
+from selfai_ui.constants import ERROR_MESSAGES
+from selfai_ui.env import SRC_LOG_LEVELS
+from selfai_ui.models.files import FileModel, Files
 from selfai_ui.models.knowledge import (
-    Knowledges,
     KnowledgeFiles,
     KnowledgeForm,
     KnowledgeResponse,
+    Knowledges,
     KnowledgeUserResponse,
 )
-from selfai_ui.models.files import Files, FileModel
 from selfai_ui.retrieval.vector.connector import VECTOR_DB_CLIENT
 from selfai_ui.routers.retrieval import (
-    process_file,
-    ProcessFileForm,
-    process_files_batch,
     BatchProcessFilesForm,
+    ProcessFileForm,
+    process_file,
+    process_files_batch,
 )
-
-
-from selfai_ui.constants import ERROR_MESSAGES
-from selfai_ui.utils.auth import get_verified_user
-from selfai_ui.utils.access_control import has_access, has_permission
 from selfai_ui.storage.provider import Storage
-from selfai_ui.config import UPLOAD_DIR
-
-
-from selfai_ui.env import SRC_LOG_LEVELS
-
+from selfai_ui.utils.access_control import has_access, has_permission
+from selfai_ui.utils.auth import get_admin_user, get_verified_user
+from selfai_ui.utils.self_corpus import (
+    SelfCorpusError,
+    backfill_missing_repos,
+    create_repository,
+    delete_repository,
+    repo_id_for_kb,
+)
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MODELS"])
@@ -76,6 +79,23 @@ def _move_file_to_kb(file: FileModel, knowledge_id: str) -> None:
 HF_HUB_DATASETS_API = "https://huggingface.co/api/datasets"
 HF_DATASETS_SERVER = "https://datasets-server.huggingface.co"
 
+# HF dataset identifiers are either "org/name" or a bare canonical name
+# ("squad", "imdb"). No shape check let arbitrary strings reach these
+# endpoints -- most importantly unescaped `&`/`#` could override the
+# hardcoded config/split/offset/length params on the datasets-server query
+# below (self.ai#14).
+_HF_PATH_RE = re.compile(r"^[\w.\-]+(/[\w.\-]+)?$")
+
+
+def _validate_hf_path(hf_path: Optional[str]) -> str:
+    hf_path = (hf_path or "").strip().strip("/")
+    if not hf_path or not _HF_PATH_RE.match(hf_path):
+        raise HTTPException(
+            status_code=400,
+            detail="hf_path must look like 'name' or 'org/name'",
+        )
+    return hf_path
+
 
 def _clean_hf_description(raw: str, max_len: int = 700) -> str:
     """Turn a HuggingFace dataset-card blob into a short plain-text summary.
@@ -88,7 +108,12 @@ def _clean_hf_description(raw: str, max_len: int = 700) -> str:
     if not raw:
         return ""
     text = raw.replace("\t", " ")
-    skip_exact = {"dataset card", "dataset summary", "dataset details", "table of contents"}
+    skip_exact = {
+        "dataset card",
+        "dataset summary",
+        "dataset details",
+        "table of contents",
+    }
     paras = []
     for ln in text.splitlines():
         ln = re.sub(r"[ ]+", " ", ln).strip()
@@ -110,9 +135,7 @@ async def get_hf_dataset_info(hf_path: str, user=Depends(get_verified_user)):
     dataset KB detail view: pretty name, a cleaned description, the detected
     training format, and task tags. Any field that can't be resolved comes back
     empty/None so the UI can fall back to manual entry."""
-    hf_path = (hf_path or "").strip().strip("/")
-    if not hf_path:
-        raise HTTPException(status_code=400, detail="hf_path is required")
+    hf_path = _validate_hf_path(hf_path)
 
     result = {
         "hf_path": hf_path,
@@ -124,9 +147,7 @@ async def get_hf_dataset_info(hf_path: str, user=Depends(get_verified_user)):
 
     # 1) Hub API — pretty name + dataset-card description + task tags.
     try:
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=15)
-        ) as session:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
             async with session.get(
                 f"{HF_HUB_DATASETS_API}/{hf_path}",
                 headers={"User-Agent": "self.ai UI"},
@@ -156,27 +177,18 @@ async def get_hf_dataset_info(hf_path: str, user=Depends(get_verified_user)):
 
 
 @router.get("/hf/dataset-rows")
-async def get_hf_dataset_rows(
-    hf_path: str, length: int = 5, user=Depends(get_verified_user)
-):
+async def get_hf_dataset_rows(hf_path: str, length: int = 5, user=Depends(get_verified_user)):
     """A small row preview for the dataset KB detail view, proxied from the HF
     datasets-server /rows API (avoids the browser needing HF egress/CORS)."""
-    hf_path = (hf_path or "").strip().strip("/")
-    if not hf_path:
-        raise HTTPException(status_code=400, detail="hf_path is required")
+    hf_path = _validate_hf_path(hf_path)
     length = max(1, min(length, 20))
 
     try:
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=20)
-        ) as session:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
             # config/split default to the first available; datasets-server
             # accepts config=default&split=train for the common case.
-            url = (
-                f"{HF_DATASETS_SERVER}/rows?dataset={hf_path}"
-                f"&config=default&split=train&offset=0&length={length}"
-            )
-            async with session.get(url) as resp:
+            params = {"dataset": hf_path, "config": "default", "split": "train", "offset": 0, "length": length}
+            async with session.get(f"{HF_DATASETS_SERVER}/rows", params=params) as resp:
                 if resp.status != 200:
                     return {"columns": [], "rows": []}
                 data = await resp.json()
@@ -199,9 +211,7 @@ async def get_dataset_rows(id: str, length: int = 5, user=Depends(get_verified_u
     if not knowledge:
         raise HTTPException(status_code=404, detail=ERROR_MESSAGES.NOT_FOUND)
     if not (
-        user.role == "admin"
-        or knowledge.user_id == user.id
-        or has_access(user.id, "read", knowledge.access_control)
+        user.role == "admin" or knowledge.user_id == user.id or has_access(user.id, "read", knowledge.access_control)
     ):
         raise HTTPException(status_code=401, detail=ERROR_MESSAGES.NOT_FOUND)
 
@@ -300,9 +310,7 @@ async def get_knowledge_list(user=Depends(get_verified_user)):
 
 
 @router.post("/create", response_model=Optional[KnowledgeResponse])
-async def create_new_knowledge(
-    request: Request, form_data: KnowledgeForm, user=Depends(get_verified_user)
-):
+async def create_new_knowledge(request: Request, form_data: KnowledgeForm, user=Depends(get_verified_user)):
     if user.role != "admin" and not has_permission(
         user.id, "workspace.knowledge", request.app.state.config.USER_PERMISSIONS
     ):
@@ -313,13 +321,59 @@ async def create_new_knowledge(
 
     knowledge = Knowledges.insert_new_knowledge(user.id, form_data)
 
-    if knowledge:
-        return knowledge
-    else:
+    if not knowledge:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=ERROR_MESSAGES.FILE_EXISTS,
         )
+
+    # self.corpus repo-creation event — Public path only (first slice,
+    # self.ai/self.ai#32). access_control is None means public per the
+    # existing Knowledge access-control convention (knowledge.py model).
+    # Private (per-user) connections are future work, not this hook.
+    cfg = request.app.state.config
+    if cfg.ENABLE_SELF_CORPUS and knowledge.access_control is None:
+        try:
+            corpus_repo = repo_id_for_kb(knowledge.id)
+            await create_repository(
+                endpoint=cfg.SELF_CORPUS_LAKEFS_ENDPOINT,
+                access_key_id=cfg.SELF_CORPUS_LAKEFS_ACCESS_KEY_ID,
+                secret_access_key=cfg.SELF_CORPUS_LAKEFS_SECRET_ACCESS_KEY,
+                repo_id=corpus_repo,
+            )
+            updated = Knowledges.update_knowledge_meta_by_id(
+                knowledge.id,
+                {**(knowledge.meta or {}), "self_corpus": {"repo": corpus_repo}},
+            )
+            if updated:
+                knowledge = updated
+        except SelfCorpusError as e:
+            # Best-effort: a self.corpus outage shouldn't block KB creation —
+            # same soft-disabled degradation posture as self.curator's own
+            # write path. Surfaced in logs, not to the caller.
+            log.error(f"self.corpus repo creation failed for KB {knowledge.id}: {e}")
+
+    return knowledge
+
+
+############################
+# BackfillSelfCorpusRepos
+############################
+
+
+@router.post("/self-corpus/backfill")
+async def backfill_self_corpus_repos(request: Request, user=Depends(get_admin_user)):
+    """Admin-triggered catch-up for public KB/Dataset rows missing a
+    self.corpus repo — e.g. rows created before self.corpus was reachable, or
+    before self.ai-public's ACL grant covered repo creation
+    (self.corpus/self.corpus#3). Runs automatically on every pod startup too
+    (main.py); this lets it be re-run immediately without a restart."""
+    if not request.app.state.config.ENABLE_SELF_CORPUS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="ENABLE_SELF_CORPUS is False",
+        )
+    return await backfill_missing_repos(request.app.state)
 
 
 ############################
@@ -444,11 +498,9 @@ def add_file_to_knowledge_by_id(
         _move_file_to_kb(file, id)
 
     # Add content to the vector database
-    if not file.filename.endswith('_pipeline.json'):
+    if not file.filename.endswith("_pipeline.json"):
         try:
-            process_file(
-                request, ProcessFileForm(file_id=form_data.file_id, collection_name=id)
-            )
+            process_file(request, ProcessFileForm(file_id=form_data.file_id, collection_name=id))
         except Exception as e:
             log.debug(e)
             raise HTTPException(
@@ -500,16 +552,12 @@ def update_file_from_knowledge_by_id(
         )
 
     # Remove content from the vector database
-    VECTOR_DB_CLIENT.delete(
-        collection_name=knowledge.id, filter={"file_id": form_data.file_id}
-    )
+    VECTOR_DB_CLIENT.delete(collection_name=knowledge.id, filter={"file_id": form_data.file_id})
 
     # Add content to the vector database
-    if not file.filename.endswith('_pipeline.json'):
+    if not file.filename.endswith("_pipeline.json"):
         try:
-            process_file(
-                request, ProcessFileForm(file_id=form_data.file_id, collection_name=id)
-            )
+            process_file(request, ProcessFileForm(file_id=form_data.file_id, collection_name=id))
         except Exception as e:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -557,10 +605,8 @@ def remove_file_from_knowledge_by_id(
         )
 
     # Remove content from the vector database
-    if not file.filename.endswith('_pipeline.json'):
-        VECTOR_DB_CLIENT.delete(
-            collection_name=knowledge.id, filter={"file_id": form_data.file_id}
-        )
+    if not file.filename.endswith("_pipeline.json"):
+        VECTOR_DB_CLIENT.delete(collection_name=knowledge.id, filter={"file_id": form_data.file_id})
 
     # Remove file association via join table
     KnowledgeFiles.remove_file_from_knowledge(id, form_data.file_id)
@@ -580,7 +626,7 @@ def remove_file_from_knowledge_by_id(
 
 
 @router.delete("/{id}/delete", response_model=bool)
-async def delete_knowledge_by_id(id: str, user=Depends(get_verified_user)):
+async def delete_knowledge_by_id(request: Request, id: str, user=Depends(get_verified_user)):
     knowledge = Knowledges.get_knowledge_by_id(id=id)
     if not knowledge:
         raise HTTPException(
@@ -600,6 +646,20 @@ async def delete_knowledge_by_id(id: str, user=Depends(get_verified_user)):
         log.debug(e)
         pass
     Storage.delete_subdirectory(id)
+
+    corpus_repo = (knowledge.meta or {}).get("self_corpus", {}).get("repo")
+    if corpus_repo:
+        cfg = request.app.state.config
+        try:
+            await delete_repository(
+                endpoint=cfg.SELF_CORPUS_LAKEFS_ENDPOINT,
+                access_key_id=cfg.SELF_CORPUS_LAKEFS_ACCESS_KEY_ID,
+                secret_access_key=cfg.SELF_CORPUS_LAKEFS_SECRET_ACCESS_KEY,
+                repo_id=corpus_repo,
+            )
+        except SelfCorpusError as e:
+            log.error(f"self.corpus repo deletion failed for KB {id}: {e}")
+
     result = Knowledges.delete_knowledge_by_id(id=id)
     return result
 
@@ -688,9 +748,7 @@ def add_files_to_knowledge_batch(
             user=user,
         )
     except Exception as e:
-        log.error(
-            f"add_files_to_knowledge_batch: Exception occurred: {e}", exc_info=True
-        )
+        log.error(f"add_files_to_knowledge_batch: Exception occurred: {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
     # Add successful files to knowledge base via join table
@@ -715,14 +773,13 @@ def add_files_to_knowledge_batch(
             },
         )
 
-    return KnowledgeFilesResponse(
-        **knowledge.model_dump(), files=Files.get_files_by_ids(all_file_ids)
-    )
+    return KnowledgeFilesResponse(**knowledge.model_dump(), files=Files.get_files_by_ids(all_file_ids))
 
 
 ############################
 # PrepareInput (for Curator)
 ############################
+
 
 @router.post("/{id}/prepare-input")
 async def prepare_curator_input(
@@ -730,7 +787,8 @@ async def prepare_curator_input(
     id: str,
     user=Depends(get_verified_user),
 ):
-    import json, os
+    import json
+    import os
     from datetime import datetime
 
     knowledge = Knowledges.get_knowledge_by_id(id=id)
@@ -748,28 +806,33 @@ async def prepare_curator_input(
     os.makedirs(curator_dir, exist_ok=True)
     output_file = os.path.join(curator_dir, f"{id}_{timestamp}.jsonl")
 
-    # Pull extracted text from all non-pipeline files in this KB
-    file_ids = KnowledgeFiles.get_file_ids_by_knowledge_id(id)
-    files = Files.get_files_by_ids(file_ids)
-
+    # Stream files in batches — KBs regularly carry thousands to millions of
+    # documents now, and loading every file's full extracted content into
+    # one list before writing a line (the old get_file_ids_by_knowledge_id +
+    # Files.get_files_by_ids pairing) doesn't scale.
     count = 0
     with open(output_file, "w") as f:
-        for file in files:
-            if (file.filename or "").endswith("_pipeline.json"):
-                continue
-            content = (file.data or {}).get("content", "")
-            if not content:
-                continue
-            record = {
-                "id": file.id,
-                "text": content,
-                "source": file.filename,
-            }
-            f.write(json.dumps(record) + "\n")
-            count += 1
+        for batch in KnowledgeFiles.iter_files_by_knowledge_id(id):
+            for file in batch:
+                if (file.filename or "").endswith("_pipeline.json"):
+                    continue
+                content = (file.data or {}).get("content", "")
+                if not content:
+                    continue
+                record = {
+                    "id": file.id,
+                    "text": content,
+                    "source": file.filename,
+                }
+                f.write(json.dumps(record) + "\n")
+                count += 1
 
     log.info(f"Exported {count} files from KB {id} to {output_file}")
 
     # Return the curator-visible path (shared volume mount)
     curator_path = output_file.replace("/app/backend/data", "/workspace/ui-data")
-    return {"input_path": curator_path, "file_count": count, "output_format": "parquet" if request.app.state.config.ICEBERG_BASE_URL else "jsonl"}
+    return {
+        "input_path": curator_path,
+        "file_count": count,
+        "output_format": ("parquet" if request.app.state.config.ICEBERG_BASE_URL else "jsonl"),
+    }

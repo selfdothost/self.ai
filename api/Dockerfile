@@ -33,13 +33,19 @@ ENV SENTENCE_TRANSFORMERS_HOME="/app/backend/data/cache/embedding/models" \
 WORKDIR /app/backend
 
 # Minimal system deps: a build toolchain for the few sdist-only wheels, pandoc
-# for document parsing, curl+jq for the healthcheck. Deliberately NO ffmpeg /
-# libsm6 / libxext6 (those were for OCR/cv2, dropped) and NO CUDA.
+# for document parsing, curl+jq for the healthcheck, ffmpeg for pydub's
+# mediainfo()/ffprobe call in audio.py's is_mp4_audio() check (the STT-forward
+# path to self.transcribe crashed with "No such file or directory: 'ffprobe'"
+# on any mp4/AAC browser recording -- this image previously shipped with no
+# ffmpeg at all, on the assumption STT was fully externalized and wouldn't
+# need it locally; that assumption was wrong, the mp4-detection probe runs
+# regardless of engine). Still NO libsm6/libxext6 (those were for OCR/cv2,
+# dropped) and NO CUDA -- this stays torch-free.
 # TODO(slim): move to a multi-stage build to drop build-essential from runtime.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       build-essential gcc python3-dev \
-      pandoc netcat-openbsd curl jq ca-certificates && \
+      pandoc netcat-openbsd curl jq ca-certificates ffmpeg && \
     rm -rf /var/lib/apt/lists/*
 
 # Python deps — slim API set (no torch, no model downloads).

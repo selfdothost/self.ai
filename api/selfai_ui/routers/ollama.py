@@ -1,6 +1,9 @@
-# TODO: Implement a more intelligent load balancing mechanism for distributing requests among multiple backend instances.
-# Current implementation uses a simple round-robin approach (random.choice). Consider incorporating algorithms like weighted round-robin,
-# least connections, or least response time for better resource utilization and performance optimization.
+# TODO: Implement a more intelligent load balancing mechanism for distributing
+# requests among multiple backend instances.
+# Current implementation uses a simple round-robin approach (random.choice).
+# Consider incorporating algorithms like weighted round-robin, least
+# connections, or least response time for better resource utilization and
+# performance optimization.
 
 import asyncio
 import json
@@ -13,26 +16,33 @@ from typing import Optional, Union
 from urllib.parse import urlparse
 
 import aiohttp
-from aiocache import cached
-
 import requests
-
+from aiocache import cached
 from fastapi import (
+    APIRouter,
     Depends,
-    FastAPI,
     File,
     HTTPException,
     Request,
     UploadFile,
-    APIRouter,
 )
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 from starlette.background import BackgroundTask
 
-
+from selfai_ui.config import (
+    UPLOAD_DIR,
+)
+from selfai_ui.constants import ERROR_MESSAGES
+from selfai_ui.env import (
+    AIOHTTP_CLIENT_TIMEOUT,
+    AIOHTTP_CLIENT_TIMEOUT_OPENAI_MODEL_LIST,
+    BYPASS_MODEL_ACCESS_CONTROL,
+    SRC_LOG_LEVELS,
+)
 from selfai_ui.models.models import Models
+from selfai_ui.utils.access_control import has_access
+from selfai_ui.utils.auth import get_admin_user, get_verified_user
 from selfai_ui.utils.misc import (
     calculate_sha256,
 )
@@ -41,21 +51,6 @@ from selfai_ui.utils.payload import (
     apply_model_params_to_body_openai,
     apply_model_system_prompt_to_body,
 )
-from selfai_ui.utils.auth import get_admin_user, get_verified_user
-from selfai_ui.utils.access_control import has_access
-
-
-from selfai_ui.config import (
-    UPLOAD_DIR,
-)
-from selfai_ui.env import (
-    ENV,
-    SRC_LOG_LEVELS,
-    AIOHTTP_CLIENT_TIMEOUT,
-    AIOHTTP_CLIENT_TIMEOUT_OPENAI_MODEL_LIST,
-    BYPASS_MODEL_ACCESS_CONTROL,
-)
-from selfai_ui.constants import ERROR_MESSAGES
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["OLLAMA"])
@@ -72,9 +67,7 @@ async def send_get_request(url, key=None):
     timeout = aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT_OPENAI_MODEL_LIST)
     try:
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
-            async with session.get(
-                url, headers={**({"Authorization": f"Bearer {key}"} if key else {})}
-            ) as response:
+            async with session.get(url, headers={**({"Authorization": f"Bearer {key}"} if key else {})}) as response:
                 return await response.json()
     except Exception as e:
         # Handle connection error here
@@ -102,9 +95,7 @@ async def send_post_request(
 
     r = None
     try:
-        session = aiohttp.ClientSession(
-            trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
-        )
+        session = aiohttp.ClientSession(trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT))
 
         r = await session.post(
             url,
@@ -126,9 +117,7 @@ async def send_post_request(
                 r.content,
                 status_code=r.status,
                 headers=response_headers,
-                background=BackgroundTask(
-                    cleanup_response, response=r, session=session
-                ),
+                background=BackgroundTask(cleanup_response, response=r, session=session),
             )
         else:
             res = await r.json()
@@ -179,9 +168,7 @@ class ConnectionVerificationForm(BaseModel):
 
 
 @router.post("/verify")
-async def verify_connection(
-    form_data: ConnectionVerificationForm, user=Depends(get_admin_user)
-):
+async def verify_connection(form_data: ConnectionVerificationForm, user=Depends(get_admin_user)):
     url = form_data.url
     key = form_data.key
 
@@ -205,9 +192,7 @@ async def verify_connection(
                 return data
         except aiohttp.ClientError as e:
             log.exception(f"Client error: {str(e)}")
-            raise HTTPException(
-                status_code=500, detail="Self.AI UI: Server Connection Error"
-            )
+            raise HTTPException(status_code=500, detail="Self.AI UI: Server Connection Error")
         except Exception as e:
             log.exception(f"Unexpected error: {e}")
             error_detail = f"Unexpected error: {str(e)}"
@@ -230,9 +215,7 @@ class OllamaConfigForm(BaseModel):
 
 
 @router.post("/config/update")
-async def update_config(
-    request: Request, form_data: OllamaConfigForm, user=Depends(get_admin_user)
-):
+async def update_config(request: Request, form_data: OllamaConfigForm, user=Depends(get_admin_user)):
     request.app.state.config.ENABLE_OLLAMA_API = form_data.ENABLE_OLLAMA_API
 
     request.app.state.config.OLLAMA_BASE_URLS = form_data.OLLAMA_BASE_URLS
@@ -319,9 +302,7 @@ async def get_all_models(request: Request):
     else:
         models = {"models": []}
 
-    request.app.state.OLLAMA_MODELS = {
-        model["model"]: model for model in models["models"]
-    }
+    request.app.state.OLLAMA_MODELS = {model["model"]: model for model in models["models"]}
     return models
 
 
@@ -340,9 +321,7 @@ async def get_filtered_models(models, user):
 
 @router.get("/api/tags")
 @router.get("/api/tags/{url_idx}")
-async def get_ollama_tags(
-    request: Request, url_idx: Optional[int] = None, user=Depends(get_verified_user)
-):
+async def get_ollama_tags(request: Request, url_idx: Optional[int] = None, user=Depends(get_verified_user)):
     models = []
 
     if url_idx is None:
@@ -396,9 +375,7 @@ async def get_ollama_versions(request: Request, url_idx: Optional[int] = None):
             request_tasks = [
                 send_get_request(
                     f"{url}/api/version",
-                    request.app.state.config.OLLAMA_API_CONFIGS.get(url, {}).get(
-                        "key", None
-                    ),
+                    request.app.state.config.OLLAMA_API_CONFIGS.get(url, {}).get("key", None),
                 )
                 for url in request.app.state.config.OLLAMA_BASE_URLS
             ]
@@ -408,9 +385,7 @@ async def get_ollama_versions(request: Request, url_idx: Optional[int] = None):
             if len(responses) > 0:
                 lowest_version = min(
                     responses,
-                    key=lambda x: tuple(
-                        map(int, re.sub(r"^v|-.*", "", x["version"]).split("."))
-                    ),
+                    key=lambda x: tuple(map(int, re.sub(r"^v|-.*", "", x["version"]).split("."))),
                 )
 
                 return {"version": lowest_version["version"]}
@@ -457,9 +432,7 @@ async def get_ollama_loaded_models(request: Request, user=Depends(get_verified_u
         request_tasks = [
             send_get_request(
                 f"{url}/api/ps",
-                request.app.state.config.OLLAMA_API_CONFIGS.get(url, {}).get(
-                    "key", None
-                ),
+                request.app.state.config.OLLAMA_API_CONFIGS.get(url, {}).get("key", None),
             )
             for url in request.app.state.config.OLLAMA_BASE_URLS
         ]
@@ -672,9 +645,7 @@ async def delete_model(
 
 
 @router.post("/api/show")
-async def show_model_info(
-    request: Request, form_data: ModelNameForm, user=Depends(get_verified_user)
-):
+async def show_model_info(request: Request, form_data: ModelNameForm, user=Depends(get_verified_user)):
     await get_all_models(request)
     models = request.app.state.OLLAMA_MODELS
 
@@ -980,18 +951,14 @@ async def generate_chat_completion(
             if payload.get("options") is None:
                 payload["options"] = {}
 
-            payload["options"] = apply_model_params_to_body_ollama(
-                params, payload["options"]
-            )
+            payload["options"] = apply_model_params_to_body_ollama(params, payload["options"])
             payload = apply_model_system_prompt_to_body(params, payload, user)
 
         # Check if user has access to the model
         if not bypass_filter and user.role == "user":
             if not (
                 user.id == model_info.user_id
-                or has_access(
-                    user.id, type="read", access_control=model_info.access_control
-                )
+                or has_access(user.id, type="read", access_control=model_info.access_control)
             ):
                 raise HTTPException(
                     status_code=403,
@@ -1088,9 +1055,7 @@ async def generate_openai_completion(
         if user.role == "user":
             if not (
                 user.id == model_info.user_id
-                or has_access(
-                    user.id, type="read", access_control=model_info.access_control
-                )
+                or has_access(user.id, type="read", access_control=model_info.access_control)
             ):
                 raise HTTPException(
                     status_code=403,
@@ -1162,9 +1127,7 @@ async def generate_openai_chat_completion(
         if user.role == "user":
             if not (
                 user.id == model_info.user_id
-                or has_access(
-                    user.id, type="read", access_control=model_info.access_control
-                )
+                or has_access(user.id, type="read", access_control=model_info.access_control)
             ):
                 raise HTTPException(
                     status_code=403,
@@ -1291,9 +1254,7 @@ def parse_huggingface_url(hf_url):
         return None
 
 
-async def download_file_stream(
-    ollama_url, file_url, file_path, file_name, chunk_size=1024 * 1024
-):
+async def download_file_stream(ollama_url, file_url, file_path, file_name, chunk_size=1024 * 1024):
     done = False
 
     if os.path.exists(file_path):
@@ -1434,9 +1395,7 @@ def upload_model(
                         os.remove(file_path)
                         yield f"data: {json.dumps(res)}\n\n"
                     else:
-                        raise Exception(
-                            "Ollama: Could not create blob, Please try again."
-                        )
+                        raise Exception("Ollama: Could not create blob, Please try again.")
 
         except Exception as e:
             res = {"error": str(e)}

@@ -1,11 +1,10 @@
+import logging
 import os
 import re
 import subprocess
 import sys
-from importlib import util
-import types
 import tempfile
-import logging
+import types
 
 from selfai_ui.env import SRC_LOG_LEVELS
 from selfai_ui.models.functions import Functions
@@ -173,3 +172,23 @@ def install_frontmatter_requirements(requirements):
             subprocess.check_call([sys.executable, "-m", "pip", "install", req])
     else:
         log.info("No requirements found in frontmatter.")
+
+
+def get_function_priority(function_id: str) -> int:
+    """Return a filter function's configured dispatch priority (default 0).
+
+    `FunctionModel` (the pydantic read model returned by
+    `Functions.get_function_by_id`) deliberately omits `valves` -- same as
+    `ToolModel` for tools -- since valves are only meant to be read straight
+    off the ORM row via `Functions.get_function_valves_by_id`, not exposed
+    on the general-purpose serialized model. A previous version of the two
+    call sites (chat.py's `chat_completed` and middleware.py's
+    `chat_completion_filter_functions_handler`) each carried their own
+    `get_priority` closure that checked `hasattr(function_model, "valves")`
+    on that pydantic model -- which is always False, so priority silently
+    defaulted to 0 for every filter. This reads valves the same way
+    `Functions.get_function_valves_by_id` / `get_tool_valves_by_id` already
+    do, and gives both call sites one shared implementation.
+    """
+    valves = Functions.get_function_valves_by_id(function_id)
+    return (valves or {}).get("priority", 0)

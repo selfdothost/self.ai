@@ -48,9 +48,7 @@ def test_update_group(authenticated_admin):
         },
     )
     assert resp.status_code == 200
-    refetch = authenticated_admin.get(
-        f"/api/v1/groups/id/{created['id']}"
-    ).json()
+    refetch = authenticated_admin.get(f"/api/v1/groups/id/{created['id']}").json()
     assert refetch["description"] == "new"
 
 
@@ -60,9 +58,7 @@ def test_delete_group(authenticated_admin):
         "/api/v1/groups/create",
         json={"name": "g-del", "description": ""},
     ).json()
-    resp = authenticated_admin.delete(
-        f"/api/v1/groups/id/{created['id']}/delete"
-    )
+    resp = authenticated_admin.delete(f"/api/v1/groups/id/{created['id']}/delete")
     assert resp.status_code == 200
 
 

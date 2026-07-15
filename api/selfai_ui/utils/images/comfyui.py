@@ -7,8 +7,9 @@ import urllib.request
 from typing import Optional
 
 import websocket  # NOTE: websocket-client (https://github.com/websocket-client/websocket-client)
-from selfai_ui.env import SRC_LOG_LEVELS
 from pydantic import BaseModel
+
+from selfai_ui.env import SRC_LOG_LEVELS
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["COMFYUI"])
@@ -84,9 +85,7 @@ def get_images(ws, prompt, client_id, base_url, api_key):
             node_output = history["outputs"][node_id]
             if "images" in node_output:
                 for image in node_output["images"]:
-                    url = get_image_url(
-                        image["filename"], image["subfolder"], image["type"], base_url
-                    )
+                    url = get_image_url(image["filename"], image["subfolder"], image["type"], base_url)
                     output_images.append({"url": url})
     return {"data": output_images}
 
@@ -116,9 +115,7 @@ class ComfyUIGenerateImageForm(BaseModel):
     seed: Optional[int] = None
 
 
-async def comfyui_generate_image(
-    model: str, payload: ComfyUIGenerateImageForm, client_id, base_url, api_key
-):
+async def comfyui_generate_image(model: str, payload: ComfyUIGenerateImageForm, client_id, base_url, api_key):
     ws_url = base_url.replace("http://", "ws://").replace("https://", "wss://")
     workflow = json.loads(payload.workflow.workflow)
 
@@ -129,40 +126,24 @@ async def comfyui_generate_image(
                     workflow[node_id]["inputs"][node.key] = model
             elif node.type == "prompt":
                 for node_id in node.node_ids:
-                    workflow[node_id]["inputs"][
-                        node.key if node.key else "text"
-                    ] = payload.prompt
+                    workflow[node_id]["inputs"][node.key if node.key else "text"] = payload.prompt
             elif node.type == "negative_prompt":
                 for node_id in node.node_ids:
-                    workflow[node_id]["inputs"][
-                        node.key if node.key else "text"
-                    ] = payload.negative_prompt
+                    workflow[node_id]["inputs"][node.key if node.key else "text"] = payload.negative_prompt
             elif node.type == "width":
                 for node_id in node.node_ids:
-                    workflow[node_id]["inputs"][
-                        node.key if node.key else "width"
-                    ] = payload.width
+                    workflow[node_id]["inputs"][node.key if node.key else "width"] = payload.width
             elif node.type == "height":
                 for node_id in node.node_ids:
-                    workflow[node_id]["inputs"][
-                        node.key if node.key else "height"
-                    ] = payload.height
+                    workflow[node_id]["inputs"][node.key if node.key else "height"] = payload.height
             elif node.type == "n":
                 for node_id in node.node_ids:
-                    workflow[node_id]["inputs"][
-                        node.key if node.key else "batch_size"
-                    ] = payload.n
+                    workflow[node_id]["inputs"][node.key if node.key else "batch_size"] = payload.n
             elif node.type == "steps":
                 for node_id in node.node_ids:
-                    workflow[node_id]["inputs"][
-                        node.key if node.key else "steps"
-                    ] = payload.steps
+                    workflow[node_id]["inputs"][node.key if node.key else "steps"] = payload.steps
             elif node.type == "seed":
-                seed = (
-                    payload.seed
-                    if payload.seed
-                    else random.randint(0, 18446744073709551614)
-                )
+                seed = payload.seed if payload.seed else random.randint(0, 18446744073709551614)
                 for node_id in node.node_ids:
                     workflow[node_id]["inputs"][node.key] = seed
         else:
@@ -181,9 +162,7 @@ async def comfyui_generate_image(
     try:
         log.info("Sending workflow to WebSocket server.")
         log.info(f"Workflow: {workflow}")
-        images = await asyncio.to_thread(
-            get_images, ws, workflow, client_id, base_url, api_key
-        )
+        images = await asyncio.to_thread(get_images, ws, workflow, client_id, base_url, api_key)
     except Exception as e:
         log.exception(f"Error while receiving images: {e}")
         images = None

@@ -1,16 +1,11 @@
-import json
 import time
 import uuid
 from typing import Optional
 
-from selfai_ui.internal.db import Base, get_db
-from selfai_ui.models.tags import TagModel, Tag, Tags
-
-
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import BigInteger, Boolean, Column, String, Text, JSON
-from sqlalchemy import or_, func, select, and_, text
-from sqlalchemy.sql import exists
+from sqlalchemy import JSON, BigInteger, Column, Text
+
+from selfai_ui.internal.db import Base, get_db
 
 ####################
 # Message DB Schema
@@ -95,9 +90,7 @@ class MessageResponse(MessageModel):
 
 
 class MessageTable:
-    def insert_new_message(
-        self, form_data: MessageForm, channel_id: str, user_id: str
-    ) -> Optional[MessageModel]:
+    def insert_new_message(self, form_data: MessageForm, channel_id: str, user_id: str) -> Optional[MessageModel]:
         with get_db() as db:
             id = str(uuid.uuid4())
 
@@ -142,24 +135,14 @@ class MessageTable:
 
     def get_replies_by_message_id(self, id: str) -> list[MessageModel]:
         with get_db() as db:
-            all_messages = (
-                db.query(Message)
-                .filter_by(parent_id=id)
-                .order_by(Message.created_at.desc())
-                .all()
-            )
+            all_messages = db.query(Message).filter_by(parent_id=id).order_by(Message.created_at.desc()).all()
             return [MessageModel.model_validate(message) for message in all_messages]
 
     def get_reply_user_ids_by_message_id(self, id: str) -> list[str]:
         with get_db() as db:
-            return [
-                message.user_id
-                for message in db.query(Message).filter_by(parent_id=id).all()
-            ]
+            return [message.user_id for message in db.query(Message).filter_by(parent_id=id).all()]
 
-    def get_messages_by_channel_id(
-        self, channel_id: str, skip: int = 0, limit: int = 50
-    ) -> list[MessageModel]:
+    def get_messages_by_channel_id(self, channel_id: str, skip: int = 0, limit: int = 50) -> list[MessageModel]:
         with get_db() as db:
             all_messages = (
                 db.query(Message)
@@ -195,9 +178,7 @@ class MessageTable:
 
             return [MessageModel.model_validate(message) for message in all_messages]
 
-    def update_message_by_id(
-        self, id: str, form_data: MessageForm
-    ) -> Optional[MessageModel]:
+    def update_message_by_id(self, id: str, form_data: MessageForm) -> Optional[MessageModel]:
         with get_db() as db:
             message = db.get(Message, id)
             message.content = form_data.content
@@ -208,9 +189,7 @@ class MessageTable:
             db.refresh(message)
             return MessageModel.model_validate(message) if message else None
 
-    def add_reaction_to_message(
-        self, id: str, user_id: str, name: str
-    ) -> Optional[MessageReactionModel]:
+    def add_reaction_to_message(self, id: str, user_id: str, name: str) -> Optional[MessageReactionModel]:
         with get_db() as db:
             reaction_id = str(uuid.uuid4())
             reaction = MessageReactionModel(
@@ -243,13 +222,9 @@ class MessageTable:
 
             return [Reactions(**reaction) for reaction in reactions.values()]
 
-    def remove_reaction_by_id_and_user_id_and_name(
-        self, id: str, user_id: str, name: str
-    ) -> bool:
+    def remove_reaction_by_id_and_user_id_and_name(self, id: str, user_id: str, name: str) -> bool:
         with get_db() as db:
-            db.query(MessageReaction).filter_by(
-                message_id=id, user_id=user_id, name=name
-            ).delete()
+            db.query(MessageReaction).filter_by(message_id=id, user_id=user_id, name=name).delete()
             db.commit()
             return True
 

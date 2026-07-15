@@ -20,5 +20,53 @@ jobs:
       - name: Build api image (no push)
         run: docker build -f api/Dockerfile -t selfai-api:pr ./api
 
-      # Lint/test steps are added here as the suites solidify. They must not
-      # require secrets, so fork PRs validate without any privileged access.
+      # Lint steps are added here once a linter is configured (no ruff/flake8
+      # exists in this repo yet — see the tracking issue for adding one).
+      # Nothing here needs secrets, so fork PRs validate without privileged access.
+
+  # api/tests/ (55 files: router + security suites) against a plain SQLite DB —
+  # no secrets, so fork PRs run this too. Mirrors the .gitlab-ci.yml test:api
+  # stage's install/run commands; keep the two in sync.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install API + test dependencies
+        run: pip install --no-cache-dir -r api/requirements-api.txt -r api/requirements-dev.txt
+
+      - name: pytest
+        run: cd api && python -m pytest tests -q -m "not gpu and not integration"
+        # Two pre-existing failures (faster_whisper import, self.ai#26) — see
+        # the matching note in .gitlab-ci.yml. Flip to blocking once resolved.
+        continue-on-error: true
+
+  # Every commit must carry a real DCO Signed-off-by trailer (CONTRIBUTING.md,
+  # pull_request_template.md). Checks each commit introduced by the PR, not
+  # just the tip — matches `git commit -s` and rejects `-s`-less commits and
+  # merge/squash commits that dropped the trailer.
+  dco-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check Signed-off-by on every commit in this PR
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -e
+          missing=0
+          for sha in $(git rev-list "$BASE_SHA..$HEAD_SHA"); do
+            if ! git log -1 --format=%B "$sha" | grep -qE '^Signed-off-by: .+ <[^<>]+@[^<>]+>$'; then
+              echo "::error::Commit $sha is missing a DCO Signed-off-by trailer. Use 'git commit -s' (see CONTRIBUTING.md)."
+              missing=1
+            fi
+          done
+          exit "$missing"

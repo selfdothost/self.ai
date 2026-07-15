@@ -12,32 +12,32 @@ from fastapi import (
 )
 from starlette.responses import RedirectResponse
 
-from selfai_ui.models.auths import Auths
-from selfai_ui.models.users import Users
-from selfai_ui.models.groups import Groups, GroupModel, GroupUpdateForm
 from selfai_ui.config import (
     DEFAULT_USER_ROLE,
-    ENABLE_OAUTH_SIGNUP,
-    OAUTH_MERGE_ACCOUNTS_BY_EMAIL,
-    OAUTH_PROVIDERS,
-    ENABLE_OAUTH_ROLE_MANAGEMENT,
     ENABLE_OAUTH_GROUP_MANAGEMENT,
-    OAUTH_ROLES_CLAIM,
-    OAUTH_GROUPS_CLAIM,
-    OAUTH_EMAIL_CLAIM,
-    OAUTH_PICTURE_CLAIM,
-    OAUTH_USERNAME_CLAIM,
-    OAUTH_ALLOWED_ROLES,
+    ENABLE_OAUTH_ROLE_MANAGEMENT,
+    ENABLE_OAUTH_SIGNUP,
+    JWT_EXPIRES_IN,
     OAUTH_ADMIN_ROLES,
     OAUTH_ALLOWED_DOMAINS,
+    OAUTH_ALLOWED_ROLES,
+    OAUTH_EMAIL_CLAIM,
+    OAUTH_GROUPS_CLAIM,
+    OAUTH_MERGE_ACCOUNTS_BY_EMAIL,
+    OAUTH_PICTURE_CLAIM,
+    OAUTH_PROVIDERS,
+    OAUTH_ROLES_CLAIM,
+    OAUTH_USERNAME_CLAIM,
     WEBHOOK_URL,
-    JWT_EXPIRES_IN,
     AppConfig,
 )
 from selfai_ui.constants import ERROR_MESSAGES
 from selfai_ui.env import WEBUI_SESSION_COOKIE_SAME_SITE, WEBUI_SESSION_COOKIE_SECURE
+from selfai_ui.models.auths import Auths
+from selfai_ui.models.groups import GroupModel, Groups, GroupUpdateForm
+from selfai_ui.models.users import Users
+from selfai_ui.utils.auth import create_token, get_password_hash
 from selfai_ui.utils.misc import parse_duration
-from selfai_ui.utils.auth import get_password_hash, create_token
 from selfai_ui.utils.webhook import post_webhook
 
 log = logging.getLogger(__name__)
@@ -150,9 +150,7 @@ class OAuthManager:
                     permissions=group_permissions,
                     user_ids=user_ids,
                 )
-                Groups.update_group_by_id(
-                    id=group_model.id, form_data=update_form, overwrite=False
-                )
+                Groups.update_group_by_id(id=group_model.id, form_data=update_form, overwrite=False)
 
         # Add user to new groups
         for group_model in all_available_groups:
@@ -175,9 +173,7 @@ class OAuthManager:
                     permissions=group_permissions,
                     user_ids=user_ids,
                 )
-                Groups.update_group_by_id(
-                    id=group_model.id, form_data=update_form, overwrite=False
-                )
+                Groups.update_group_by_id(id=group_model.id, form_data=update_form, overwrite=False)
 
     async def handle_login(self, provider, request):
         if provider not in OAUTH_PROVIDERS:
@@ -222,9 +218,7 @@ class OAuthManager:
             "*" not in auth_manager_config.OAUTH_ALLOWED_DOMAINS
             and email.split("@")[-1] not in auth_manager_config.OAUTH_ALLOWED_DOMAINS
         ):
-            log.warning(
-                f"OAuth callback failed, e-mail domain is not in the list of allowed domains: {user_data}"
-            )
+            log.warning(f"OAuth callback failed, e-mail domain is not in the list of allowed domains: {user_data}")
             raise HTTPException(400, detail=ERROR_MESSAGES.INVALID_CRED)
 
         # Check if the user exists
@@ -248,9 +242,7 @@ class OAuthManager:
             # If the user does not exist, check if signups are enabled
             if auth_manager_config.ENABLE_OAUTH_SIGNUP:
                 # Check if an existing user with the same email already exists
-                existing_user = Users.get_user_by_email(
-                    user_data.get("email", "").lower()
-                )
+                existing_user = Users.get_user_by_email(user_data.get("email", "").lower())
                 if existing_user:
                     raise HTTPException(400, detail=ERROR_MESSAGES.EMAIL_TAKEN)
 
@@ -262,18 +254,14 @@ class OAuthManager:
                         async with aiohttp.ClientSession() as session:
                             async with session.get(picture_url) as resp:
                                 picture = await resp.read()
-                                base64_encoded_picture = base64.b64encode(
-                                    picture
-                                ).decode("utf-8")
+                                base64_encoded_picture = base64.b64encode(picture).decode("utf-8")
                                 guessed_mime_type = mimetypes.guess_type(picture_url)[0]
                                 if guessed_mime_type is None:
                                     # assume JPG, browsers are tolerant enough of image formats
                                     guessed_mime_type = "image/jpeg"
                                 picture_url = f"data:{guessed_mime_type};base64,{base64_encoded_picture}"
                     except Exception as e:
-                        log.error(
-                            f"Error downloading profile image '{picture_url}': {e}"
-                        )
+                        log.error(f"Error downloading profile image '{picture_url}': {e}")
                         picture_url = ""
                 if not picture_url:
                     picture_url = "/user.png"
@@ -283,9 +271,7 @@ class OAuthManager:
 
                 user = Auths.insert_new_auth(
                     email=email,
-                    password=get_password_hash(
-                        str(uuid.uuid4())
-                    ),  # Random password, not used
+                    password=get_password_hash(str(uuid.uuid4())),  # Random password, not used
                     name=user_data.get(username_claim, "User"),
                     profile_image_url=picture_url,
                     role=role,
@@ -298,16 +284,12 @@ class OAuthManager:
                         auth_manager_config.WEBHOOK_MESSAGES.USER_SIGNUP(user.name),
                         {
                             "action": "signup",
-                            "message": auth_manager_config.WEBHOOK_MESSAGES.USER_SIGNUP(
-                                user.name
-                            ),
+                            "message": auth_manager_config.WEBHOOK_MESSAGES.USER_SIGNUP(user.name),
                             "user": user.model_dump_json(exclude_none=True),
                         },
                     )
             else:
-                raise HTTPException(
-                    status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACCESS_PROHIBITED
-                )
+                raise HTTPException(status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
 
         jwt_token = create_token(
             data={"id": user.id},

@@ -79,9 +79,7 @@ class TestPrompts(AbstractPostgresTest):
 
         # Delete prompt
         with mock_webui_user(id="2"):
-            response = self.fast_api_client.delete(
-                self.create_url("/command/my-command/delete")
-            )
+            response = self.fast_api_client.delete(self.create_url("/command/my-command/delete"))
         assert response.status_code == 200
 
         # Get all prompts

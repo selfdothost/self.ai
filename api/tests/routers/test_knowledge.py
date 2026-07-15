@@ -106,6 +106,7 @@ def test_knowledge_creation_denied_for_user_without_permission(
 # T-R18: File membership (add/remove/reset) error paths
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.tier0
 def test_add_file_to_nonexistent_kb_rejected(authenticated_admin):
     """Adding a file to a KB that doesn't exist returns 400 NOT_FOUND."""
@@ -143,9 +144,7 @@ def test_remove_file_from_nonexistent_kb_rejected(authenticated_admin):
 @pytest.mark.tier0
 def test_reset_nonexistent_kb_rejected(authenticated_admin):
     """Resetting a nonexistent KB returns 400 NOT_FOUND."""
-    resp = authenticated_admin.post(
-        "/api/v1/knowledge/nonexistent-kb-id/reset"
-    )
+    resp = authenticated_admin.post("/api/v1/knowledge/nonexistent-kb-id/reset")
     assert resp.status_code == 400
 
 
@@ -162,18 +161,98 @@ def test_reset_existing_kb_clears_membership(authenticated_admin):
 
 
 @pytest.mark.tier0
-def test_user_cannot_add_file_to_other_users_kb(
-    authenticated_user, db_session
-):
+def test_user_cannot_add_file_to_other_users_kb(authenticated_user, db_session):
     """User A cannot add a file to user B's knowledge base."""
-    from tests.factories import UserFactory, KnowledgeFactory
+    from tests.factories import KnowledgeFactory, UserFactory
+
     user_b = UserFactory.create(db_session)
-    kb_b = KnowledgeFactory.create(
-        db_session, user_id=user_b.id, name="B's KB"
-    )
+    kb_b = KnowledgeFactory.create(db_session, user_id=user_b.id, name="B's KB")
     resp = authenticated_user.post(
         f"/api/v1/knowledge/{kb_b.id}/file/add",
         json={"file_id": "any-file"},
     )
     # Router raises 400 ACCESS_PROHIBITED when caller is not owner/admin
     assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# iter_files_by_knowledge_id: streaming export pagination
+#
+# KBs now regularly carry thousands to millions of documents. The old
+# get_file_ids_by_knowledge_id() + Files.get_files_by_ids() pairing loaded
+# every file's full extracted content into one Python list before writing a
+# single JSONL line — these tests exercise the batched replacement.
+# ---------------------------------------------------------------------------
+
+
+def _make_kb_with_files(db_session, file_count, user_id=None):
+    from selfai_ui.models.knowledge import KnowledgeFiles
+    from tests.factories import FileFactory, KnowledgeFactory
+
+    kb = KnowledgeFactory.create(db_session, user_id=user_id or "test-user")
+    files = [
+        FileFactory.create(
+            db_session,
+            filename=f"doc-{i}.txt",
+            data={"content": f"content-{i}"},
+        )
+        for i in range(file_count)
+    ]
+    for f in files:
+        KnowledgeFiles.add_file_to_knowledge(kb.id, f.id)
+    return kb, files
+
+
+@pytest.mark.tier0
+def test_iter_files_by_knowledge_id_empty_kb(db_session):
+    """A KB with no files yields no batches at all."""
+    from selfai_ui.models.knowledge import KnowledgeFiles
+    from tests.factories import KnowledgeFactory
+
+    kb = KnowledgeFactory.create(db_session, user_id="test-user")
+    batches = list(KnowledgeFiles.iter_files_by_knowledge_id(kb.id))
+    assert batches == []
+
+
+@pytest.mark.tier0
+def test_iter_files_by_knowledge_id_paginates_across_batches(db_session):
+    """5 files with batch_size=2 come back as batches of [2, 2, 1] and
+    cover every file exactly once, with no batch exceeding batch_size."""
+    from selfai_ui.models.knowledge import KnowledgeFiles
+
+    kb, files = _make_kb_with_files(db_session, file_count=5)
+
+    batches = list(
+        KnowledgeFiles.iter_files_by_knowledge_id(kb.id, batch_size=2)
+    )
+    assert [len(b) for b in batches] == [2, 2, 1]
+
+    seen_ids = [f.id for batch in batches for f in batch]
+    assert sorted(seen_ids) == sorted(f.id for f in files)
+    assert len(seen_ids) == len(set(seen_ids))  # no duplicates across batches
+
+
+@pytest.mark.tier0
+def test_iter_files_by_knowledge_id_only_this_kb(db_session):
+    """Files belonging to a different KB are never yielded."""
+    from selfai_ui.models.knowledge import KnowledgeFiles
+
+    kb_a, files_a = _make_kb_with_files(db_session, file_count=2)
+    kb_b, _files_b = _make_kb_with_files(db_session, file_count=3)
+
+    batches = list(KnowledgeFiles.iter_files_by_knowledge_id(kb_a.id))
+    seen_ids = [f.id for batch in batches for f in batch]
+    assert sorted(seen_ids) == sorted(f.id for f in files_a)
+
+
+@pytest.mark.tier0
+def test_prepare_curator_input_exports_all_files(authenticated_admin, db_session):
+    """The /prepare-input endpoint's JSONL export covers every file in the
+    KB via the batched iter_files_by_knowledge_id path (batch-boundary
+    behavior itself is covered by the model-level tests above)."""
+    kb, files = _make_kb_with_files(db_session, file_count=5)
+
+    resp = authenticated_admin.post(f"/api/v1/knowledge/{kb.id}/prepare-input")
+
+    assert resp.status_code == 200
+    assert resp.json()["file_count"] == len(files)

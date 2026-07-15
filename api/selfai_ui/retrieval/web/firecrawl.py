@@ -1,13 +1,31 @@
-from firecrawl import FirecrawlApp, AsyncFirecrawlApp
-from firecrawl.v2.types import ScrapeOptions
-from langchain_core.documents import Document as LCDocument
-from typing import Union, Sequence, List, Optional, Callable
-import logging
 import asyncio
 import json
+import logging
+from typing import Callable, List, Optional
+from urllib.parse import urlsplit, urlunsplit
+
 import httpx
+from firecrawl import AsyncFirecrawlApp, FirecrawlApp
+from firecrawl.v2.types import ScrapeOptions
+from langchain_core.documents import Document as LCDocument
 
 log = logging.getLogger(__name__)
+
+
+def _normalize_next_url(next_url: Optional[str], base_url: str) -> Optional[str]:
+    """Rewrite a Firecrawl-provided `next` pagination link onto base_url's
+    scheme+host. Self-hosted Firecrawl builds `next` from its own (internal,
+    plain-http) view of itself, so it comes back as e.g.
+    `http://scrape.home...` even when reached over a TLS-terminating ingress
+    at `https://scrape.home...` — following it literally 404s against the
+    origin, silently capping crawl ingestion at the first page of results.
+    """
+    if not next_url:
+        return next_url
+    base = urlsplit(base_url)
+    nxt = urlsplit(next_url)
+    return urlunsplit((base.scheme, base.netloc, nxt.path, nxt.query, nxt.fragment))
+
 
 class SafeFirecrawlLoader:
     def __init__(self, urls, api_key=None, api_base_url=None):
@@ -25,14 +43,22 @@ class SafeFirecrawlLoader:
             try:
                 log.debug(f"Firecrawl: scraping {url}")
                 result = self.app.scrape(url, formats=["markdown", "html"])
-                markdown = getattr(result, "markdown", None) or (result.get("markdown", "") if isinstance(result, dict) else "")
-                meta = getattr(result, "metadata", None) or (result.get("metadata", {}) if isinstance(result, dict) else {})
-                title = (getattr(meta, "title", None) or (meta.get("title", "") if isinstance(meta, dict) else "")) or ""
+                markdown = getattr(result, "markdown", None) or (
+                    result.get("markdown", "") if isinstance(result, dict) else ""
+                )
+                meta = getattr(result, "metadata", None) or (
+                    result.get("metadata", {}) if isinstance(result, dict) else {}
+                )
+                title = (
+                    getattr(meta, "title", None) or (meta.get("title", "") if isinstance(meta, dict) else "")
+                ) or ""
                 log.debug(f"Firecrawl: got result for {url} — markdown_len={len(markdown or '')}")
-                docs.append(LCDocument(
-                    page_content=markdown or "",
-                    metadata={"source": url, "title": title},
-                ))
+                docs.append(
+                    LCDocument(
+                        page_content=markdown or "",
+                        metadata={"source": url, "title": title},
+                    )
+                )
             except Exception as e:
                 log.error(f"Firecrawl error loading {url}: {e}", exc_info=True)
         log.info(f"Firecrawl load complete: {len(docs)}/{len(self.urls)} docs returned")
@@ -74,15 +100,21 @@ class SafeFirecrawlLoader:
                     if status == "completed":
                         for page in snapshot.data:
                             meta = getattr(page, "metadata", None)
-                            source = (getattr(meta, "source_url", None) or getattr(meta, "url", None) or url) if meta else url
+                            source = (
+                                (getattr(meta, "source_url", None) or getattr(meta, "url", None) or url)
+                                if meta
+                                else url
+                            )
                             markdown = getattr(page, "markdown", None) or ""
-                            docs.append(LCDocument(
-                                page_content=markdown,
-                                metadata={
-                                    "source": source,
-                                    "title": getattr(meta, "title", "") or "" if meta else "",
-                                },
-                            ))
+                            docs.append(
+                                LCDocument(
+                                    page_content=markdown,
+                                    metadata={
+                                        "source": source,
+                                        "title": (getattr(meta, "title", "") or "" if meta else ""),
+                                    },
+                                )
+                            )
                         log.info(f"Firecrawl crawl {crawl_id}: completed, {len(snapshot.data)} pages")
                         break
                     elif status in ("failed", "cancelled"):
@@ -109,10 +141,7 @@ class SafeFirecrawlLoader:
         if isinstance(page, dict):
             markdown = page.get("markdown") or ""
             meta = page.get("metadata") or {}
-            source = (
-                meta.get("sourceURL") or meta.get("source_url")
-                or meta.get("url") or fallback_url
-            )
+            source = meta.get("sourceURL") or meta.get("source_url") or meta.get("url") or fallback_url
             title = meta.get("title") or ""
             status_code = meta.get("statusCode")
         else:
@@ -159,7 +188,13 @@ class SafeFirecrawlLoader:
         docs = []
         for url in self.urls:
             try:
-                log.info(f"crawl_with_progress: starting crawl for {url} (limit={limit}, max_depth={max_depth}, delay={delay}s, include_paths={include_paths}, exclude_paths={exclude_paths}, regex_on_full_url={regex_on_full_url}, crawl_entire_domain={crawl_entire_domain})")
+                log.info(
+                    f"crawl_with_progress: starting crawl for {url} "
+                    f"(limit={limit}, max_depth={max_depth}, delay={delay}s, "
+                    f"include_paths={include_paths}, exclude_paths={exclude_paths}, "
+                    f"regex_on_full_url={regex_on_full_url}, "
+                    f"crawl_entire_domain={crawl_entire_domain})"
+                )
                 scrape_options = ScrapeOptions(wait_for=delay * 1000) if delay else None
                 crawl_kwargs: dict = {}
                 # When crawling the entire domain, omit the page limit so that
@@ -217,7 +252,9 @@ class SafeFirecrawlLoader:
                             resp = await http.get(f"{base_url}/v2/crawl/{crawl_id}", headers=headers)
                             body = resp.json()
                         except httpx.TimeoutException:
-                            log.warning(f"crawl_with_progress {crawl_id}: status poll timed out (30 s) — treating as terminal")
+                            log.warning(
+                                f"crawl_with_progress {crawl_id}: status poll timed out (30 s) — treating as terminal"
+                            )
                             job_state["cancelled"] = True
                             job_state["cancel_reason"] = "Firecrawl did not respond to status poll within 30 s"
                             try:
@@ -239,8 +276,11 @@ class SafeFirecrawlLoader:
                         # Only follow "next" links once we've consumed everything in
                         # the current first page, to avoid unnecessary requests while
                         # the crawl is still filling the first batch.
-                        next_url = body.get("next")
-                        log.info(f"crawl_with_progress {crawl_id}: next_url={next_url} processed={processed} raw_data_len={len(raw_data)}")
+                        next_url = _normalize_next_url(body.get("next"), base_url)
+                        log.info(
+                            f"crawl_with_progress {crawl_id}: next_url={next_url} "
+                            f"processed={processed} raw_data_len={len(raw_data)}"
+                        )
                         if next_url and processed >= len(raw_data) and len(raw_data) > 0:
                             while next_url:
                                 try:
@@ -254,7 +294,9 @@ class SafeFirecrawlLoader:
                                         break
                                     resp_text = next_resp.text
                                     if not resp_text or not resp_text.strip():
-                                        log.warning(f"crawl_with_progress {crawl_id}: pagination returned empty body, stopping")
+                                        log.warning(
+                                            f"crawl_with_progress {crawl_id}: pagination returned empty body, stopping"
+                                        )
                                         break
                                     next_body = next_resp.json()
                                     next_page_data = next_body.get("data") or []
@@ -265,7 +307,7 @@ class SafeFirecrawlLoader:
                                         f"crawl_with_progress {crawl_id}: pagination added "
                                         f"{len(next_page_data)} items, raw_data_len now {len(raw_data)}"
                                     )
-                                    next_url = next_body.get("next")
+                                    next_url = _normalize_next_url(next_body.get("next"), base_url)
                                 except Exception as page_err:
                                     log.warning(f"crawl_with_progress {crawl_id}: pagination fetch failed: {page_err}")
                                     break
@@ -310,10 +352,12 @@ class SafeFirecrawlLoader:
 
                             if markdown:
                                 job_state["pages"].append({"url": source, "title": title, "content": markdown})
-                                docs.append(LCDocument(
-                                    page_content=markdown,
-                                    metadata={"source": source, "title": title},
-                                ))
+                                docs.append(
+                                    LCDocument(
+                                        page_content=markdown,
+                                        metadata={"source": source, "title": title},
+                                    )
+                                )
                             processed += 1
 
                         # Track position in Firecrawl's data array for persistence/resume
@@ -336,7 +380,9 @@ class SafeFirecrawlLoader:
                                         f"(attempt {premature_done_count}/{MAX_PREMATURE_DONE}), waiting…"
                                     )
                                 else:
-                                    log.warning(f"crawl_with_progress {crawl_id}: timed out waiting for workers to start")
+                                    log.warning(
+                                        f"crawl_with_progress {crawl_id}: timed out waiting for workers to start"
+                                    )
                                     break
                             elif status == "completed" and total > 0 and completed < total:
                                 # Firecrawl prematurely reports "completed" mid-crawl — keep polling

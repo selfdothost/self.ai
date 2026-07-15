@@ -1,15 +1,15 @@
 import black
 import markdown
-
-from selfai_ui.models.chats import ChatTitleMessagesForm
-from selfai_ui.config import DATA_DIR, ENABLE_ADMIN_EXPORT
-from selfai_ui.constants import ERROR_MESSAGES
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel
 from starlette.responses import FileResponse
+
+from selfai_ui.config import DATA_DIR, ENABLE_ADMIN_EXPORT
+from selfai_ui.constants import ERROR_MESSAGES
+from selfai_ui.models.chats import ChatTitleMessagesForm
+from selfai_ui.utils.auth import get_admin_user, get_verified_user
 from selfai_ui.utils.misc import get_gravatar_url
 from selfai_ui.utils.pdf_generator import PDFGenerator
-from selfai_ui.utils.auth import get_admin_user, get_verified_user
 
 router = APIRouter()
 

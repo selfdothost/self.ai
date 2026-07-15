@@ -2,29 +2,25 @@ import logging
 from typing import Optional
 
 import aiohttp
-
 from fastapi import (
+    APIRouter,
     Depends,
     HTTPException,
     Request,
-    APIRouter,
 )
 from pydantic import BaseModel
 
-from selfai_ui.utils.auth import get_admin_user, get_verified_user
-from selfai_ui.utils.access_control import has_permission
-
 from selfai_ui.env import (
-    SRC_LOG_LEVELS,
     AIOHTTP_CLIENT_TIMEOUT,
     AIOHTTP_CLIENT_TIMEOUT_OPENAI_MODEL_LIST,
+    SRC_LOG_LEVELS,
 )
-from selfai_ui.constants import ERROR_MESSAGES
 from selfai_ui.models.curator_jobs import (
-    CuratorJobs,
     CuratorJobForm,
     CuratorJobModel,
+    CuratorJobs,
 )
+from selfai_ui.utils.auth import get_admin_user, get_verified_user
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS.get("CURATOR", logging.INFO))
@@ -57,9 +53,7 @@ async def send_get_request(url, raise_on_error=False):
     except Exception as e:
         log.error(f"Curator connection error: {e}")
         if raise_on_error:
-            raise HTTPException(
-                status_code=500, detail="Self.AI UI: Curator Connection Error"
-            )
+            raise HTTPException(status_code=500, detail="Self.AI UI: Curator Connection Error")
         return None
 
 
@@ -87,9 +81,7 @@ async def send_post_request(url, payload, raise_on_error=False):
     except Exception as e:
         log.error(f"Curator connection error: {e}")
         if raise_on_error:
-            raise HTTPException(
-                status_code=500, detail="Self.AI UI: Curator Connection Error"
-            )
+            raise HTTPException(status_code=500, detail="Self.AI UI: Curator Connection Error")
         return None
 
 
@@ -113,9 +105,7 @@ async def send_delete_request(url, raise_on_error=False):
     except Exception as e:
         log.error(f"Curator connection error: {e}")
         if raise_on_error:
-            raise HTTPException(
-                status_code=500, detail="Self.AI UI: Curator Connection Error"
-            )
+            raise HTTPException(status_code=500, detail="Self.AI UI: Curator Connection Error")
         return None
 
 
@@ -153,9 +143,7 @@ class ConnectionVerificationForm(BaseModel):
 
 
 @router.post("/verify")
-async def verify_connection(
-    form_data: ConnectionVerificationForm, user=Depends(get_admin_user)
-):
+async def verify_connection(form_data: ConnectionVerificationForm, user=Depends(get_admin_user)):
     url = form_data.url.rstrip("/")
 
     async with aiohttp.ClientSession(
@@ -177,9 +165,7 @@ async def verify_connection(
                 return data
         except aiohttp.ClientError as e:
             log.exception(f"Client error: {str(e)}")
-            raise HTTPException(
-                status_code=500, detail="Self.AI UI: Curator Connection Error"
-            )
+            raise HTTPException(status_code=500, detail="Self.AI UI: Curator Connection Error")
         except Exception as e:
             log.exception(f"Connection error: {str(e)}")
             raise HTTPException(
@@ -209,9 +195,7 @@ class CuratorConfigForm(BaseModel):
 
 
 @router.post("/config/update")
-async def update_config(
-    request: Request, form_data: CuratorConfigForm, user=Depends(get_admin_user)
-):
+async def update_config(request: Request, form_data: CuratorConfigForm, user=Depends(get_admin_user)):
     request.app.state.config.ENABLE_CURATOR_API = form_data.ENABLE_CURATOR_API
     request.app.state.config.CURATOR_BASE_URLS = form_data.CURATOR_BASE_URLS
     request.app.state.config.CURATOR_API_CONFIGS = form_data.CURATOR_API_CONFIGS
@@ -235,76 +219,52 @@ async def update_config(
 
 
 @router.get("/api/text")
-async def list_text_categories(
-    request: Request, user=Depends(get_verified_user)
-):
+async def list_text_categories(request: Request, user=Depends(get_verified_user)):
     url = get_curator_url(request)
     result = await send_get_request(f"{url}/api/text", raise_on_error=True)
     return result
 
 
 @router.get("/api/text/custom/stages")
-async def list_custom_stages(
-    request: Request, user=Depends(get_verified_user)
-):
+async def list_custom_stages(request: Request, user=Depends(get_verified_user)):
     url = get_curator_url(request)
     result = await send_get_request(f"{url}/api/text/custom/stages", raise_on_error=True)
     return result
 
 
 @router.get("/api/text/custom/stages/{stage_uuid}")
-async def get_custom_stage(
-    request: Request, stage_uuid: str, user=Depends(get_verified_user)
-):
+async def get_custom_stage(request: Request, stage_uuid: str, user=Depends(get_verified_user)):
     url = get_curator_url(request)
-    result = await send_get_request(
-        f"{url}/api/text/custom/stages/{stage_uuid}", raise_on_error=True
-    )
+    result = await send_get_request(f"{url}/api/text/custom/stages/{stage_uuid}", raise_on_error=True)
     return result
 
 
 @router.post("/api/text/custom/stages")
-async def create_custom_stage(
-    request: Request, user=Depends(get_admin_user)
-):
+async def create_custom_stage(request: Request, user=Depends(get_admin_user)):
     url = get_curator_url(request)
     body = await request.body()
-    result = await send_post_request(
-        f"{url}/api/text/custom/stages", body.decode(), raise_on_error=True
-    )
+    result = await send_post_request(f"{url}/api/text/custom/stages", body.decode(), raise_on_error=True)
     return result
 
 
 @router.delete("/api/text/custom/stages/{stage_uuid}")
-async def delete_custom_stage(
-    request: Request, stage_uuid: str, user=Depends(get_admin_user)
-):
+async def delete_custom_stage(request: Request, stage_uuid: str, user=Depends(get_admin_user)):
     url = get_curator_url(request)
-    result = await send_delete_request(
-        f"{url}/api/text/custom/stages/{stage_uuid}", raise_on_error=True
-    )
+    result = await send_delete_request(f"{url}/api/text/custom/stages/{stage_uuid}", raise_on_error=True)
     return result
 
 
 @router.get("/api/text/{category}/stages")
-async def list_category_stages(
-    request: Request, category: str, user=Depends(get_verified_user)
-):
+async def list_category_stages(request: Request, category: str, user=Depends(get_verified_user)):
     url = get_curator_url(request)
-    result = await send_get_request(
-        f"{url}/api/text/{category}/stages", raise_on_error=True
-    )
+    result = await send_get_request(f"{url}/api/text/{category}/stages", raise_on_error=True)
     return result
 
 
 @router.get("/api/text/{category}/stages/{stage_id}")
-async def get_stage_detail(
-    request: Request, category: str, stage_id: str, user=Depends(get_verified_user)
-):
+async def get_stage_detail(request: Request, category: str, stage_id: str, user=Depends(get_verified_user)):
     url = get_curator_url(request)
-    result = await send_get_request(
-        f"{url}/api/text/{category}/stages/{stage_id}", raise_on_error=True
-    )
+    result = await send_get_request(f"{url}/api/text/{category}/stages/{stage_id}", raise_on_error=True)
     return result
 
 
@@ -355,96 +315,64 @@ async def queue_curator_job(
 
 
 @router.post("/api/jobs")
-async def create_job(
-    request: Request, user=Depends(get_verified_user)
-):
+async def create_job(request: Request, user=Depends(get_verified_user)):
     url = get_curator_url(request)
     body = await request.body()
-    result = await send_post_request(
-        f"{url}/api/jobs", body.decode(), raise_on_error=True
-    )
+    result = await send_post_request(f"{url}/api/jobs", body.decode(), raise_on_error=True)
     return result
 
 
 @router.get("/api/jobs")
-async def list_jobs(
-    request: Request, user=Depends(get_verified_user)
-):
+async def list_jobs(request: Request, user=Depends(get_verified_user)):
     url = get_curator_url(request)
     result = await send_get_request(f"{url}/api/jobs", raise_on_error=True)
     return result
 
 
 @router.get("/api/jobs/{job_id}")
-async def get_job(
-    request: Request, job_id: str, user=Depends(get_verified_user)
-):
+async def get_job(request: Request, job_id: str, user=Depends(get_verified_user)):
     url = get_curator_url(request)
     result = await send_get_request(f"{url}/api/jobs/{job_id}", raise_on_error=True)
     return result
 
 
 @router.get("/api/jobs/{job_id}/logs")
-async def get_job_logs(
-    request: Request, job_id: str, user=Depends(get_verified_user)
-):
+async def get_job_logs(request: Request, job_id: str, user=Depends(get_verified_user)):
     url = get_curator_url(request)
-    result = await send_get_request(
-        f"{url}/api/jobs/{job_id}/logs", raise_on_error=True
-    )
+    result = await send_get_request(f"{url}/api/jobs/{job_id}/logs", raise_on_error=True)
     return result
 
 
 @router.delete("/api/jobs/{job_id}")
-async def cancel_job(
-    request: Request, job_id: str, user=Depends(get_verified_user)
-):
+async def cancel_job(request: Request, job_id: str, user=Depends(get_verified_user)):
     url = get_curator_url(request)
-    result = await send_delete_request(
-        f"{url}/api/jobs/{job_id}", raise_on_error=True
-    )
+    result = await send_delete_request(f"{url}/api/jobs/{job_id}", raise_on_error=True)
     return result
 
 
 @router.post("/api/jobs/{job_id}/schedule")
-async def schedule_job(
-    request: Request, job_id: str, user=Depends(get_verified_user)
-):
+async def schedule_job(request: Request, job_id: str, user=Depends(get_verified_user)):
     url = get_curator_url(request)
     body = await request.body()
-    return await send_post_request(
-        f"{url}/api/jobs/{job_id}/schedule", body.decode(), raise_on_error=True
-    )
+    return await send_post_request(f"{url}/api/jobs/{job_id}/schedule", body.decode(), raise_on_error=True)
 
 
 @router.post("/api/jobs/{job_id}/unschedule")
-async def unschedule_job(
-    request: Request, job_id: str, user=Depends(get_verified_user)
-):
+async def unschedule_job(request: Request, job_id: str, user=Depends(get_verified_user)):
     url = get_curator_url(request)
-    return await send_post_request(
-        f"{url}/api/jobs/{job_id}/unschedule", "{}", raise_on_error=True
-    )
+    return await send_post_request(f"{url}/api/jobs/{job_id}/unschedule", "{}", raise_on_error=True)
 
 
 @router.post("/api/jobs/{job_id}/approve")
-async def approve_job(
-    request: Request, job_id: str, user=Depends(get_verified_user)
-):
+async def approve_job(request: Request, job_id: str, user=Depends(get_verified_user)):
     url = get_curator_url(request)
-    return await send_post_request(
-        f"{url}/api/jobs/{job_id}/approve", "{}", raise_on_error=True
-    )
+    return await send_post_request(f"{url}/api/jobs/{job_id}/approve", "{}", raise_on_error=True)
 
 
 @router.post("/api/jobs/{job_id}/cancel")
-async def cancel_job_post(
-    request: Request, job_id: str, user=Depends(get_verified_user)
-):
+async def cancel_job_post(request: Request, job_id: str, user=Depends(get_verified_user)):
     url = get_curator_url(request)
-    return await send_post_request(
-        f"{url}/api/jobs/{job_id}/cancel", "{}", raise_on_error=True
-    )
+    return await send_post_request(f"{url}/api/jobs/{job_id}/cancel", "{}", raise_on_error=True)
 
 
 ##########################################
@@ -453,9 +381,7 @@ async def cancel_job_post(
 
 
 @router.get("/api/data")
-async def list_data(
-    request: Request, user=Depends(get_verified_user)
-):
+async def list_data(request: Request, user=Depends(get_verified_user)):
     url = get_curator_url(request)
     result = await send_get_request(f"{url}/api/data", raise_on_error=True)
     return result

@@ -1,7 +1,11 @@
 # test_curator_jobs.py
 import time
 
-from selfai_ui.models.curator_jobs import CuratorJobs, CuratorJobForm, CuratorJobStatusUpdate
+from selfai_ui.models.curator_jobs import (
+    CuratorJobForm,
+    CuratorJobs,
+    CuratorJobStatusUpdate,
+)
 
 
 def test_insert_pending_when_no_schedule(db_session):
@@ -35,14 +39,30 @@ def test_get_all_jobs_returns_all(db_session):
 
 
 def test_get_all_jobs_newest_first(db_session):
-    from selfai_ui.models.curator_jobs import CuratorJob
     import uuid
+
+    from selfai_ui.models.curator_jobs import CuratorJob
+
     base = int(time.time())
     # Insert directly with controlled timestamps to avoid same-second flakiness
-    older = CuratorJob(id=str(uuid.uuid4()), user_id="u1", pipeline_id="p1",
-                       status="pending", priority="normal", created_at=base, updated_at=base)
-    newer = CuratorJob(id=str(uuid.uuid4()), user_id="u2", pipeline_id="p2",
-                       status="pending", priority="normal", created_at=base + 1, updated_at=base + 1)
+    older = CuratorJob(
+        id=str(uuid.uuid4()),
+        user_id="u1",
+        pipeline_id="p1",
+        status="pending",
+        priority="normal",
+        created_at=base,
+        updated_at=base,
+    )
+    newer = CuratorJob(
+        id=str(uuid.uuid4()),
+        user_id="u2",
+        pipeline_id="p2",
+        status="pending",
+        priority="normal",
+        created_at=base + 1,
+        updated_at=base + 1,
+    )
     db_session.add(older)
     db_session.add(newer)
     db_session.commit()

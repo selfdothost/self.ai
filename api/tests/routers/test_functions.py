@@ -7,7 +7,6 @@ Functions are admin-only to create/delete. Regular users can list
 
 import pytest
 
-
 VALID_FUNCTION_CONTENT = '''"""
 title: TestFilter
 description: Minimal valid function for testing
@@ -68,9 +67,7 @@ def test_admin_create_function(authenticated_admin):
             "meta": {"description": "Test"},
         },
     )
-    assert resp.status_code == 200, (
-        f"Function create returned {resp.status_code}: {resp.text[:200]}"
-    )
+    assert resp.status_code == 200, f"Function create returned {resp.status_code}: {resp.text[:200]}"
 
 
 @pytest.mark.tier0

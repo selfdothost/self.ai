@@ -6,7 +6,7 @@ on the provided URL. Tests use aioresponses to mock the upstream.
 """
 
 import pytest
-from aioresponses import aioresponses
+
 from tests.mocks.external_services import aioresponses_strict
 
 
@@ -16,9 +16,7 @@ def test_language_eval_verify_success(authenticated_admin):
     target = "http://self-language-eval:5000"
     with aioresponses_strict() as m:
         m.get(f"{target}/health", status=200, payload={"status": "healthy"})
-        resp = authenticated_admin.post(
-            "/language-eval/verify", json={"url": target}
-        )
+        resp = authenticated_admin.post("/language-eval/verify", json={"url": target})
     assert resp.status_code == 200
     assert resp.json() == {"status": "healthy"}
 
@@ -29,9 +27,7 @@ def test_language_eval_verify_upstream_non_200_becomes_500(authenticated_admin):
     target = "http://self-language-eval:5000"
     with aioresponses_strict() as m:
         m.get(f"{target}/health", status=503, payload={"error": "down"})
-        resp = authenticated_admin.post(
-            "/language-eval/verify", json={"url": target}
-        )
+        resp = authenticated_admin.post("/language-eval/verify", json={"url": target})
     assert resp.status_code == 500
 
 
@@ -40,9 +36,7 @@ def test_code_eval_verify_success(authenticated_admin):
     target = "http://self-code-eval:5001"
     with aioresponses_strict() as m:
         m.get(f"{target}/health", status=200, payload={"status": "ok"})
-        resp = authenticated_admin.post(
-            "/code-eval/verify", json={"url": target}
-        )
+        resp = authenticated_admin.post("/code-eval/verify", json={"url": target})
     assert resp.status_code == 200
 
 
@@ -51,9 +45,7 @@ def test_code_eval_verify_upstream_non_200_becomes_500(authenticated_admin):
     target = "http://self-code-eval:5001"
     with aioresponses_strict() as m:
         m.get(f"{target}/health", status=404, payload={"error": "missing"})
-        resp = authenticated_admin.post(
-            "/code-eval/verify", json={"url": target}
-        )
+        resp = authenticated_admin.post("/code-eval/verify", json={"url": target})
     assert resp.status_code == 500
 
 

@@ -1,8 +1,9 @@
 import logging
-
-from typing import Any, Dict, Generator, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Optional, Sequence, Union
 from urllib.parse import parse_qs, urlparse
+
 from langchain_core.documents import Document
+
 from selfai_ui.env import SRC_LOG_LEVELS
 
 log = logging.getLogger(__name__)
@@ -74,7 +75,6 @@ class YoutubeLoader:
         try:
             from youtube_transcript_api import (
                 NoTranscriptFound,
-                TranscriptsDisabled,
                 YouTubeTranscriptApi,
             )
         except ImportError:
@@ -94,10 +94,8 @@ class YoutubeLoader:
             youtube_proxies = None
 
         try:
-            transcript_list = YouTubeTranscriptApi.list_transcripts(
-                self.video_id, proxies=youtube_proxies
-            )
-        except Exception as e:
+            transcript_list = YouTubeTranscriptApi.list_transcripts(self.video_id, proxies=youtube_proxies)
+        except Exception:
             log.exception("Loading YouTube transcript failed")
             return []
 

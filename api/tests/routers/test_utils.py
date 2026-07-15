@@ -12,9 +12,7 @@ def test_gravatar_public(client):
 
 @pytest.mark.tier0
 def test_code_format_requires_auth(client):
-    resp = client.post(
-        "/api/v1/utils/code/format", json={"code": "x=1"}
-    )
+    resp = client.post("/api/v1/utils/code/format", json={"code": "x=1"})
     assert resp.status_code in (401, 403)
 
 

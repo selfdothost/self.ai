@@ -7,14 +7,20 @@ secrets, internal paths, or configuration details.
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # T-234: Unauthenticated /api/config leaks
 # ---------------------------------------------------------------------------
 
 SENSITIVE_KEYS = [
-    "api_key", "secret", "password", "jwt", "token",
-    "private", "credential", "aws", "postgres",
+    "api_key",
+    "secret",
+    "password",
+    "jwt",
+    "token",
+    "private",
+    "credential",
+    "aws",
+    "postgres",
 ]
 
 
@@ -66,14 +72,13 @@ def test_unauthenticated_config_no_obvious_secrets(client):
     assert resp.status_code == 200
     body = resp.json()
     findings = _contains_sensitive(body)
-    assert findings == [], (
-        f"Unauthenticated /api/config exposes sensitive keys: {findings}"
-    )
+    assert findings == [], f"Unauthenticated /api/config exposes sensitive keys: {findings}"
 
 
 # ---------------------------------------------------------------------------
 # T-235: Error responses don't leak stack traces
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.tier0
 @pytest.mark.security
@@ -89,15 +94,13 @@ def test_error_response_no_stack_trace(client):
     body = resp.text
     stack_indicators = [
         "Traceback",
-        "File \"/",
+        'File "/',
         "line ",
         "selfai_ui/",
-        ".py\", line",
+        '.py", line',
     ]
     for indicator in stack_indicators:
-        assert indicator not in body, (
-            f"Error response contains stack trace indicator '{indicator}':\n{body[:500]}"
-        )
+        assert indicator not in body, f"Error response contains stack trace indicator '{indicator}':\n{body[:500]}"
 
 
 @pytest.mark.tier0
@@ -117,6 +120,4 @@ def test_401_no_mechanism_hints(client):
         "api key required",
     ]
     for phrase in sensitive_phrases:
-        assert phrase not in body, (
-            f"401/403 response leaks auth mechanism hint: '{phrase}'"
-        )
+        assert phrase not in body, f"401/403 response leaks auth mechanism hint: '{phrase}'"

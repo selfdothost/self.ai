@@ -1,26 +1,31 @@
+import logging
 import os
-import boto3
-from botocore.exceptions import ClientError
 import shutil
+from typing import BinaryIO, Optional, Tuple
 
+import boto3
+from botocore.config import Config as BotoConfig
+from botocore.exceptions import ClientError
 
-from typing import BinaryIO, Tuple, Optional, Union
-
-from selfai_ui.constants import ERROR_MESSAGES
 from selfai_ui.config import (
-    STORAGE_PROVIDER,
+    ENABLE_SELF_CORPUS,
     S3_ACCESS_KEY_ID,
-    S3_SECRET_ACCESS_KEY,
     S3_BUCKET_NAME,
-    S3_REGION_NAME,
     S3_ENDPOINT_URL,
+    S3_REGION_NAME,
+    S3_SECRET_ACCESS_KEY,
+    SELF_CORPUS_LAKEFS_ACCESS_KEY_ID,
+    SELF_CORPUS_LAKEFS_ENDPOINT,
+    SELF_CORPUS_LAKEFS_SECRET_ACCESS_KEY,
+    STORAGE_PROVIDER,
     UPLOAD_DIR,
 )
+from selfai_ui.constants import ERROR_MESSAGES
+from selfai_ui.utils.self_corpus import repo_id_for_kb
 
+log = logging.getLogger(__name__)
 
-import boto3
-from botocore.exceptions import ClientError
-from typing import BinaryIO, Tuple, Optional
+SELF_CORPUS_BRANCH = "main"
 
 
 class StorageProvider:
@@ -33,6 +38,21 @@ class StorageProvider:
         if self.storage_provider == "s3":
             self._initialize_s3()
 
+        # self.corpus (LakeFS) — one repo per Knowledge Base, addressed through
+        # lakeFS's S3-compatible gateway (repo = bucket, "<branch>/<path>" = key).
+        # Orthogonal to the generic single-bucket `s3` mode above: this only
+        # applies to KB-scoped files, keyed by the KB's own id as `subdirectory`.
+        self.corpus_client = None
+        if ENABLE_SELF_CORPUS.value:
+            self.corpus_client = boto3.client(
+                "s3",
+                region_name="us-east-1",
+                endpoint_url=SELF_CORPUS_LAKEFS_ENDPOINT.value,
+                aws_access_key_id=SELF_CORPUS_LAKEFS_ACCESS_KEY_ID.value,
+                aws_secret_access_key=SELF_CORPUS_LAKEFS_SECRET_ACCESS_KEY.value,
+                config=BotoConfig(s3={"addressing_style": "path"}),
+            )
+
     def _initialize_s3(self) -> None:
         """Initializes the S3 client and bucket name if using S3 storage."""
         self.s3_client = boto3.client(
@@ -43,6 +63,43 @@ class StorageProvider:
             aws_secret_access_key=S3_SECRET_ACCESS_KEY,
         )
         self.bucket_name = S3_BUCKET_NAME
+
+    def _upload_to_corpus(self, file_path: str, kb_id: str, filename: str) -> None:
+        """Best-effort push of a KB-scoped file into its self.corpus repo.
+
+        Never raises — self.corpus being unreachable or the repo not existing
+        (e.g. a Private KB, or self.corpus was off at KB-creation time)
+        shouldn't break the KB feature itself.
+        """
+        if not self.corpus_client:
+            return
+        repo_id = repo_id_for_kb(kb_id)
+        try:
+            self.corpus_client.upload_file(file_path, repo_id, f"{SELF_CORPUS_BRANCH}/{filename}")
+        except Exception as e:
+            log.warning(f"self.corpus upload skipped for repo {repo_id}: {e}")
+
+    def _delete_from_corpus(self, kb_id: str, filename: str) -> None:
+        """Best-effort delete of a KB-scoped file's object in self.corpus."""
+        if not self.corpus_client:
+            return
+        repo_id = repo_id_for_kb(kb_id)
+        try:
+            self.corpus_client.delete_object(Bucket=repo_id, Key=f"{SELF_CORPUS_BRANCH}/{filename}")
+        except Exception as e:
+            log.warning(f"self.corpus delete skipped for repo {repo_id}: {e}")
+
+    def _delete_all_from_corpus(self, kb_id: str) -> None:
+        """Best-effort delete of every object in a KB's self.corpus repo."""
+        if not self.corpus_client:
+            return
+        repo_id = repo_id_for_kb(kb_id)
+        try:
+            response = self.corpus_client.list_objects_v2(Bucket=repo_id, Prefix=f"{SELF_CORPUS_BRANCH}/")
+            for content in response.get("Contents", []):
+                self.corpus_client.delete_object(Bucket=repo_id, Key=content["Key"])
+        except Exception as e:
+            log.warning(f"self.corpus subdirectory cleanup skipped for repo {repo_id}: {e}")
 
     def _upload_to_s3(self, file_path: str, filename: str) -> Tuple[bytes, str]:
         """Handles uploading of the file to S3 storage."""
@@ -117,9 +174,7 @@ class StorageProvider:
             response = self.s3_client.list_objects_v2(Bucket=self.bucket_name)
             if "Contents" in response:
                 for content in response["Contents"]:
-                    self.s3_client.delete_object(
-                        Bucket=self.bucket_name, Key=content["Key"]
-                    )
+                    self.s3_client.delete_object(Bucket=self.bucket_name, Key=content["Key"])
         except ClientError as e:
             raise RuntimeError(f"Error deleting all files from S3: {e}")
 
@@ -173,26 +228,39 @@ class StorageProvider:
             local_path = f"{UPLOAD_DIR}/{key}"
         else:
             local_path = file_path
+
+        # If the file lives under a KB subdirectory, that's its self.corpus
+        # repo (via repo_id_for_kb) — clean up the object there too.
+        parent = os.path.dirname(local_path)
+        if parent != UPLOAD_DIR and os.path.dirname(parent) == UPLOAD_DIR:
+            kb_id = os.path.basename(parent)
+            self._delete_from_corpus(kb_id, os.path.basename(local_path))
+
         self._delete_from_local(local_path)
 
     def move_file(self, current_path: str, new_subdirectory: str) -> str:
-        """Moves a file to a new subdirectory within the upload directory."""
+        """Moves a file to a new subdirectory within the upload directory.
+
+        `new_subdirectory` is a Knowledge Base id — this is the sole point
+        where a generically-uploaded file becomes KB-scoped, so it's also
+        where the file gets pushed into that KB's self.corpus repo.
+        """
         basename = os.path.basename(current_path)
         target_dir = f"{UPLOAD_DIR}/{new_subdirectory}"
         new_path = f"{target_dir}/{basename}"
 
-        if current_path == new_path:
-            return new_path
+        if current_path != new_path:
+            os.makedirs(target_dir, exist_ok=True)
+            shutil.move(current_path, new_path)
 
-        os.makedirs(target_dir, exist_ok=True)
-        shutil.move(current_path, new_path)
+            # Clean up empty source directory
+            source_dir = os.path.dirname(current_path)
+            if source_dir != UPLOAD_DIR and os.path.isdir(source_dir) and not os.listdir(source_dir):
+                os.rmdir(source_dir)
 
-        # Clean up empty source directory
-        source_dir = os.path.dirname(current_path)
-        if source_dir != UPLOAD_DIR and os.path.isdir(source_dir) and not os.listdir(source_dir):
-            os.rmdir(source_dir)
+        self._upload_to_corpus(new_path, new_subdirectory, basename)
 
-        if self.storage_provider == "s3":
+        if self.storage_provider == "s3" and current_path != new_path:
             old_key = os.path.basename(current_path)
             new_key = f"{new_subdirectory}/{basename}"
             try:
@@ -209,21 +277,22 @@ class StorageProvider:
         return new_path
 
     def delete_subdirectory(self, subdirectory: str) -> None:
-        """Deletes an entire subdirectory from storage."""
+        """Deletes an entire subdirectory from storage. `subdirectory` here is
+        a KB id, so this also clears that KB's self.corpus repo objects —
+        the repo itself is deleted separately (routers/knowledge.py, via
+        utils/self_corpus.delete_repository)."""
         local_dir = f"{UPLOAD_DIR}/{subdirectory}"
         if os.path.isdir(local_dir):
             shutil.rmtree(local_dir, ignore_errors=True)
 
+        self._delete_all_from_corpus(subdirectory)
+
         if self.storage_provider == "s3" and self.s3_client:
             try:
-                response = self.s3_client.list_objects_v2(
-                    Bucket=self.bucket_name, Prefix=f"{subdirectory}/"
-                )
+                response = self.s3_client.list_objects_v2(Bucket=self.bucket_name, Prefix=f"{subdirectory}/")
                 if "Contents" in response:
                     for content in response["Contents"]:
-                        self.s3_client.delete_object(
-                            Bucket=self.bucket_name, Key=content["Key"]
-                        )
+                        self.s3_client.delete_object(Bucket=self.bucket_name, Key=content["Key"])
             except ClientError as e:
                 print(f"Error deleting subdirectory from S3: {e}")
 

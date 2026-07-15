@@ -8,7 +8,6 @@ valid minimal Python content. Full exec/sandbox testing is deferred
 
 import pytest
 
-
 VALID_TOOL_CONTENT = '''"""
 title: TestTool
 description: Minimal valid tool for testing
@@ -45,9 +44,7 @@ def test_create_tool_minimal(authenticated_admin):
             "access_control": None,
         },
     )
-    assert resp.status_code == 200, (
-        f"Tool create returned {resp.status_code}: {resp.text[:200]}"
-    )
+    assert resp.status_code == 200, f"Tool create returned {resp.status_code}: {resp.text[:200]}"
     assert resp.json()["id"] == "test_tool"
 
 

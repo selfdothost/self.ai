@@ -5,43 +5,36 @@ import os
 import uuid
 from functools import lru_cache
 from pathlib import Path
-from pydub import AudioSegment
-from pydub.silence import split_on_silence
 
-import aiohttp
 import aiofiles
+import aiohttp
 import requests
-
 from fastapi import (
+    APIRouter,
     Depends,
-    FastAPI,
     File,
     HTTPException,
     Request,
     UploadFile,
     status,
-    APIRouter,
 )
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from pydub import AudioSegment
+from pydub.utils import mediainfo
 
-
-from selfai_ui.utils.auth import get_admin_user, get_verified_user
 from selfai_ui.config import (
+    CACHE_DIR,
     WHISPER_MODEL_AUTO_UPDATE,
     WHISPER_MODEL_DIR,
-    CACHE_DIR,
 )
-
 from selfai_ui.constants import ERROR_MESSAGES
 from selfai_ui.env import (
-    ENV,
-    SRC_LOG_LEVELS,
     DEVICE_TYPE,
     ENABLE_FORWARD_USER_INFO_HEADERS,
+    SRC_LOG_LEVELS,
 )
-
+from selfai_ui.utils.auth import get_admin_user, get_verified_user
 
 router = APIRouter()
 
@@ -62,9 +55,6 @@ SPEECH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 #
 ##########################################
 
-from pydub import AudioSegment
-from pydub.utils import mediainfo
-
 
 def is_mp4_audio(file_path):
     """Check if the given file is an MP4 audio file."""
@@ -73,11 +63,7 @@ def is_mp4_audio(file_path):
         return False
 
     info = mediainfo(file_path)
-    if (
-        info.get("codec_name") == "aac"
-        and info.get("codec_type") == "audio"
-        and info.get("codec_tag_string") == "mp4a"
-    ):
+    if info.get("codec_name") == "aac" and info.get("codec_type") == "audio" and info.get("codec_tag_string") == "mp4a":
         return True
     return False
 
@@ -89,10 +75,29 @@ def convert_mp4_to_wav(file_path, output_path):
     print(f"Converted {file_path} to {output_path}")
 
 
+class FasterWhisperUnavailable(RuntimeError):
+    """Raised when the local faster-whisper STT engine is not installed.
+
+    The API-tier image deliberately excludes ``faster-whisper`` (and the
+    torch stack it depends on) — see ``requirements-api.txt``. Local Whisper
+    STT is only available on images that vendor it; the API-tier image
+    externalizes STT to self.transcribe as its own service instead.
+    """
+
+
+LOCAL_WHISPER_UNAVAILABLE_MESSAGE = (
+    "local Whisper STT is not available on this image; configure "
+    "AUDIO_STT_OPENAI_API_BASE_URL to use an external STT backend instead"
+)
+
+
 def set_faster_whisper_model(model: str, auto_update: bool = False):
     whisper_model = None
     if model:
-        from faster_whisper import WhisperModel
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError as e:
+            raise FasterWhisperUnavailable(LOCAL_WHISPER_UNAVAILABLE_MESSAGE) from e
 
         faster_whisper_kwargs = {
             "model_size_or_path": model,
@@ -105,9 +110,7 @@ def set_faster_whisper_model(model: str, auto_update: bool = False):
         try:
             whisper_model = WhisperModel(**faster_whisper_kwargs)
         except Exception:
-            log.warning(
-                "WhisperModel initialization failed, attempting download with local_files_only=False"
-            )
+            log.warning("WhisperModel initialization failed, attempting download with local_files_only=False")
             faster_whisper_kwargs["local_files_only"] = False
             whisper_model = WhisperModel(**faster_whisper_kwargs)
     return whisper_model
@@ -170,9 +173,7 @@ async def get_audio_config(request: Request, user=Depends(get_admin_user)):
 
 
 @router.post("/config/update")
-async def update_audio_config(
-    request: Request, form_data: AudioConfigUpdateForm, user=Depends(get_admin_user)
-):
+async def update_audio_config(request: Request, form_data: AudioConfigUpdateForm, user=Depends(get_admin_user)):
     request.app.state.config.TTS_OPENAI_API_BASE_URL = form_data.tts.OPENAI_API_BASE_URL
     request.app.state.config.TTS_OPENAI_API_KEY = form_data.tts.OPENAI_API_KEY
     request.app.state.config.TTS_API_KEY = form_data.tts.API_KEY
@@ -181,9 +182,7 @@ async def update_audio_config(
     request.app.state.config.TTS_VOICE = form_data.tts.VOICE
     request.app.state.config.TTS_SPLIT_ON = form_data.tts.SPLIT_ON
     request.app.state.config.TTS_AZURE_SPEECH_REGION = form_data.tts.AZURE_SPEECH_REGION
-    request.app.state.config.TTS_AZURE_SPEECH_OUTPUT_FORMAT = (
-        form_data.tts.AZURE_SPEECH_OUTPUT_FORMAT
-    )
+    request.app.state.config.TTS_AZURE_SPEECH_OUTPUT_FORMAT = form_data.tts.AZURE_SPEECH_OUTPUT_FORMAT
 
     request.app.state.config.STT_OPENAI_API_BASE_URL = form_data.stt.OPENAI_API_BASE_URL
     request.app.state.config.STT_OPENAI_API_KEY = form_data.stt.OPENAI_API_KEY
@@ -192,9 +191,15 @@ async def update_audio_config(
     request.app.state.config.WHISPER_MODEL = form_data.stt.WHISPER_MODEL
 
     if request.app.state.config.STT_ENGINE == "":
-        request.app.state.faster_whisper_model = set_faster_whisper_model(
-            form_data.stt.WHISPER_MODEL, WHISPER_MODEL_AUTO_UPDATE
-        )
+        try:
+            request.app.state.faster_whisper_model = set_faster_whisper_model(
+                form_data.stt.WHISPER_MODEL, WHISPER_MODEL_AUTO_UPDATE
+            )
+        except FasterWhisperUnavailable as e:
+            raise HTTPException(
+                status_code=status.HTTP_501_NOT_IMPLEMENTED,
+                detail=str(e),
+            )
 
     return {
         "tts": {
@@ -219,13 +224,11 @@ async def update_audio_config(
 
 
 def load_speech_pipeline(request):
-    from transformers import pipeline
     from datasets import load_dataset
+    from transformers import pipeline
 
     if request.app.state.speech_synthesiser is None:
-        request.app.state.speech_synthesiser = pipeline(
-            "text-to-speech", "microsoft/speecht5_tts"
-        )
+        request.app.state.speech_synthesiser = pipeline("text-to-speech", "microsoft/speecht5_tts")
 
     if request.app.state.speech_speaker_embeddings_dataset is None:
         request.app.state.speech_speaker_embeddings_dataset = load_dataset(
@@ -420,8 +423,8 @@ async def speech(request: Request, user=Depends(get_verified_user)):
             log.exception(e)
             raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
-        import torch
         import soundfile as sf
+        import torch
 
         load_speech_pipeline(request)
 
@@ -429,15 +432,11 @@ async def speech(request: Request, user=Depends(get_verified_user)):
 
         speaker_index = 6799
         try:
-            speaker_index = embeddings_dataset["filename"].index(
-                request.app.state.config.TTS_MODEL
-            )
+            speaker_index = embeddings_dataset["filename"].index(request.app.state.config.TTS_MODEL)
         except Exception:
             pass
 
-        speaker_embedding = torch.tensor(
-            embeddings_dataset[speaker_index]["xvector"]
-        ).unsqueeze(0)
+        speaker_embedding = torch.tensor(embeddings_dataset[speaker_index]["xvector"]).unsqueeze(0)
 
         speech = request.app.state.speech_synthesiser(
             payload["input"],
@@ -451,6 +450,17 @@ async def speech(request: Request, user=Depends(get_verified_user)):
 
         return FileResponse(file_path)
 
+    else:
+        # None of the known engines matched (TTS_ENGINE unset/misconfigured).
+        # Previously this fell through with no return -> an implicit 200 with
+        # a null body, silently "succeeding" at producing no audio. Surfaced
+        # by test_audio_speech_requires_payload once the STT-side crash that
+        # used to mask it was fixed (self.ai#26).
+        raise HTTPException(
+            status_code=400,
+            detail="TTS engine is not configured",
+        )
+
 
 def transcribe(request: Request, file_path):
     print("transcribe", file_path)
@@ -460,16 +470,19 @@ def transcribe(request: Request, file_path):
 
     if request.app.state.config.STT_ENGINE == "":
         if request.app.state.faster_whisper_model is None:
-            request.app.state.faster_whisper_model = set_faster_whisper_model(
-                request.app.state.config.WHISPER_MODEL
-            )
+            try:
+                request.app.state.faster_whisper_model = set_faster_whisper_model(
+                    request.app.state.config.WHISPER_MODEL
+                )
+            except FasterWhisperUnavailable as e:
+                raise HTTPException(
+                    status_code=status.HTTP_501_NOT_IMPLEMENTED,
+                    detail=str(e),
+                )
 
         model = request.app.state.faster_whisper_model
         segments, info = model.transcribe(file_path, beam_size=5)
-        log.info(
-            "Detected language '%s' with probability %f"
-            % (info.language, info.language_probability)
-        )
+        log.info("Detected language '%s' with probability %f" % (info.language, info.language_probability))
 
         transcript = "".join([segment.text for segment in list(segments)])
         data = {"text": transcript.strip()}
@@ -491,9 +504,7 @@ def transcribe(request: Request, file_path):
         try:
             r = requests.post(
                 url=f"{request.app.state.config.STT_OPENAI_API_BASE_URL}/audio/transcriptions",
-                headers={
-                    "Authorization": f"Bearer {request.app.state.config.STT_OPENAI_API_KEY}"
-                },
+                headers={"Authorization": f"Bearer {request.app.state.config.STT_OPENAI_API_KEY}"},
                 files={"file": (filename, open(file_path, "rb"))},
                 data={"model": request.app.state.config.STT_MODEL},
             )
@@ -531,9 +542,7 @@ def compress_audio(file_path):
         audio.export(compressed_path, format="opus", bitrate="32k")
         log.debug(f"Compressed audio to {compressed_path}")
 
-        if (
-            os.path.getsize(compressed_path) > MAX_FILE_SIZE
-        ):  # Still larger than MAX_FILE_SIZE after compression
+        if os.path.getsize(compressed_path) > MAX_FILE_SIZE:  # Still larger than MAX_FILE_SIZE after compression
             raise Exception(ERROR_MESSAGES.FILE_TOO_LARGE(size=f"{MAX_FILE_SIZE_MB}MB"))
         return compressed_path
     else:
@@ -582,6 +591,10 @@ def transcription(
             data = transcribe(request, file_path)
             file_path = file_path.split("/")[-1]
             return {**data, "filename": file_path}
+        except HTTPException:
+            # Preserve intentional statuses (e.g. 501 for an unavailable
+            # local STT engine) instead of flattening them into a 400 below.
+            raise
         except Exception as e:
             log.exception(e)
 
@@ -590,6 +603,8 @@ def transcription(
                 detail=ERROR_MESSAGES.DEFAULT(e),
             )
 
+    except HTTPException:
+        raise
     except Exception as e:
         log.exception(e)
 
@@ -616,9 +631,7 @@ def get_available_models(request: Request) -> list[dict]:
             response.raise_for_status()
             models = response.json()
 
-            available_models = [
-                {"name": model["name"], "id": model["model_id"]} for model in models
-            ]
+            available_models = [{"name": model["name"], "id": model["model_id"]} for model in models]
         except requests.RequestException as e:
             log.error(f"Error fetching voices: {str(e)}")
     return available_models
@@ -643,9 +656,7 @@ def get_available_voices(request) -> dict:
         }
     elif request.app.state.config.TTS_ENGINE == "elevenlabs":
         try:
-            available_voices = get_elevenlabs_voices(
-                api_key=request.app.state.config.TTS_API_KEY
-            )
+            available_voices = get_elevenlabs_voices(api_key=request.app.state.config.TTS_API_KEY)
         except Exception:
             # Avoided @lru_cache with exception
             pass
@@ -653,18 +664,14 @@ def get_available_voices(request) -> dict:
         try:
             region = request.app.state.config.TTS_AZURE_SPEECH_REGION
             url = f"https://{region}.tts.speech.microsoft.com/cognitiveservices/voices/list"
-            headers = {
-                "Ocp-Apim-Subscription-Key": request.app.state.config.TTS_API_KEY
-            }
+            headers = {"Ocp-Apim-Subscription-Key": request.app.state.config.TTS_API_KEY}
 
             response = requests.get(url, headers=headers)
             response.raise_for_status()
             voices = response.json()
 
             for voice in voices:
-                available_voices[voice["ShortName"]] = (
-                    f"{voice['DisplayName']} ({voice['ShortName']})"
-                )
+                available_voices[voice["ShortName"]] = f"{voice['DisplayName']} ({voice['ShortName']})"
         except requests.RequestException as e:
             log.error(f"Error fetching voices: {str(e)}")
 
@@ -706,8 +713,4 @@ def get_elevenlabs_voices(api_key: str) -> dict:
 
 @router.get("/voices")
 async def get_voices(request: Request, user=Depends(get_verified_user)):
-    return {
-        "voices": [
-            {"id": k, "name": v} for k, v in get_available_voices(request).items()
-        ]
-    }
+    return {"voices": [{"id": k, "name": v} for k, v in get_available_voices(request).items()]}

@@ -16,10 +16,10 @@ are testing the FastAPI auth layer only.
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # T-327: Ollama proxy
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.tier0
 def test_ollama_status_unauthenticated(client):
@@ -45,6 +45,7 @@ def test_ollama_config_admin_access(authenticated_admin):
 # T-328: OpenAI proxy
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.tier0
 def test_openai_config_admin_only(authenticated_user):
     resp = authenticated_user.get("/openai/config")
@@ -60,6 +61,7 @@ def test_openai_config_admin_access(authenticated_admin):
 # ---------------------------------------------------------------------------
 # T-329: Llamolotl proxy
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.tier0
 def test_llamolotl_status_unauthenticated(client):
@@ -84,6 +86,7 @@ def test_llamolotl_config_admin_access(authenticated_admin):
 # T-330: Curator proxy
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.tier0
 def test_curator_config_admin_only(authenticated_user):
     resp = authenticated_user.get("/curator/config")
@@ -101,6 +104,7 @@ def test_curator_config_admin_access(authenticated_admin):
 # T-331: Audio (STT/TTS)
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.tier0
 def test_audio_config_admin_only(authenticated_user):
     resp = authenticated_user.get("/api/v1/audio/config")
@@ -117,6 +121,7 @@ def test_audio_config_admin_access(authenticated_admin):
 # T-332: Images
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.tier0
 def test_images_config_admin_only(authenticated_user):
     resp = authenticated_user.get("/api/v1/images/config")
@@ -132,6 +137,7 @@ def test_images_config_admin_access(authenticated_admin):
 # ---------------------------------------------------------------------------
 # T-333: Retrieval (config moved behind auth in T-205 fixes)
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.tier0
 def test_retrieval_status_requires_admin(authenticated_user):
@@ -155,6 +161,7 @@ def test_retrieval_config_admin_only(authenticated_user):
 # ---------------------------------------------------------------------------
 # T-334: Eval proxies (language-eval + code-eval)
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.tier0
 def test_language_eval_config_admin_only(authenticated_user):

@@ -8,9 +8,7 @@ Validates server-side enforcement of upload constraints:
 - Null byte injection rejected
 """
 
-import io
 import pytest
-
 
 UPLOAD_PATH = "/api/v1/files/"
 
@@ -18,6 +16,7 @@ UPLOAD_PATH = "/api/v1/files/"
 # ---------------------------------------------------------------------------
 # T-227: Size limit enforcement
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.tier0
 @pytest.mark.security
@@ -55,14 +54,13 @@ def test_upload_oversized_file_returns_413(authenticated_user, test_app):
         UPLOAD_PATH,
         files={"file": ("big.bin", big_content, "application/octet-stream")},
     )
-    assert resp.status_code == 413, (
-        f"Expected 413 for oversized upload, got {resp.status_code}: {resp.text}"
-    )
+    assert resp.status_code == 413, f"Expected 413 for oversized upload, got {resp.status_code}: {resp.text}"
 
 
 # ---------------------------------------------------------------------------
 # T-228: Path traversal, null bytes, MIME
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.tier0
 @pytest.mark.security
@@ -83,9 +81,7 @@ def test_upload_path_traversal_sanitized(authenticated_user, test_app):
     if resp.status_code == 200:
         body = resp.json()
         path = body.get("meta", {}).get("path", body.get("path", ""))
-        assert ".." not in path, (
-            f"Upload path contains traversal sequence: {path}"
-        )
+        assert ".." not in path, f"Upload path contains traversal sequence: {path}"
 
 
 @pytest.mark.tier0
@@ -128,9 +124,7 @@ def test_upload_blocked_mime_rejected(authenticated_user, test_app):
             )
         },
     )
-    assert resp.status_code == 415, (
-        f"Expected 415 for executable MIME, got {resp.status_code}"
-    )
+    assert resp.status_code == 415, f"Expected 415 for executable MIME, got {resp.status_code}"
 
 
 @pytest.mark.tier0
@@ -151,8 +145,7 @@ def test_upload_allowlist_blocks_non_allowed(authenticated_user, test_app):
             },
         )
         assert resp.status_code == 415, (
-            f"PDF should be rejected when allowlist is text/plain only, "
-            f"got {resp.status_code}"
+            f"PDF should be rejected when allowlist is text/plain only, " f"got {resp.status_code}"
         )
     finally:
         test_app.state.config.FILE_UPLOAD_MIME_ALLOWLIST = []

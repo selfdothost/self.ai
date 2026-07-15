@@ -1,74 +1,57 @@
-import time
+import asyncio
+import inspect
+import json
 import logging
 import sys
-
-import asyncio
-from aiocache import cached
-from typing import Any, Optional
-import random
-import json
-import inspect
-from uuid import uuid4
 from concurrent.futures import ThreadPoolExecutor
-
+from html.parser import HTMLParser
+from uuid import uuid4
 
 from fastapi import Request
-from fastapi import BackgroundTasks
+from langchain_core.documents import Document as LCDocument
+from starlette.responses import StreamingResponse
 
-from starlette.responses import Response, StreamingResponse
-
-
-from selfai_ui.models.chats import Chats
-from selfai_ui.models.users import Users
-from selfai_ui.socket.main import (
-    get_event_call,
-    get_event_emitter,
-    get_active_status_by_user_id,
+from selfai_ui.browse.access_control import has_browsing_access
+from selfai_ui.browse.connection import browse_fetch
+from selfai_ui.browse.profiles import resolve_profile
+from selfai_ui.constants import TASKS
+from selfai_ui.env import (
+    ENABLE_REALTIME_CHAT_SAVE,
+    GLOBAL_LOG_LEVEL,
+    SRC_LOG_LEVELS,
 )
+from selfai_ui.models.chats import Chats
+from selfai_ui.models.functions import Functions
+from selfai_ui.models.users import UserModel, Users
+from selfai_ui.retrieval.utils import get_sources_from_files
+from selfai_ui.routers.retrieval import save_docs_to_vector_db, search_web
 from selfai_ui.routers.tasks import (
+    TaskFormData,
+    generate_chat_tags,
     generate_queries,
     generate_title,
-    generate_chat_tags,
 )
-from selfai_ui.routers.retrieval import process_web_search, SearchForm
-from selfai_ui.utils.webhook import post_webhook
-
-
-from selfai_ui.models.users import UserModel
-from selfai_ui.models.functions import Functions
-from selfai_ui.models.models import Models
-
-from selfai_ui.retrieval.utils import get_sources_from_files
-
-
+from selfai_ui.socket.main import (
+    get_active_status_by_user_id,
+    get_event_call,
+    get_event_emitter,
+)
+from selfai_ui.tasks import create_task
 from selfai_ui.utils.chat import generate_chat_completion
+from selfai_ui.utils.misc import (
+    add_or_update_system_message,
+    calculate_sha256_string,
+    get_last_user_message,
+    get_message_list,
+    prepend_to_first_user_message_content,
+)
+from selfai_ui.utils.plugin import get_function_priority, load_function_module_by_id
 from selfai_ui.utils.task import (
     get_task_model_id,
     rag_template,
-    tools_function_calling_generation_template,
-)
-from selfai_ui.utils.misc import (
-    get_message_list,
-    add_or_update_system_message,
-    get_last_user_message,
-    get_last_assistant_message,
-    prepend_to_first_user_message_content,
 )
 from selfai_ui.utils.tools import get_tools
-from selfai_ui.utils.plugin import load_function_module_by_id
-
-
-from selfai_ui.tasks import create_task
-
-from selfai_ui.config import DEFAULT_TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE
-from selfai_ui.env import (
-    SRC_LOG_LEVELS,
-    GLOBAL_LOG_LEVEL,
-    BYPASS_MODEL_ACCESS_CONTROL,
-    ENABLE_REALTIME_CHAT_SAVE,
-)
-from selfai_ui.constants import TASKS
-
+from selfai_ui.utils.webhook import post_webhook
 
 logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
 log = logging.getLogger(__name__)
@@ -79,30 +62,17 @@ async def chat_completion_filter_functions_handler(request, body, model, extra_p
     skip_files = None
 
     def get_filter_function_ids(model):
-        def get_priority(function_id):
-            function = Functions.get_function_by_id(function_id)
-            if function is not None and hasattr(function, "valves"):
-                # TODO: Fix FunctionModel
-                return (function.valves if function.valves else {}).get("priority", 0)
-            return 0
-
-        filter_ids = [
-            function.id for function in Functions.get_global_filter_functions()
-        ]
+        filter_ids = [function.id for function in Functions.get_global_filter_functions()]
         if "info" in model and "meta" in model["info"]:
             filter_ids.extend(model["info"]["meta"].get("filterIds", []))
             filter_ids = list(set(filter_ids))
 
-        enabled_filter_ids = [
-            function.id
-            for function in Functions.get_functions_by_type("filter", active_only=True)
-        ]
+        enabled_filter_ids = [function.id for function in Functions.get_functions_by_type("filter", active_only=True)]
 
-        filter_ids = [
-            filter_id for filter_id in filter_ids if filter_id in enabled_filter_ids
-        ]
+        filter_ids = [filter_id for filter_id in filter_ids if filter_id in enabled_filter_ids]
 
-        filter_ids.sort(key=get_priority)
+        # Sort filter_ids by priority, using the shared get_function_priority helper
+        filter_ids.sort(key=get_function_priority)
         return filter_ids
 
     filter_ids = get_filter_function_ids(model)
@@ -124,9 +94,7 @@ async def chat_completion_filter_functions_handler(request, body, model, extra_p
         # Apply valves to the function
         if hasattr(function_module, "valves") and hasattr(function_module, "Valves"):
             valves = Functions.get_function_valves_by_id(filter_id)
-            function_module.valves = function_module.Valves(
-                **(valves if valves else {})
-            )
+            function_module.valves = function_module.Valves(**(valves if valves else {}))
 
         if hasattr(function_module, "inlet"):
             try:
@@ -146,9 +114,7 @@ async def chat_completion_filter_functions_handler(request, body, model, extra_p
                 if "__user__" in params and hasattr(function_module, "UserValves"):
                     try:
                         params["__user__"]["valves"] = function_module.UserValves(
-                            **Functions.get_user_valves_by_id_and_user_id(
-                                filter_id, params["__user__"]["id"]
-                            )
+                            **Functions.get_user_valves_by_id_and_user_id(filter_id, params["__user__"]["id"])
                         )
                     except Exception as e:
                         print(e)
@@ -168,238 +134,95 @@ async def chat_completion_filter_functions_handler(request, body, model, extra_p
     return body, {}
 
 
-async def chat_completion_tools_handler(
-    request: Request, body: dict, user: UserModel, models, extra_params: dict
-) -> tuple[dict, dict]:
-    async def get_content_from_response(response) -> Optional[str]:
-        content = None
-        if hasattr(response, "body_iterator"):
-            async for chunk in response.body_iterator:
-                data = json.loads(chunk.decode("utf-8"))
-                content = data["choices"][0]["message"]["content"]
-
-            # Cleanup any remaining background tasks if necessary
-            if response.background is not None:
-                await response.background()
-        else:
-            content = response["choices"][0]["message"]["content"]
-        return content
-
-    def get_tools_function_calling_payload(messages, task_model_id, content):
-        user_message = get_last_user_message(messages)
-        history = "\n".join(
-            f"{message['role'].upper()}: \"\"\"{message['content']}\"\"\""
-            for message in messages[::-1][:4]
-        )
-
-        prompt = f"History:\n{history}\nQuery: {user_message}"
-
-        return {
-            "model": task_model_id,
-            "messages": [
-                {"role": "system", "content": content},
-                {"role": "user", "content": f"Query: {prompt}"},
-            ],
-            "stream": False,
-            "metadata": {"task": str(TASKS.FUNCTION_CALLING)},
-        }
-
-    # If tool_ids field is present, call the functions
-    metadata = body.get("metadata", {})
-
-    tool_ids = metadata.get("tool_ids", None)
-    log.debug(f"{tool_ids=}")
-    if not tool_ids:
-        return body, {}
-
-    skip_files = False
-    sources = []
-
-    task_model_id = get_task_model_id(
-        body["model"],
-        request.app.state.config.TASK_MODEL,
-        request.app.state.config.TASK_MODEL_EXTERNAL,
-        models,
-    )
-    tools = get_tools(
-        request,
-        tool_ids,
-        user,
-        {
-            **extra_params,
-            "__model__": models[task_model_id],
-            "__messages__": body["messages"],
-            "__files__": metadata.get("files", []),
-        },
-    )
-    log.info(f"{tools=}")
-
-    specs = [tool["spec"] for tool in tools.values()]
-    tools_specs = json.dumps(specs)
-
-    if request.app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE != "":
-        template = request.app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE
-    else:
-        template = DEFAULT_TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE
-
-    tools_function_calling_prompt = tools_function_calling_generation_template(
-        template, tools_specs
-    )
-    log.info(f"{tools_function_calling_prompt=}")
-    payload = get_tools_function_calling_payload(
-        body["messages"], task_model_id, tools_function_calling_prompt
-    )
-
-    try:
-        response = await generate_chat_completion(request, form_data=payload, user=user)
-        log.debug(f"{response=}")
-        content = await get_content_from_response(response)
-        log.debug(f"{content=}")
-
-        if not content:
-            return body, {}
-
-        try:
-            content = content[content.find("{") : content.rfind("}") + 1]
-            if not content:
-                raise Exception("No JSON object found in the response")
-
-            result = json.loads(content)
-
-            tool_function_name = result.get("name", None)
-            if tool_function_name not in tools:
-                return body, {}
-
-            tool_function_params = result.get("parameters", {})
-
-            try:
-                required_params = (
-                    tools[tool_function_name]
-                    .get("spec", {})
-                    .get("parameters", {})
-                    .get("required", [])
-                )
-                tool_function = tools[tool_function_name]["callable"]
-                tool_function_params = {
-                    k: v
-                    for k, v in tool_function_params.items()
-                    if k in required_params
-                }
-                tool_output = await tool_function(**tool_function_params)
-
-            except Exception as e:
-                tool_output = str(e)
-
-            if isinstance(tool_output, str):
-                if tools[tool_function_name]["citation"]:
-                    sources.append(
-                        {
-                            "source": {
-                                "name": f"TOOL:{tools[tool_function_name]['toolkit_id']}/{tool_function_name}"
-                            },
-                            "document": [tool_output],
-                            "metadata": [
-                                {
-                                    "source": f"TOOL:{tools[tool_function_name]['toolkit_id']}/{tool_function_name}"
-                                }
-                            ],
-                        }
-                    )
-                else:
-                    sources.append(
-                        {
-                            "source": {},
-                            "document": [tool_output],
-                            "metadata": [
-                                {
-                                    "source": f"TOOL:{tools[tool_function_name]['toolkit_id']}/{tool_function_name}"
-                                }
-                            ],
-                        }
-                    )
-
-                if tools[tool_function_name]["file_handler"]:
-                    skip_files = True
-
-        except Exception as e:
-            log.exception(f"Error: {e}")
-            content = None
-    except Exception as e:
-        log.exception(f"Error: {e}")
-        content = None
-
-    log.debug(f"tool_contexts: {sources}")
-
-    if skip_files and "files" in body.get("metadata", {}):
-        del body["metadata"]["files"]
-
-    return body, {"sources": sources}
-
-
-async def chat_web_search_handler(
-    request: Request, form_data: dict, extra_params: dict, user
-):
-    event_emitter = extra_params["__event_emitter__"]
-    await event_emitter(
-        {
-            "type": "status",
-            "data": {
-                "action": "web_search",
-                "description": "Generating search query",
-                "done": False,
-            },
-        }
-    )
-
-    messages = form_data["messages"]
-    user_message = get_last_user_message(messages)
-
-    queries = []
-    try:
-        res = await generate_queries(
-            request,
-            {
-                "model": form_data["model"],
-                "messages": messages,
-                "prompt": user_message,
-                "type": "web_search",
-            },
-            user,
-        )
-
-        response = res["choices"][0]["message"]["content"]
-
-        try:
-            bracket_start = response.find("{")
-            bracket_end = response.rfind("}") + 1
-
-            if bracket_start == -1 or bracket_end == -1:
-                raise Exception("No JSON object found in the response")
-
-            response = response[bracket_start:bracket_end]
-            queries = json.loads(response)
-            queries = queries.get("queries", [])
-        except Exception as e:
-            queries = [response]
-
-    except Exception as e:
-        log.exception(e)
-        queries = [user_message]
-
-    if len(queries) == 0:
-        await event_emitter(
-            {
-                "type": "status",
-                "data": {
-                    "action": "web_search",
-                    "description": "No search query generated",
-                    "done": True,
-                },
+WEB_SEARCH_TOOL_SPEC = {
+    "name": "web_search",
+    "description": (
+        "Search the web for current, real-time, or otherwise unfamiliar information that "
+        "is not already available in this conversation. Use this only when the existing "
+        "context is insufficient to answer accurately — do not use it for general "
+        "knowledge, conversation, or anything already covered above."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "A concise, targeted web search query.",
             }
-        )
-        return
+        },
+        "required": ["query"],
+    },
+}
 
-    searchQuery = queries[0]
+
+class _HTMLTextExtractor(HTMLParser):
+    """cavekit-browse-search-migration.md R4: dependency-free HTML -> readable
+    text + title extraction, so web_search's own content processing doesn't
+    require the domain-crawl scraping backend to be present or running."""
+
+    _SKIP_TAGS = {"script", "style", "noscript", "head"}
+    _BREAK_TAGS = {"p", "div", "br", "li", "h1", "h2", "h3", "h4", "h5", "h6", "tr"}
+
+    def __init__(self):
+        super().__init__()
+        self._parts: list[str] = []
+        self._skip_depth = 0
+        self._in_title = False
+        self.title = ""
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self._SKIP_TAGS:
+            self._skip_depth += 1
+        if tag == "title":
+            self._in_title = True
+
+    def handle_endtag(self, tag):
+        if tag in self._SKIP_TAGS:
+            self._skip_depth = max(0, self._skip_depth - 1)
+        if tag == "title":
+            self._in_title = False
+        if tag in self._BREAK_TAGS:
+            self._parts.append("\n")
+
+    def handle_data(self, data):
+        if self._in_title:
+            self.title += data
+        elif self._skip_depth == 0:
+            self._parts.append(data)
+
+    def get_text(self) -> str:
+        lines = [line.strip() for line in "".join(self._parts).splitlines()]
+        return "\n".join(line for line in lines if line)
+
+
+def html_to_text(html: str) -> tuple[str, str]:
+    """R4: extract (readable_text, title) from HTML. Never raises — a
+    parse failure on genuinely malformed input just yields what could be
+    recovered rather than failing the whole search."""
+    parser = _HTMLTextExtractor()
+    try:
+        parser.feed(html)
+    except Exception as e:
+        log.warning(f"html_to_text: parse error, using partial result: {e}")
+    return parser.get_text(), parser.title.strip()
+
+
+async def run_web_search_tool_call(request: Request, query: str, extra_params: dict, user) -> str:
+    """Execute a web search the model itself chose to issue via native
+    tool-calling, and return the retrieved content as a string for a
+    role="tool" message. The decision of *whether* to search, and the query
+    itself, both already came out of the model's own tool_calls — this only
+    runs the search/scrape/embed/retrieve pipeline and formats the result,
+    reusing the same event_emitter status shape as before so the frontend's
+    WebSearchResults UI needs no changes.
+
+    web_search is the first browsing-backed tool gated by
+    cavekit-browse-access-control.md — checked before the core connection
+    is ever invoked (its own R1)."""
+    event_emitter = extra_params["__event_emitter__"]
+
+    if not has_browsing_access(user, request.app.state.config.USER_PERMISSIONS):
+        return "Web browsing is not permitted for this account."
 
     await event_emitter(
         {
@@ -407,67 +230,133 @@ async def chat_web_search_handler(
             "data": {
                 "action": "web_search",
                 "description": 'Searching "{{searchQuery}}"',
-                "query": searchQuery,
+                "query": query,
                 "done": False,
             },
         }
     )
 
     try:
-
-        # Offload process_web_search to a separate thread
+        # Search-PROVIDER lookup (SearXNG/etc, per RAG_WEB_SEARCH_ENGINE) is
+        # unchanged — already pluggable, out of scope for this migration.
+        # What's replaced is the scrape step below: cavekit-browse-connection
+        # instead of the domain-crawl backend (self.crawl/Firecrawl), which
+        # this tool no longer sends any traffic to (cavekit-browse-search
+        # -migration.md R1, R7).
         loop = asyncio.get_running_loop()
         with ThreadPoolExecutor() as executor:
-            results = await loop.run_in_executor(
+            search_results = await loop.run_in_executor(
                 executor,
-                lambda: process_web_search(
-                    request,
-                    SearchForm(
-                        **{
-                            "query": searchQuery,
-                        }
-                    ),
-                    user,
-                ),
+                lambda: search_web(request, request.app.state.config.RAG_WEB_SEARCH_ENGINE, query),
             )
 
-        if results:
-            await event_emitter(
-                {
-                    "type": "status",
-                    "data": {
-                        "action": "web_search",
-                        "description": "Searched {{count}} sites",
-                        "query": searchQuery,
-                        "urls": results["filenames"],
-                        "done": True,
-                    },
-                }
-            )
-
-            files = form_data.get("files", [])
-            files.append(
-                {
-                    "collection_name": results["collection_name"],
-                    "name": searchQuery,
-                    "type": "web_search_results",
-                    "urls": results["filenames"],
-                }
-            )
-            form_data["files"] = files
-        else:
+        if not search_results:
             await event_emitter(
                 {
                     "type": "status",
                     "data": {
                         "action": "web_search",
                         "description": "No search results found",
-                        "query": searchQuery,
+                        "query": query,
                         "done": True,
                         "error": True,
                     },
                 }
             )
+            return "No search results found."
+
+        profile = resolve_profile("general-search")
+
+        # R2: fetched concurrently, not one after another — total wall-clock
+        # is bounded by the slowest single fetch's timeout, not the sum of
+        # all of them. R3 (fast-fail) falls out of this for free: a
+        # blocked/slow URL can't delay the others since they're all
+        # in flight at once, and general-search's retry_count=0 means no
+        # URL gets retried extensively either.
+        fetch_results = await asyncio.gather(
+            *(browse_fetch(request, result.link, profile) for result in search_results)
+        )
+
+        docs: list[LCDocument] = []
+        fetched_urls: list[str] = []
+        for result, fetch_result in zip(search_results, fetch_results):
+            if not fetch_result.success:
+                log.debug(f"web_search: skipping {result.link}: {fetch_result.error}")
+                continue
+
+            text, title = html_to_text(fetch_result.content)
+            if not text.strip():
+                continue
+
+            docs.append(
+                LCDocument(
+                    page_content=text,
+                    metadata={"source": result.link, "title": title or result.title or ""},
+                )
+            )
+            fetched_urls.append(result.link)
+
+        if not docs:
+            await event_emitter(
+                {
+                    "type": "status",
+                    "data": {
+                        "action": "web_search",
+                        "description": "No search results found",
+                        "query": query,
+                        "done": True,
+                        "error": True,
+                    },
+                }
+            )
+            return "No search results found."
+
+        collection_name = f"web-search-{calculate_sha256_string(query)}"[:63]
+
+        with ThreadPoolExecutor() as executor:
+            await loop.run_in_executor(
+                executor,
+                lambda: save_docs_to_vector_db(request, docs, collection_name, overwrite=True),
+            )
+
+        await event_emitter(
+            {
+                "type": "status",
+                "data": {
+                    "action": "web_search",
+                    "description": "Searched {{count}} sites",
+                    "query": query,
+                    "urls": fetched_urls,
+                    "done": True,
+                },
+            }
+        )
+
+        sources = get_sources_from_files(
+            files=[
+                {
+                    "collection_name": collection_name,
+                    "name": query,
+                    "type": "web_search_results",
+                    "urls": fetched_urls,
+                }
+            ],
+            queries=[query],
+            embedding_function=request.app.state.EMBEDDING_FUNCTION,
+            k=request.app.state.config.TOP_K,
+            reranking_function=request.app.state.rf,
+            r=request.app.state.config.RELEVANCE_THRESHOLD,
+            hybrid_search=request.app.state.config.ENABLE_RAG_HYBRID_SEARCH,
+        )
+
+        parts = []
+        for source in sources:
+            name = source.get("source", {}).get("name", "web result")
+            for doc in source.get("document", []):
+                parts.append(f'<source name="{name}">\n{doc}\n</source>')
+
+        return "\n\n".join(parts) if parts else "No relevant content retrieved."
+
     except Exception as e:
         log.exception(e)
         await event_emitter(
@@ -476,30 +365,333 @@ async def chat_web_search_handler(
                 "data": {
                     "action": "web_search",
                     "description": 'Error searching "{{searchQuery}}"',
-                    "query": searchQuery,
+                    "query": query,
                     "done": True,
                     "error": True,
                 },
             }
         )
+        return f"Web search failed: {e}"
 
-    return form_data
+
+MAX_TOOL_CALL_ROUNDS = 5
 
 
-async def chat_completion_files_handler(
-    request: Request, body: dict, user: UserModel
-) -> tuple[dict, dict[str, list]]:
+async def _dispatch_tool_call(
+    request: Request, tool_call: dict, admin_tools: dict, extra_params: dict, user, messages: list
+) -> str:
+    """Execute one tool_calls entry (web_search or an admin Tool) and return
+    its string result for a role="tool" message. Shared by the buffered and
+    streaming round-runners so dispatch logic lives in exactly one place."""
+    function = tool_call.get("function", {})
+    name = function.get("name")
+    try:
+        arguments = json.loads(function.get("arguments") or "{}")
+    except Exception:
+        arguments = {}
+
+    if name == "web_search":
+        query = arguments.get("query") or get_last_user_message(messages)
+        return await run_web_search_tool_call(request, query, extra_params, user)
+
+    if name in admin_tools:
+        event_emitter = extra_params["__event_emitter__"]
+        await event_emitter(
+            {"type": "status", "data": {"action": "tool_calls", "description": f"Calling {name}...", "done": False}}
+        )
+        try:
+            allowed_params = admin_tools[name].get("spec", {}).get("parameters", {}).get("properties", {})
+            tool_function = admin_tools[name]["callable"]
+            filtered_args = {k: v for k, v in arguments.items() if k in allowed_params}
+            tool_output = await tool_function(**filtered_args)
+            if not isinstance(tool_output, str):
+                tool_output = json.dumps(tool_output)
+        except Exception as e:
+            tool_output = str(e)
+        await event_emitter(
+            {"type": "status", "data": {"action": "tool_calls", "description": f"Called {name}", "done": True}}
+        )
+        return tool_output
+
+    return f"Unknown tool: {name}"
+
+
+async def _run_tool_calling_buffered(
+    request: Request, form_data: dict, messages: list, openai_tools: list, admin_tools: dict, extra_params: dict, user
+):
+    """Non-streaming tool-calling loop: each round is a single non-streaming
+    completion call, easy to inspect for tool_calls. Used whenever the
+    client asked for stream=False (e.g. eval jobs) — those want a plain
+    dict response anyway, so there's nothing to gain from streaming
+    internally."""
+    original_stream = form_data.get("stream", False)
+
+    for _ in range(MAX_TOOL_CALL_ROUNDS):
+        round_payload = {
+            **form_data,
+            "messages": messages,
+            "tools": openai_tools,
+            "tool_choice": "auto",
+            "stream": False,
+        }
+
+        try:
+            response = await generate_chat_completion(request, round_payload, user)
+        except Exception as e:
+            # Model/template likely doesn't support tool-calling — fall back
+            # to a plain completion rather than failing the whole turn.
+            log.exception(e)
+            return await generate_chat_completion(
+                request, {**form_data, "messages": messages, "stream": original_stream}, user
+            )
+
+        message = (response.get("choices") or [{}])[0].get("message", {})
+        tool_calls = message.get("tool_calls")
+
+        if not tool_calls:
+            return response
+
+        messages.append(message)
+
+        for tool_call in tool_calls:
+            tool_output = await _dispatch_tool_call(request, tool_call, admin_tools, extra_params, user, messages)
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.get("id", tool_call.get("function", {}).get("name")),
+                    "content": tool_output,
+                }
+            )
+
+    # Exceeded MAX_TOOL_CALL_ROUNDS while the model kept calling tools —
+    # force a final answer without offering any more.
+    return await generate_chat_completion(request, {**form_data, "messages": messages, "stream": original_stream}, user)
+
+
+async def _stream_tool_calling(
+    request: Request, form_data: dict, messages: list, openai_tools: list, admin_tools: dict, extra_params: dict, user
+):
+    """Streaming tool-calling loop: each round is a real streaming
+    completion call. content deltas are relayed to the client the instant
+    they arrive — nothing buffers them — while tool_calls deltas are
+    accumulated (by index, per the OpenAI/llama.cpp streaming contract:
+    the first delta for an index carries id + function.name, every delta
+    for that index may carry a function.arguments fragment to concatenate)
+    without being relayed, since a tool-deciding round naturally carries
+    little or no content to hold back. When a round ends with accumulated
+    tool_calls, they're executed and the loop opens the *next* streaming
+    round, transparently continuing the same outer stream — so a model
+    that narrates before calling a tool ("let me check...") has that
+    narration stream live too, then the real answer streams live right
+    after the tool result comes back.
+    """
+
+    async def iter_lines(response):
+        # response.body_iterator (aiohttp StreamReader under the hood, for
+        # llamolotl-owned models) yields one already-complete line per item —
+        # the same assumption process_chat_response's own SSE consumption
+        # relies on.
+        async for raw in response.body_iterator:
+            yield raw.decode("utf-8") if isinstance(raw, bytes) else raw
+
+    async def close(response):
+        if response.background is not None:
+            await response.background()
+
+    for _ in range(MAX_TOOL_CALL_ROUNDS):
+        round_payload = {
+            **form_data,
+            "messages": messages,
+            "tools": openai_tools,
+            "tool_choice": "auto",
+            "stream": True,
+        }
+
+        try:
+            response = await generate_chat_completion(request, round_payload, user)
+        except Exception as e:
+            log.exception(e)
+            try:
+                fallback = await generate_chat_completion(
+                    request, {**form_data, "messages": messages, "tools": None, "stream": True}, user
+                )
+                async for line in iter_lines(fallback):
+                    yield line
+                await close(fallback)
+            except Exception as e2:
+                log.exception(e2)
+                yield f"data: {json.dumps({'error': {'message': str(e2)}})}\n\n"
+                yield "data: [DONE]\n\n"
+            return
+
+        tool_calls_by_index = {}
+        content_parts = []
+
+        async for line in iter_lines(response):
+            if not line.strip() or not line.startswith("data: "):
+                continue
+            data_str = line[len("data: ") :]
+            if data_str.strip() == "[DONE]":
+                break
+
+            try:
+                chunk = json.loads(data_str)
+            except Exception:
+                continue
+
+            choices = chunk.get("choices") or []
+            if not choices:
+                # Trailer chunk (usage/timings with no choices) — nothing to relay.
+                continue
+
+            delta = choices[0].get("delta", {}) or {}
+
+            content = delta.get("content")
+            if content:
+                content_parts.append(content)
+                yield f"data: {json.dumps(chunk)}\n\n"
+
+            for tc in delta.get("tool_calls") or []:
+                idx = tc.get("index", 0)
+                entry = tool_calls_by_index.setdefault(
+                    idx, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
+                )
+                if tc.get("id"):
+                    entry["id"] = tc["id"]
+                fct = tc.get("function") or {}
+                if fct.get("name"):
+                    entry["function"]["name"] += fct["name"]
+                if fct.get("arguments"):
+                    entry["function"]["arguments"] += fct["arguments"]
+
+        await close(response)
+
+        if not tool_calls_by_index:
+            # This round was the final answer, and it already streamed live.
+            yield "data: [DONE]\n\n"
+            return
+
+        tool_calls = [tool_calls_by_index[i] for i in sorted(tool_calls_by_index)]
+        messages.append(
+            {
+                "role": "assistant",
+                "content": "".join(content_parts) or None,
+                "tool_calls": tool_calls,
+            }
+        )
+
+        for tool_call in tool_calls:
+            tool_output = await _dispatch_tool_call(request, tool_call, admin_tools, extra_params, user, messages)
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.get("id", tool_call.get("function", {}).get("name")),
+                    "content": tool_output,
+                }
+            )
+
+    # Exceeded MAX_TOOL_CALL_ROUNDS while the model kept calling tools —
+    # force a final streamed answer without offering any more.
+    try:
+        fallback = await generate_chat_completion(
+            request, {**form_data, "messages": messages, "tools": None, "stream": True}, user
+        )
+        async for line in iter_lines(fallback):
+            yield line
+        await close(fallback)
+    except Exception as e:
+        log.exception(e)
+        yield f"data: {json.dumps({'error': {'message': str(e)}})}\n\n"
+        yield "data: [DONE]\n\n"
+
+
+async def generate_chat_completion_with_tools(request: Request, form_data: dict, user: UserModel):
+    """Drive a native OpenAI-spec tool-calling loop: attach the tools array
+    to the actual completion request and let the model itself emit
+    tool_calls (self.llama already supports this, including
+    parallel_tool_calls, per-model template permitting) instead of running a
+    separate hand-rolled single-shot JSON-decision prompt beforehand.
+    Execute whatever the model calls, feed results back as role="tool"
+    messages, and repeat until it answers without calling anything else or
+    MAX_TOOL_CALL_ROUNDS is hit.
+
+    Falls straight through to a normal single completion call when there's
+    nothing to offer the model (no admin tool_ids, web search off) — zero
+    overhead for the common case. Otherwise dispatches to a real streaming
+    loop (content relayed live, round-by-round) or the simpler buffered
+    loop, matching whatever the client asked for.
+    """
+    metadata = form_data.get("metadata", {}) or {}
+
+    tool_ids = metadata.get("tool_ids", None)
+    features = metadata.get("features", None) or {}
+    web_search_enabled = bool(features.get("web_search"))
+
+    if not tool_ids and not web_search_enabled:
+        return await generate_chat_completion(request, form_data, user)
+
+    models = request.app.state.MODELS
+    event_emitter = get_event_emitter(metadata)
+    extra_params = {
+        "__event_emitter__": event_emitter,
+        "__event_call__": get_event_call(metadata),
+        "__user__": {"id": user.id, "email": user.email, "name": user.name, "role": user.role},
+        "__metadata__": metadata,
+        "__request__": request,
+    }
+
+    task_model_id = get_task_model_id(
+        form_data["model"],
+        request.app.state.config.TASK_MODEL,
+        request.app.state.config.TASK_MODEL_EXTERNAL,
+        models,
+    )
+
+    admin_tools = (
+        get_tools(
+            request,
+            tool_ids,
+            user,
+            {
+                **extra_params,
+                "__model__": models[task_model_id],
+                "__messages__": form_data["messages"],
+                "__files__": metadata.get("files", []),
+            },
+        )
+        if tool_ids
+        else {}
+    )
+
+    openai_tools = [{"type": "function", "function": tool["spec"]} for tool in admin_tools.values()]
+    if web_search_enabled:
+        openai_tools.append({"type": "function", "function": WEB_SEARCH_TOOL_SPEC})
+
+    messages = list(form_data["messages"])
+
+    if not form_data.get("stream", True):
+        return await _run_tool_calling_buffered(
+            request, form_data, messages, openai_tools, admin_tools, extra_params, user
+        )
+
+    return StreamingResponse(
+        _stream_tool_calling(request, form_data, messages, openai_tools, admin_tools, extra_params, user),
+        media_type="text/event-stream",
+    )
+
+
+async def chat_completion_files_handler(request: Request, body: dict, user: UserModel) -> tuple[dict, dict[str, list]]:
     sources = []
 
     if files := body.get("metadata", {}).get("files", None):
         try:
             queries_response = await generate_queries(
                 request,
-                {
-                    "model": body["model"],
-                    "messages": body["messages"],
-                    "type": "retrieval",
-                },
+                TaskFormData(
+                    model=body["model"],
+                    messages=body["messages"],
+                    type="retrieval",
+                ),
                 user,
             )
             queries_response = queries_response["choices"][0]["message"]["content"]
@@ -513,11 +705,11 @@ async def chat_completion_files_handler(
 
                 queries_response = queries_response[bracket_start:bracket_end]
                 queries_response = json.loads(queries_response)
-            except Exception as e:
+            except Exception:
                 queries_response = {"queries": [queries_response]}
 
             queries = queries_response.get("queries", [])
-        except Exception as e:
+        except Exception:
             queries = []
 
         if len(queries) == 0:
@@ -587,8 +779,6 @@ async def process_chat_payload(request, form_data, metadata, user, model):
 
     # Initialize events to store additional event to be sent to the client
     # Initialize contexts and citation
-    models = request.app.state.MODELS
-
     events = []
     sources = []
 
@@ -633,17 +823,13 @@ async def process_chat_payload(request, form_data, metadata, user, model):
         files.extend(knowledge_files)
         form_data["files"] = files
 
-    features = form_data.pop("features", None)
-    if features:
-        if "web_search" in features and features["web_search"]:
-            form_data = await chat_web_search_handler(
-                request, form_data, extra_params, user
-            )
+    # features (web_search, etc.) are read later by generate_chat_completion_with_tools
+    # via form_data["metadata"]["features"] — not consumed here, just stripped from the
+    # payload that eventually goes to the model.
+    form_data.pop("features", None)
 
     try:
-        form_data, flags = await chat_completion_filter_functions_handler(
-            request, form_data, model, extra_params
-        )
+        form_data, flags = await chat_completion_filter_functions_handler(request, form_data, model, extra_params)
     except Exception as e:
         raise Exception(f"Error: {e}")
 
@@ -659,14 +845,6 @@ async def process_chat_payload(request, form_data, metadata, user, model):
         "files": files,
     }
     form_data["metadata"] = metadata
-
-    try:
-        form_data, flags = await chat_completion_tools_handler(
-            request, form_data, user, models, extra_params
-        )
-        sources.extend(flags.get("sources", []))
-    except Exception as e:
-        log.exception(e)
 
     try:
         form_data, flags = await chat_completion_files_handler(request, form_data, user)
@@ -689,7 +867,10 @@ async def process_chat_payload(request, form_data, metadata, user, model):
                         doc_source_id = metadata[doc_idx].get("source", source_id)
 
                     if source_id:
-                        context_string += f"<source><source_id>{doc_source_id if doc_source_id is not None else source_id}</source_id><source_context>{doc_context}</source_context></source>\n"
+                        context_string += (
+                            f"<source><source_id>{doc_source_id if doc_source_id is not None else source_id}"
+                            f"</source_id><source_context>{doc_context}</source_context></source>\n"
+                        )
                     else:
                         # If there is no source_id, then do not include the source_id tag
                         context_string += f"<source><source_context>{doc_context}</source_context></source>\n"
@@ -699,28 +880,19 @@ async def process_chat_payload(request, form_data, metadata, user, model):
 
         if prompt is None:
             raise Exception("No user message found")
-        if (
-            request.app.state.config.RELEVANCE_THRESHOLD == 0
-            and context_string.strip() == ""
-        ):
-            log.debug(
-                f"With a 0 relevancy threshold for RAG, the context cannot be empty"
-            )
+        if request.app.state.config.RELEVANCE_THRESHOLD == 0 and context_string.strip() == "":
+            log.debug("With a 0 relevancy threshold for RAG, the context cannot be empty")
 
         # Workaround for Ollama 2.0+ system prompt issue
         # TODO: replace with add_or_update_system_message
         if model["owned_by"] == "ollama":
             form_data["messages"] = prepend_to_first_user_message_content(
-                rag_template(
-                    request.app.state.config.RAG_TEMPLATE, context_string, prompt
-                ),
+                rag_template(request.app.state.config.RAG_TEMPLATE, context_string, prompt),
                 form_data["messages"],
             )
         else:
             form_data["messages"] = add_or_update_system_message(
-                rag_template(
-                    request.app.state.config.RAG_TEMPLATE, context_string, prompt
-                ),
+                rag_template(request.app.state.config.RAG_TEMPLATE, context_string, prompt),
                 form_data["messages"],
             )
 
@@ -746,9 +918,7 @@ async def process_chat_payload(request, form_data, metadata, user, model):
     return form_data, events
 
 
-async def process_chat_response(
-    request, response, form_data, user, events, metadata, tasks
-):
+async def process_chat_response(request, response, form_data, user, events, metadata, tasks):
     async def background_tasks_handler():
         message_map = Chats.get_messages_by_chat_id(metadata["chat_id"])
         message = message_map.get(metadata["message_id"]) if message_map else None
@@ -761,11 +931,11 @@ async def process_chat_response(
                     if tasks[TASKS.TITLE_GENERATION]:
                         res = await generate_title(
                             request,
-                            {
-                                "model": message["model"],
-                                "messages": messages,
-                                "chat_id": metadata["chat_id"],
-                            },
+                            TaskFormData(
+                                model=message["model"],
+                                messages=messages,
+                                chat_id=metadata["chat_id"],
+                            ),
                             user,
                         )
 
@@ -805,30 +975,22 @@ async def process_chat_response(
                 if TASKS.TAGS_GENERATION in tasks and tasks[TASKS.TAGS_GENERATION]:
                     res = await generate_chat_tags(
                         request,
-                        {
-                            "model": message["model"],
-                            "messages": messages,
-                            "chat_id": metadata["chat_id"],
-                        },
+                        TaskFormData(
+                            model=message["model"],
+                            messages=messages,
+                            chat_id=metadata["chat_id"],
+                        ),
                         user,
                     )
 
                     if res and isinstance(res, dict):
-                        tags_string = (
-                            res.get("choices", [])[0]
-                            .get("message", {})
-                            .get("content", "")
-                        )
+                        tags_string = res.get("choices", [])[0].get("message", {}).get("content", "")
 
-                        tags_string = tags_string[
-                            tags_string.find("{") : tags_string.rfind("}") + 1
-                        ]
+                        tags_string = tags_string[tags_string.find("{") : tags_string.rfind("}") + 1]
 
                         try:
                             tags = json.loads(tags_string).get("tags", [])
-                            Chats.update_chat_tags_by_id(
-                                metadata["chat_id"], tags, user
-                            )
+                            Chats.update_chat_tags_by_id(metadata["chat_id"], tags, user)
 
                             await event_emitter(
                                 {
@@ -929,9 +1091,7 @@ async def process_chat_response(
 
         # Handle as a background task
         async def post_response_handler(response, events):
-            message = Chats.get_message_by_id_and_message_id(
-                metadata["chat_id"], metadata["message_id"]
-            )
+            message = Chats.get_message_by_id_and_message_id(metadata["chat_id"], metadata["message_id"])
             content = message.get("content", "") if message else ""
 
             try:
@@ -980,11 +1140,7 @@ async def process_chat_response(
                             )
 
                         else:
-                            value = (
-                                data.get("choices", [])[0]
-                                .get("delta", {})
-                                .get("content")
-                            )
+                            value = data.get("choices", [])[0].get("delta", {}).get("content")
 
                             if value:
                                 content = f"{content}{value}"
@@ -1010,7 +1166,7 @@ async def process_chat_response(
                             }
                         )
 
-                    except Exception as e:
+                    except Exception:
                         done = "data: [DONE]" in line
 
                         if done:

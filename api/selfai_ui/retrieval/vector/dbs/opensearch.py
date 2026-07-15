@@ -1,14 +1,15 @@
-from opensearchpy import OpenSearch
 from typing import Optional
 
-from selfai_ui.retrieval.vector.main import VectorItem, SearchResult, GetResult
+from opensearchpy import OpenSearch
+
 from selfai_ui.config import (
-    OPENSEARCH_URI,
-    OPENSEARCH_SSL,
     OPENSEARCH_CERT_VERIFY,
-    OPENSEARCH_USERNAME,
     OPENSEARCH_PASSWORD,
+    OPENSEARCH_SSL,
+    OPENSEARCH_URI,
+    OPENSEARCH_USERNAME,
 )
+from selfai_ui.retrieval.vector.main import GetResult, SearchResult, VectorItem
 
 
 class OpenSearchClient:
@@ -45,9 +46,7 @@ class OpenSearchClient:
             documents.append(hit["_source"].get("text"))
             metadatas.append(hit["_source"].get("metadata"))
 
-        return SearchResult(
-            ids=ids, distances=distances, documents=documents, metadatas=metadatas
-        )
+        return SearchResult(ids=ids, distances=distances, documents=documents, metadatas=metadatas)
 
     def _create_index(self, index_name: str, dimension: int):
         body = {
@@ -57,7 +56,7 @@ class OpenSearchClient:
                     "vector": {
                         "type": "dense_vector",
                         "dims": dimension,  # Adjust based on your vector dimensions
-                        "index": true,
+                        "index": True,
                         "similarity": "faiss",
                         "method": {
                             "name": "hnsw",
@@ -88,9 +87,7 @@ class OpenSearchClient:
         # We are simply adapting to the norms of the other DBs.
         self.client.indices.delete(index=f"{self.index_prefix}_{index_name}")
 
-    def search(
-        self, index_name: str, vectors: list[list[float]], limit: int
-    ) -> Optional[SearchResult]:
+    def search(self, index_name: str, vectors: list[list[float]], limit: int) -> Optional[SearchResult]:
         query = {
             "size": limit,
             "_source": ["text", "metadata"],
@@ -99,17 +96,13 @@ class OpenSearchClient:
                     "query": {"match_all": {}},
                     "script": {
                         "source": "cosineSimilarity(params.vector, 'vector') + 1.0",
-                        "params": {
-                            "vector": vectors[0]
-                        },  # Assuming single query vector
+                        "params": {"vector": vectors[0]},  # Assuming single query vector
                     },
                 }
             },
         }
 
-        result = self.client.search(
-            index=f"{self.index_prefix}_{index_name}", body=query
-        )
+        result = self.client.search(index=f"{self.index_prefix}_{index_name}", body=query)
 
         return self._result_to_search_result(result)
 
@@ -120,9 +113,7 @@ class OpenSearchClient:
     def get(self, index_name: str) -> Optional[GetResult]:
         query = {"query": {"match_all": {}}, "_source": ["text", "metadata"]}
 
-        result = self.client.search(
-            index=f"{self.index_prefix}_{index_name}", body=query
-        )
+        result = self.client.search(index=f"{self.index_prefix}_{index_name}", body=query)
         return self._result_to_get_result(result)
 
     def insert(self, index_name: str, items: list[VectorItem]):
@@ -166,10 +157,7 @@ class OpenSearchClient:
             self.client.bulk(actions)
 
     def delete(self, index_name: str, ids: list[str]):
-        actions = [
-            {"delete": {"_index": f"{self.index_prefix}_{index_name}", "_id": id}}
-            for id in ids
-        ]
+        actions = [{"delete": {"_index": f"{self.index_prefix}_{index_name}", "_id": id}} for id in ids]
         self.client.bulk(body=actions)
 
     def reset(self):

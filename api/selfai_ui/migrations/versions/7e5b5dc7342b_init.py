@@ -11,7 +11,6 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-import selfai_ui.internal.db
 from selfai_ui.internal.db import JSONField
 from selfai_ui.migrations.util import get_existing_tables
 

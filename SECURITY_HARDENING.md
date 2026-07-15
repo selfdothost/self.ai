@@ -98,19 +98,31 @@ This document tracks security improvements for the Self.AI project. The codebase
   - Add: Private IP range filtering (reject 127.0.0.1/8, 10.0.0.0/8, etc.)
   - Add: URL scheme validation (https only in production)
 
-- [ ] **Docker Security** — Remove unnecessary mounts & run as non-root
-  - File: `docker-compose.yml`
-  - Remove: Docker socket mounts from `selfUI` (line 117) and `traefik` (line 246) unless necessary
-  - Dockerfile: Run containers as non-root user (UID > 1000)
+- [x] **Docker Security** — Remove unnecessary mounts & run as non-root
+  - Files: `docker-compose.split.yml` / `docker-compose.combined.yml` (the
+    old single `docker-compose.yml` + `selfUI`/`traefik` services are gone
+    post-split; current services are `api`/`chat`/`proxy` and `selfai`
+    respectively)
+  - Checked 2026-07-10: neither compose file mounts the Docker socket.
+    Production itself doesn't run via docker-compose at all anymore --
+    it's Flux-managed Kubernetes manifests (`manifests/`), where this
+    specific concern doesn't carry over the same way. Re-verify Dockerfiles
+    run as non-root if that hasn't been separately confirmed.
 
-- [ ] **Remove Debug Logging** — Set production log level
-  - File: `self.UI/.env` (production copy)
-  - Change: `GLOBAL_LOG_LEVEL=DEBUG` → `GLOBAL_LOG_LEVEL=INFO`
-  - Remove: `DEBUG=1` from service definitions
+- [x] **Remove Debug Logging** — Set production log level
+  - `self.UI/.env` no longer exists (self.UI was the pre-split monolith
+    frontend; superseded by the separate self.chat repo + this repo's own
+    `api/`).
+  - `GLOBAL_LOG_LEVEL` is still a real, live env var
+    (`api/selfai_ui/env.py:69`, defaults to `INFO` if unset/invalid) --
+    checked 2026-07-10: it's not set anywhere in `manifests/api/`, so
+    production already gets the safe `INFO` default with no action needed.
 
 - [ ] **Container Isolation** — CORS on internal services
-  - File: `docker-compose.yml` (service definitions)
-  - Kokoro TTS: Change `CORS_ORIGINS=["*"]` → specific allowed origins
+  - Kokoro TTS has no Flux manifest yet (selfshipyard/selfai/self.ai#22 --
+    wired in config but not actually deployed), so this is forward
+    guidance for whenever that manifest lands, not a current gap: don't
+    ship `CORS_ORIGINS=["*"]` on it.
 
 ## Low Priority / Upstream Issues
 

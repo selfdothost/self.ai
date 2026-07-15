@@ -7,10 +7,10 @@ cross-user isolation, import/export round-trip, clone.
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # T-300: Basic CRUD + pagination + ownership
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.tier0
 def test_list_chats_empty(authenticated_user):
@@ -122,12 +122,10 @@ def test_list_pagination(authenticated_user):
 @pytest.mark.tier0
 def test_user_a_cannot_read_user_b_chat(authenticated_user, db_session):
     """User A can't read a chat owned by user B (cross-user isolation)."""
-    from tests.factories import UserFactory, ChatFactory
+    from tests.factories import ChatFactory, UserFactory
 
     user_b = UserFactory.create(db_session)
-    chat_b = ChatFactory.create(
-        db_session, user_id=user_b.id, title="User B Private"
-    )
+    chat_b = ChatFactory.create(db_session, user_id=user_b.id, title="User B Private")
     resp = authenticated_user.get(f"/api/v1/chats/{chat_b.id}")
     # Either 401/403/404 (denied or not-found-scoped) — all acceptable
     if resp.status_code == 200:
@@ -139,7 +137,7 @@ def test_user_a_cannot_read_user_b_chat(authenticated_user, db_session):
 @pytest.mark.tier0
 def test_user_a_list_excludes_user_b_chats(authenticated_user, db_session):
     """User A's list does not include user B's chats."""
-    from tests.factories import UserFactory, ChatFactory
+    from tests.factories import ChatFactory, UserFactory
 
     user_b = UserFactory.create(db_session)
     ChatFactory.create(db_session, user_id=user_b.id, title="B's Chat")
@@ -152,6 +150,7 @@ def test_user_a_list_excludes_user_b_chats(authenticated_user, db_session):
 # ---------------------------------------------------------------------------
 # T-301: Import/export/clone
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.tier0
 def test_import_chat(authenticated_user):
@@ -190,11 +189,13 @@ def test_clone_chat(authenticated_user):
     """Cloning a chat produces a new chat with a different id."""
     source = authenticated_user.post(
         "/api/v1/chats/new",
-        json={"chat": {
-            "title": "Original",
-            "messages": [],
-            "history": {"currentId": "msg-1", "messages": {}},
-        }},
+        json={
+            "chat": {
+                "title": "Original",
+                "messages": [],
+                "history": {"currentId": "msg-1", "messages": {}},
+            }
+        },
     ).json()
     resp = authenticated_user.post(f"/api/v1/chats/{source['id']}/clone", json={})
     assert resp.status_code == 200

@@ -21,7 +21,7 @@ a public user knows to expect a large local build rather than a pull.
 
 ## Stretch (post-alpha)
 
-`faster-whisper` (STT) and `kokoro-cpu` (TTS) are deferred out of the alpha. They
+`self.transcribe` (STT) and `self.speak` (TTS) are deferred out of the alpha. They
 build cleanly (CUDA `-runtime-` base with mounted models; CPU image baking a
 ~327 MB voice model, respectively) and are push-ready, but speech is not part of
 the first public cut — revisit when STT/TTS re-enter scope.

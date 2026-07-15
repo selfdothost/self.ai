@@ -1,27 +1,27 @@
-from typing import Optional, List, Dict, Any
+from typing import Any, Dict, List, Optional
+
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    Column,
+    Integer,
+    MetaData,
+    Text,
     cast,
     column,
     create_engine,
-    Column,
     inspect,
-    Integer,
-    MetaData,
     select,
     text,
-    Text,
     values,
 )
-from sqlalchemy.sql import true
-from sqlalchemy.pool import NullPool
-
-from sqlalchemy.orm import declarative_base, scoped_session, sessionmaker
 from sqlalchemy.dialects.postgresql import JSONB, array
-from pgvector.sqlalchemy import Vector
 from sqlalchemy.ext.mutable import MutableDict
+from sqlalchemy.orm import declarative_base, scoped_session, sessionmaker
+from sqlalchemy.pool import NullPool
+from sqlalchemy.sql import true
 
-from selfai_ui.retrieval.vector.main import VectorItem, SearchResult, GetResult
 from selfai_ui.config import PGVECTOR_DB_URL, PGVECTOR_INITIALIZE_MAX_VECTOR_LENGTH
+from selfai_ui.retrieval.vector.main import GetResult, SearchResult, VectorItem
 
 VECTOR_LENGTH = PGVECTOR_INITIALIZE_MAX_VECTOR_LENGTH
 Base = declarative_base()
@@ -46,12 +46,8 @@ class PgvectorClient:
 
             self.session = Session
         else:
-            engine = create_engine(
-                PGVECTOR_DB_URL, pool_pre_ping=True, poolclass=NullPool
-            )
-            SessionLocal = sessionmaker(
-                autocommit=False, autoflush=False, bind=engine, expire_on_commit=False
-            )
+            engine = create_engine(PGVECTOR_DB_URL, pool_pre_ping=True, poolclass=NullPool)
+            SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine, expire_on_commit=False)
             self.session = scoped_session(SessionLocal)
 
         try:
@@ -111,17 +107,15 @@ class PgvectorClient:
                     db_vector_length = vector_type.dim
                     if db_vector_length != VECTOR_LENGTH:
                         raise Exception(
-                            f"VECTOR_LENGTH {VECTOR_LENGTH} does not match existing vector column dimension {db_vector_length}. "
-                            "Cannot change vector size after initialization without migrating the data."
+                            f"VECTOR_LENGTH {VECTOR_LENGTH} does not match existing "
+                            f"vector column dimension {db_vector_length}. Cannot "
+                            "change vector size after initialization without "
+                            "migrating the data."
                         )
                 else:
-                    raise Exception(
-                        "The 'vector' column exists but is not of type 'Vector'."
-                    )
+                    raise Exception("The 'vector' column exists but is not of type 'Vector'.")
             else:
-                raise Exception(
-                    "The 'vector' column does not exist in the 'document_chunk' table."
-                )
+                raise Exception("The 'vector' column does not exist in the 'document_chunk' table.")
         else:
             # Table does not exist yet; no action needed
             pass
@@ -133,9 +127,7 @@ class PgvectorClient:
             # Pad the vector with zeros
             vector += [0.0] * (VECTOR_LENGTH - current_length)
         elif current_length > VECTOR_LENGTH:
-            raise Exception(
-                f"Vector length {current_length} not supported. Max length must be <= {VECTOR_LENGTH}"
-            )
+            raise Exception(f"Vector length {current_length} not supported. Max length must be <= {VECTOR_LENGTH}")
         return vector
 
     def insert(self, collection_name: str, items: List[VectorItem]) -> None:
@@ -153,9 +145,7 @@ class PgvectorClient:
                 new_items.append(new_chunk)
             self.session.bulk_save_objects(new_items)
             self.session.commit()
-            print(
-                f"Inserted {len(new_items)} items into collection '{collection_name}'."
-            )
+            print(f"Inserted {len(new_items)} items into collection '{collection_name}'.")
         except Exception as e:
             self.session.rollback()
             print(f"Error during insert: {e}")
@@ -165,18 +155,12 @@ class PgvectorClient:
         try:
             for item in items:
                 vector = self.adjust_vector_length(item["vector"])
-                existing = (
-                    self.session.query(DocumentChunk)
-                    .filter(DocumentChunk.id == item["id"])
-                    .first()
-                )
+                existing = self.session.query(DocumentChunk).filter(DocumentChunk.id == item["id"]).first()
                 if existing:
                     existing.vector = vector
                     existing.text = item["text"]
                     existing.vmetadata = item["metadata"]
-                    existing.collection_name = (
-                        collection_name  # Update collection_name if necessary
-                    )
+                    existing.collection_name = collection_name  # Update collection_name if necessary
                 else:
                     new_chunk = DocumentChunk(
                         id=item["id"],
@@ -215,9 +199,7 @@ class PgvectorClient:
             q_vector_col = column("q_vector", Vector(VECTOR_LENGTH))
             query_vectors = (
                 values(qid_col, q_vector_col)
-                .data(
-                    [(idx, vector_expr(vector)) for idx, vector in enumerate(vectors)]
-                )
+                .data([(idx, vector_expr(vector)) for idx, vector in enumerate(vectors)])
                 .alias("query_vectors")
             )
 
@@ -227,14 +209,10 @@ class PgvectorClient:
                     DocumentChunk.id,
                     DocumentChunk.text,
                     DocumentChunk.vmetadata,
-                    (
-                        DocumentChunk.vector.cosine_distance(query_vectors.c.q_vector)
-                    ).label("distance"),
+                    (DocumentChunk.vector.cosine_distance(query_vectors.c.q_vector)).label("distance"),
                 )
                 .where(DocumentChunk.collection_name == collection_name)
-                .order_by(
-                    (DocumentChunk.vector.cosine_distance(query_vectors.c.q_vector))
-                )
+                .order_by((DocumentChunk.vector.cosine_distance(query_vectors.c.q_vector)))
             )
             if limit is not None:
                 subq = subq.limit(limit)
@@ -277,20 +255,14 @@ class PgvectorClient:
                 documents[qid].append(row.text)
                 metadatas[qid].append(row.vmetadata)
 
-            return SearchResult(
-                ids=ids, distances=distances, documents=documents, metadatas=metadatas
-            )
+            return SearchResult(ids=ids, distances=distances, documents=documents, metadatas=metadatas)
         except Exception as e:
             print(f"Error during search: {e}")
             return None
 
-    def query(
-        self, collection_name: str, filter: Dict[str, Any], limit: Optional[int] = None
-    ) -> Optional[GetResult]:
+    def query(self, collection_name: str, filter: Dict[str, Any], limit: Optional[int] = None) -> Optional[GetResult]:
         try:
-            query = self.session.query(DocumentChunk).filter(
-                DocumentChunk.collection_name == collection_name
-            )
+            query = self.session.query(DocumentChunk).filter(DocumentChunk.collection_name == collection_name)
 
             for key, value in filter.items():
                 query = query.filter(DocumentChunk.vmetadata[key].astext == str(value))
@@ -316,13 +288,9 @@ class PgvectorClient:
             print(f"Error during query: {e}")
             return None
 
-    def get(
-        self, collection_name: str, limit: Optional[int] = None
-    ) -> Optional[GetResult]:
+    def get(self, collection_name: str, limit: Optional[int] = None) -> Optional[GetResult]:
         try:
-            query = self.session.query(DocumentChunk).filter(
-                DocumentChunk.collection_name == collection_name
-            )
+            query = self.session.query(DocumentChunk).filter(DocumentChunk.collection_name == collection_name)
             if limit is not None:
                 query = query.limit(limit)
 
@@ -347,16 +315,12 @@ class PgvectorClient:
         filter: Optional[Dict[str, Any]] = None,
     ) -> None:
         try:
-            query = self.session.query(DocumentChunk).filter(
-                DocumentChunk.collection_name == collection_name
-            )
+            query = self.session.query(DocumentChunk).filter(DocumentChunk.collection_name == collection_name)
             if ids:
                 query = query.filter(DocumentChunk.id.in_(ids))
             if filter:
                 for key, value in filter.items():
-                    query = query.filter(
-                        DocumentChunk.vmetadata[key].astext == str(value)
-                    )
+                    query = query.filter(DocumentChunk.vmetadata[key].astext == str(value))
             deleted = query.delete(synchronize_session=False)
             self.session.commit()
             print(f"Deleted {deleted} items from collection '{collection_name}'.")
@@ -369,9 +333,7 @@ class PgvectorClient:
         try:
             deleted = self.session.query(DocumentChunk).delete()
             self.session.commit()
-            print(
-                f"Reset complete. Deleted {deleted} items from 'document_chunk' table."
-            )
+            print(f"Reset complete. Deleted {deleted} items from 'document_chunk' table.")
         except Exception as e:
             self.session.rollback()
             print(f"Error during reset: {e}")
@@ -383,9 +345,7 @@ class PgvectorClient:
     def has_collection(self, collection_name: str) -> bool:
         try:
             exists = (
-                self.session.query(DocumentChunk)
-                .filter(DocumentChunk.collection_name == collection_name)
-                .first()
+                self.session.query(DocumentChunk).filter(DocumentChunk.collection_name == collection_name).first()
                 is not None
             )
             return exists

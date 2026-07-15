@@ -2,21 +2,13 @@ import logging
 import time
 from typing import Optional
 
-from selfai_ui.internal.db import Base, JSONField, get_db
-from selfai_ui.env import SRC_LOG_LEVELS
-
-from selfai_ui.models.users import Users, UserResponse
-
-
 from pydantic import BaseModel, ConfigDict
+from sqlalchemy import JSON, BigInteger, Boolean, Column, Text
 
-from sqlalchemy import or_, and_, func
-from sqlalchemy.dialects import postgresql, sqlite
-from sqlalchemy import BigInteger, Column, Text, JSON, Boolean
-
-
+from selfai_ui.env import SRC_LOG_LEVELS
+from selfai_ui.internal.db import Base, JSONField, get_db
+from selfai_ui.models.users import UserResponse, Users
 from selfai_ui.utils.access_control import has_access
-
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MODELS"])
@@ -157,9 +149,7 @@ class ModelForm(BaseModel):
 
 
 class ModelsTable:
-    def insert_new_model(
-        self, form_data: ModelForm, user_id: str
-    ) -> Optional[ModelModel]:
+    def insert_new_model(self, form_data: ModelForm, user_id: str) -> Optional[ModelModel]:
         model = ModelModel(
             **{
                 **form_data.model_dump(),
@@ -190,7 +180,7 @@ class ModelsTable:
     def get_models(self) -> list[ModelUserResponse]:
         with get_db() as db:
             models = []
-            for model in db.query(Model).filter(Model.base_model_id != None).all():
+            for model in db.query(Model).filter(Model.base_model_id.is_not(None)).all():
                 user = Users.get_user_by_id(model.user_id)
                 models.append(
                     ModelUserResponse.model_validate(
@@ -206,18 +196,15 @@ class ModelsTable:
         with get_db() as db:
             return [
                 ModelModel.model_validate(model)
-                for model in db.query(Model).filter(Model.base_model_id == None).all()
+                for model in db.query(Model).filter(Model.base_model_id.is_(None)).all()
             ]
 
-    def get_models_by_user_id(
-        self, user_id: str, permission: str = "write"
-    ) -> list[ModelUserResponse]:
+    def get_models_by_user_id(self, user_id: str, permission: str = "write") -> list[ModelUserResponse]:
         models = self.get_models()
         return [
             model
             for model in models
-            if model.user_id == user_id
-            or has_access(user_id, permission, model.access_control)
+            if model.user_id == user_id or has_access(user_id, permission, model.access_control)
         ]
 
     def get_model_by_id(self, id: str) -> Optional[ModelModel]:
@@ -249,11 +236,7 @@ class ModelsTable:
         try:
             with get_db() as db:
                 # update only the fields that are present in the model
-                result = (
-                    db.query(Model)
-                    .filter_by(id=id)
-                    .update(model.model_dump(exclude={"id"}))
-                )
+                db.query(Model).filter_by(id=id).update(model.model_dump(exclude={"id"}))
                 db.commit()
 
                 model = db.get(Model, id)

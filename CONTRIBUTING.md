@@ -48,7 +48,9 @@ still means you are accountable for the whole commit.
 2. Make focused commits, each `Signed-off-by` (and `Assisted-by:` where it
    applies).
 3. Open a PR and fill in the template, including the AI-disclosure field.
-4. CI runs lint/tests and the DCO check. First-time contributors may need a
+4. CI builds the API image, runs `api/tests/` (pytest), and checks every
+   commit for a DCO `Signed-off-by` trailer. There is no linter configured
+   yet, so lint is not enforced. First-time contributors may need a
    maintainer to approve the workflow run.
 5. A maintainer reviews. Address feedback with additional signed-off commits.
 

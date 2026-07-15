@@ -2,7 +2,11 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from selfai_ui.models.benchmark_config import BenchmarkConfigs, BenchmarkConfigModel, BenchmarkConfigUpdate
+from selfai_ui.models.benchmark_config import (
+    BenchmarkConfigModel,
+    BenchmarkConfigs,
+    BenchmarkConfigUpdate,
+)
 from selfai_ui.utils.auth import get_admin_user
 
 log = logging.getLogger(__name__)

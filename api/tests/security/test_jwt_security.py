@@ -7,9 +7,9 @@ secret red test.
 """
 
 import time
-import pytest
-import jwt
 
+import jwt
+import pytest
 
 ALGORITHM = "HS256"
 TEST_SECRET = "test-secret-key-not-for-production"  # matches conftest
@@ -27,6 +27,7 @@ def _auth_headers(token: str) -> dict:
 # ---------------------------------------------------------------------------
 # T-225: Basic attacks
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.tier0
 @pytest.mark.security
@@ -54,6 +55,7 @@ def test_alg_none_rejected(client):
     """A token signed with alg=none must return 401."""
     # Manually construct an alg:none token (PyJWT >=2 blocks encoding it)
     import base64
+
     header = base64.urlsafe_b64encode(b'{"alg":"none","typ":"JWT"}').rstrip(b"=").decode()
     payload = base64.urlsafe_b64encode(b'{"id":"admin","role":"admin"}').rstrip(b"=").decode()
     none_token = f"{header}.{payload}."
@@ -65,7 +67,11 @@ def test_alg_none_rejected(client):
 @pytest.mark.security
 def test_wrong_secret_rejected(client):
     """A JWT signed with a different secret must return 401."""
-    forged = _make_token({"id": "user-1"}, secret="attacker-secret")
+    # 32+ bytes: any wrong secret works for this test, so use one long enough
+    # to not also trip PyJWT's InsecureKeyLengthWarning (unlike
+    # test_default_secret_forgery_rejected below, which deliberately tests
+    # the actual well-known short default and should keep it as-is).
+    forged = _make_token({"id": "user-1"}, secret="attacker-controlled-secret-of-sufficient-length")
     resp = client.get("/api/v1/users/", headers=_auth_headers(forged))
     assert resp.status_code == 401
 
@@ -74,9 +80,7 @@ def test_wrong_secret_rejected(client):
 @pytest.mark.security
 def test_malformed_token_rejected(client):
     """A malformed token string must return 401."""
-    resp = client.get(
-        "/api/v1/users/", headers=_auth_headers("not-a-jwt-token")
-    )
+    resp = client.get("/api/v1/users/", headers=_auth_headers("not-a-jwt-token"))
     assert resp.status_code == 401
 
 
@@ -92,6 +96,7 @@ def test_missing_bearer_prefix_rejected(client):
 # ---------------------------------------------------------------------------
 # T-226: Secret and role forgery
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.tier0
 @pytest.mark.security

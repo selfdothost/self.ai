@@ -1,40 +1,43 @@
 import asyncio
 import json
 import logging
-from pathlib import Path
 import random
+from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
 import aiohttp
 from aiocache import cached
-
 from fastapi import (
+    APIRouter,
     Depends,
     HTTPException,
     Query,
     Request,
-    APIRouter,
 )
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
+from selfai_ui.constants import ERROR_MESSAGES
+from selfai_ui.env import (
+    AIOHTTP_CLIENT_TIMEOUT,
+    AIOHTTP_CLIENT_TIMEOUT_OPENAI_MODEL_LIST,
+    BYPASS_MODEL_ACCESS_CONTROL,
+    SRC_LOG_LEVELS,
+)
 from selfai_ui.models.models import ModelForm, ModelMeta, ModelParams, Models
+from selfai_ui.utils.access_control import has_access, has_permission
+from selfai_ui.utils.auth import get_admin_user, get_verified_user
 from selfai_ui.utils.payload import (
     apply_model_params_to_body_openai,
     apply_model_system_prompt_to_body,
 )
-from selfai_ui.utils.auth import get_admin_user, get_verified_user
-from selfai_ui.utils.access_control import has_access, has_permission
+from selfai_ui.utils.service_auth import TICKET_HEADER, mint_service_ticket
 
-from selfai_ui.env import (
-    SRC_LOG_LEVELS,
-    AIOHTTP_CLIENT_TIMEOUT,
-    AIOHTTP_CLIENT_TIMEOUT_OPENAI_MODEL_LIST,
-    BYPASS_MODEL_ACCESS_CONTROL,
-)
-from selfai_ui.constants import ERROR_MESSAGES
+# Audience string self.llamolotl's control port (:8093) validates tickets
+# against — must match SERVICE_AUTH_AUDIENCE on that side (self.llamolotl#12).
+LLAMOLOTL_AUDIENCE = "self.llamolotl"
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["LLAMOLOTL"])
@@ -51,22 +54,23 @@ def require_training_access(request: Request, user) -> None:
     if user.role == "admin":
         return
 
-    if has_permission(
-        user.id, "workspace.training", request.app.state.config.USER_PERMISSIONS
-    ):
+    if has_permission(user.id, "workspace.training", request.app.state.config.USER_PERMISSIONS):
         return
 
     raise HTTPException(status_code=401, detail=ERROR_MESSAGES.UNAUTHORIZED)
 
 
-async def send_get_request(url, key=None, params=None, raise_on_error=False):
+async def send_get_request(url, key=None, params=None, raise_on_error=False, ticket=None):
     timeout = aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT_OPENAI_MODEL_LIST)
     try:
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
             async with session.get(
                 url,
                 params=params,
-                headers={**({"Authorization": f"Bearer {key}"} if key else {})},
+                headers={
+                    **({"Authorization": f"Bearer {key}"} if key else {}),
+                    **({TICKET_HEADER: ticket} if ticket else {}),
+                },
             ) as response:
                 result = await response.json()
                 if raise_on_error and response.status >= 400:
@@ -75,9 +79,7 @@ async def send_get_request(url, key=None, params=None, raise_on_error=False):
                         detail = result.get("detail") or result.get("error")
                     raise HTTPException(
                         status_code=response.status,
-                        detail=detail
-                        if detail
-                        else "Self.AI UI: Server Connection Error",
+                        detail=(detail if detail else "Self.AI UI: Server Connection Error"),
                     )
                 return result
     except HTTPException:
@@ -85,9 +87,7 @@ async def send_get_request(url, key=None, params=None, raise_on_error=False):
     except Exception as e:
         log.error(f"Connection error: {e}")
         if raise_on_error:
-            raise HTTPException(
-                status_code=500, detail="Self.AI UI: Server Connection Error"
-            )
+            raise HTTPException(status_code=500, detail="Self.AI UI: Server Connection Error")
         return None
 
 
@@ -106,12 +106,11 @@ async def send_post_request(
     payload: str,
     stream: bool = True,
     key: Optional[str] = None,
+    ticket: Optional[str] = None,
 ):
     r = None
     try:
-        session = aiohttp.ClientSession(
-            trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
-        )
+        session = aiohttp.ClientSession(trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT))
 
         r = await session.post(
             url,
@@ -119,6 +118,7 @@ async def send_post_request(
             headers={
                 "Content-Type": "application/json",
                 **({"Authorization": f"Bearer {key}"} if key else {}),
+                **({TICKET_HEADER: ticket} if ticket else {}),
             },
         )
         r.raise_for_status()
@@ -129,9 +129,7 @@ async def send_post_request(
                 r.content,
                 status_code=r.status,
                 headers=response_headers,
-                background=BackgroundTask(
-                    cleanup_response, response=r, session=session
-                ),
+                background=BackgroundTask(cleanup_response, response=r, session=session),
             )
         else:
             res = await r.json()
@@ -161,7 +159,7 @@ def get_api_key(url, configs):
     return configs.get(base_url, {}).get("key", None)
 
 
-async def send_delete_request(url: str, key: Optional[str] = None):
+async def send_delete_request(url: str, key: Optional[str] = None, ticket: Optional[str] = None):
     r = None
     try:
         async with aiohttp.ClientSession(
@@ -169,7 +167,10 @@ async def send_delete_request(url: str, key: Optional[str] = None):
         ) as session:
             r = await session.delete(
                 url,
-                headers={**({"Authorization": f"Bearer {key}"} if key else {})},
+                headers={
+                    **({"Authorization": f"Bearer {key}"} if key else {}),
+                    **({TICKET_HEADER: ticket} if ticket else {}),
+                },
             )
             r.raise_for_status()
             return await r.json()
@@ -244,9 +245,7 @@ class ConnectionVerificationForm(BaseModel):
 
 
 @router.post("/verify")
-async def verify_connection(
-    form_data: ConnectionVerificationForm, user=Depends(get_admin_user)
-):
+async def verify_connection(form_data: ConnectionVerificationForm, user=Depends(get_admin_user)):
     url = form_data.url
     key = form_data.key
 
@@ -272,9 +271,7 @@ async def verify_connection(
                 return data
         except aiohttp.ClientError as e:
             log.exception(f"Client error: {str(e)}")
-            raise HTTPException(
-                status_code=500, detail="Self.AI UI: Server Connection Error"
-            )
+            raise HTTPException(status_code=500, detail="Self.AI UI: Server Connection Error")
         except Exception as e:
             log.exception(f"Unexpected error: {e}")
             error_detail = f"Unexpected error: {str(e)}"
@@ -306,9 +303,7 @@ class LlamolotlConfigForm(BaseModel):
 
 
 @router.post("/config/update")
-async def update_config(
-    request: Request, form_data: LlamolotlConfigForm, user=Depends(get_admin_user)
-):
+async def update_config(request: Request, form_data: LlamolotlConfigForm, user=Depends(get_admin_user)):
     request.app.state.config.ENABLE_LLAMOLOTL_API = form_data.ENABLE_LLAMOLOTL_API
     request.app.state.config.LLAMOLOTL_BASE_URLS = form_data.LLAMOLOTL_BASE_URLS
     request.app.state.config.LLAMOLOTL_API_CONFIGS = form_data.LLAMOLOTL_API_CONFIGS
@@ -377,15 +372,17 @@ async def get_all_models(request: Request):
                     status_val = status_obj.get("value", "unloaded") if isinstance(status_obj, dict) else "unloaded"
 
                     if model_id not in [m["id"] for m in models]:
-                        models.append({
-                            "id": model_id,
-                            "name": model_id,
-                            "object": "model",
-                            "created": model.get("created", 0),
-                            "owned_by": "llamolotl",
-                            "urls": [idx],
-                            "status": status_val,
-                        })
+                        models.append(
+                            {
+                                "id": model_id,
+                                "name": model_id,
+                                "object": "model",
+                                "created": model.get("created", 0),
+                                "owned_by": "llamolotl",
+                                "urls": [idx],
+                                "status": status_val,
+                            }
+                        )
                     else:
                         for m in models:
                             if m["id"] == model_id:
@@ -396,17 +393,13 @@ async def get_all_models(request: Request):
     else:
         result = {"data": []}
 
-    request.app.state.LLAMOLOTL_MODELS = {
-        model["id"]: model for model in result["data"]
-    }
+    request.app.state.LLAMOLOTL_MODELS = {model["id"]: model for model in result["data"]}
     return result
 
 
 @router.get("/models")
 @router.get("/models/{url_idx}")
-async def get_llamolotl_models(
-    request: Request, url_idx: Optional[int] = None, user=Depends(get_verified_user)
-):
+async def get_llamolotl_models(request: Request, url_idx: Optional[int] = None, user=Depends(get_verified_user)):
     if url_idx is None:
         models = await get_all_models(request)
     else:
@@ -459,12 +452,12 @@ async def _ensure_loras_applied(request: Request, model_info):
 
     desired_loras = []
     if model_info.meta:
-        meta = model_info.meta.model_dump() if hasattr(model_info.meta, 'model_dump') else model_info.meta
+        meta = model_info.meta.model_dump() if hasattr(model_info.meta, "model_dump") else model_info.meta
         desired_loras = meta.get("active_loras") or []
 
     # Normalize for comparison: sort by file name
-    desired_sorted = sorted(desired_loras, key=lambda l: l.get("file", ""))
-    current_sorted = sorted(_current_applied_loras or [], key=lambda l: l.get("file", ""))
+    desired_sorted = sorted(desired_loras, key=lambda lora: lora.get("file", ""))
+    current_sorted = sorted(_current_applied_loras or [], key=lambda lora: lora.get("file", ""))
 
     if desired_sorted == current_sorted:
         return  # Already in the right state
@@ -477,6 +470,7 @@ async def _ensure_loras_applied(request: Request, model_info):
             payload=json.dumps({"loras": desired_loras}),
             stream=False,
             key=connection["key"],
+            ticket=mint_service_ticket(LLAMOLOTL_AUDIENCE, "system:write"),
         )
         if result and result.get("status") == "applied":
             _current_applied_loras = desired_loras
@@ -517,9 +511,7 @@ async def generate_chat_completion(
         if not bypass_filter and user.role == "user":
             if not (
                 user.id == model_info.user_id
-                or has_access(
-                    user.id, type="read", access_control=model_info.access_control
-                )
+                or has_access(user.id, type="read", access_control=model_info.access_control)
             ):
                 raise HTTPException(
                     status_code=403,
@@ -590,9 +582,7 @@ async def generate_completion(
         if not bypass_filter and user.role == "user":
             if not (
                 user.id == model_info.user_id
-                or has_access(
-                    user.id, type="read", access_control=model_info.access_control
-                )
+                or has_access(user.id, type="read", access_control=model_info.access_control)
             ):
                 raise HTTPException(
                     status_code=403,
@@ -669,6 +659,7 @@ async def inspect_model(
         payload=json.dumps({"name": form_data.name}),
         stream=False,
         key=key,
+        ticket=mint_service_ticket(LLAMOLOTL_AUDIENCE, "models:read"),
     )
 
 
@@ -693,6 +684,7 @@ async def pull_model(
         payload=json.dumps(form_data.model_dump(exclude_none=True)),
         stream=True,
         key=key,
+        ticket=mint_service_ticket(LLAMOLOTL_AUDIENCE, "models:pull"),
     )
 
 
@@ -717,6 +709,7 @@ async def cancel_pull(
         payload=json.dumps(form_data.model_dump(exclude_none=True)),
         stream=False,
         key=key,
+        ticket=mint_service_ticket(LLAMOLOTL_AUDIENCE, "models:pull"),
     )
 
 
@@ -741,6 +734,7 @@ async def delete_model(
         payload=json.dumps(form_data.model_dump()),
         stream=False,
         key=key,
+        ticket=mint_service_ticket(LLAMOLOTL_AUDIENCE, "models:delete"),
     )
 
 
@@ -759,7 +753,11 @@ async def get_available_models(
     base_url = request.app.state.config.LLAMOLOTL_BASE_URLS[url_idx]
     key = get_api_key(base_url, request.app.state.config.LLAMOLOTL_API_CONFIGS)
 
-    result = await send_get_request(f"{control_url}/api/models/available", key)
+    result = await send_get_request(
+        f"{control_url}/api/models/available",
+        key,
+        ticket=mint_service_ticket(LLAMOLOTL_AUDIENCE, "models:read"),
+    )
     if result is None:
         raise HTTPException(status_code=500, detail="Self.AI UI: Server Connection Error")
     return result
@@ -790,18 +788,30 @@ async def register_model(
         payload=json.dumps(form_data.model_dump()),
         stream=False,
         key=key,
+        ticket=mint_service_ticket(LLAMOLOTL_AUDIENCE, "models:write"),
     )
 
     # Fetch metadata from llamolotl and persist lineage in the UI Model table
     try:
-        available = await send_get_request(f"{control_url}/api/models/available", key)
+        available = await send_get_request(
+            f"{control_url}/api/models/available",
+            key,
+            ticket=mint_service_ticket(LLAMOLOTL_AUDIENCE, "models:read"),
+        )
         lineage = {}
         if available:
-            for m in (available if isinstance(available, list) else []):
+            for m in available if isinstance(available, list) else []:
                 if Path(m.get("name", "")).name == Path(form_data.name).name:
                     lineage = {
                         k: m.get(k)
-                        for k in ("hf_repo", "quant", "source_type", "trainable", "pulled_at", "bake_info")
+                        for k in (
+                            "hf_repo",
+                            "quant",
+                            "source_type",
+                            "trainable",
+                            "pulled_at",
+                            "bake_info",
+                        )
                         if m.get(k) is not None
                     }
                     break
@@ -810,23 +820,29 @@ async def register_model(
         existing = Models.get_model_by_id(model_id)
         if existing:
             updated_meta = {**existing.meta.model_dump(), **lineage}
-            Models.update_model_by_id(model_id, ModelForm(
-                id=model_id,
-                base_model_id=existing.base_model_id,
-                name=existing.name,
-                meta=ModelMeta(**updated_meta),
-                params=existing.params,
-                access_control=existing.access_control,
-                is_active=existing.is_active,
-            ))
+            Models.update_model_by_id(
+                model_id,
+                ModelForm(
+                    id=model_id,
+                    base_model_id=existing.base_model_id,
+                    name=existing.name,
+                    meta=ModelMeta(**updated_meta),
+                    params=existing.params,
+                    access_control=existing.access_control,
+                    is_active=existing.is_active,
+                ),
+            )
         else:
-            Models.insert_new_model(ModelForm(
-                id=model_id,
-                name=model_id,
-                meta=ModelMeta(**lineage),
-                params=ModelParams(),
-                is_active=True,
-            ), user.id)
+            Models.insert_new_model(
+                ModelForm(
+                    id=model_id,
+                    name=model_id,
+                    meta=ModelMeta(**lineage),
+                    params=ModelParams(),
+                    is_active=True,
+                ),
+                user.id,
+            )
     except Exception as e:
         log.warning(f"Failed to persist model lineage for {form_data.name}: {e}")
 
@@ -862,6 +878,7 @@ async def bake_model(
         payload=json.dumps(form_data.model_dump(exclude_none=True)),
         stream=False,
         key=connection["key"],
+        ticket=mint_service_ticket(LLAMOLOTL_AUDIENCE, "pipeline:write"),
     )
 
 
@@ -894,6 +911,7 @@ async def apply_loras(
         payload=json.dumps({"loras": form_data.loras}),
         stream=False,
         key=connection["key"],
+        ticket=mint_service_ticket(LLAMOLOTL_AUDIENCE, "system:write"),
     )
 
     # Persist active LoRAs in the Model's meta
@@ -901,15 +919,18 @@ async def apply_loras(
         model = Models.get_model_by_id(form_data.model_id)
         if model:
             updated_meta = {**model.meta.model_dump(), "active_loras": form_data.loras}
-            Models.update_model_by_id(form_data.model_id, ModelForm(
-                id=form_data.model_id,
-                base_model_id=model.base_model_id,
-                name=model.name,
-                meta=ModelMeta(**updated_meta),
-                params=model.params,
-                access_control=model.access_control,
-                is_active=model.is_active,
-            ))
+            Models.update_model_by_id(
+                form_data.model_id,
+                ModelForm(
+                    id=form_data.model_id,
+                    base_model_id=model.base_model_id,
+                    name=model.name,
+                    meta=ModelMeta(**updated_meta),
+                    params=model.params,
+                    access_control=model.access_control,
+                    is_active=model.is_active,
+                ),
+            )
     except Exception as e:
         log.warning(f"Failed to persist active LoRAs for {form_data.model_id}: {e}")
 
@@ -927,6 +948,7 @@ async def get_active_loras(
     return await send_get_request(
         f"{connection['control_url']}/api/system/active-loras",
         connection["key"],
+        ticket=mint_service_ticket(LLAMOLOTL_AUDIENCE, "system:read"),
     )
 
 
@@ -941,6 +963,7 @@ async def list_available_loras(
     return await send_get_request(
         f"{connection['control_url']}/api/loras/available",
         connection["key"],
+        ticket=mint_service_ticket(LLAMOLOTL_AUDIENCE, "pipeline:read"),
     )
 
 
@@ -969,6 +992,7 @@ async def list_training_configs(
         f"{connection['control_url']}/api/configs",
         connection["key"],
         raise_on_error=True,
+        ticket=mint_service_ticket(LLAMOLOTL_AUDIENCE, "jobs:read"),
     )
     if result is None:
         raise HTTPException(status_code=500, detail="Self.AI UI: Server Connection Error")
@@ -988,6 +1012,7 @@ async def get_training_config(
         f"{connection['control_url']}/api/configs/{config_name}",
         connection["key"],
         raise_on_error=True,
+        ticket=mint_service_ticket(LLAMOLOTL_AUDIENCE, "jobs:read"),
     )
     if result is None:
         raise HTTPException(status_code=500, detail="Self.AI UI: Server Connection Error")
@@ -1006,6 +1031,7 @@ async def list_training_jobs(
         f"{connection['control_url']}/api/jobs",
         connection["key"],
         raise_on_error=True,
+        ticket=mint_service_ticket(LLAMOLOTL_AUDIENCE, "jobs:read"),
     )
     if result is None:
         raise HTTPException(status_code=500, detail="Self.AI UI: Server Connection Error")
@@ -1021,9 +1047,7 @@ async def create_training_job(
 ):
     require_training_access(request, user)
     connection = get_llamolotl_connection(request, url_idx)
-    payload = {
-        "config_path": normalize_training_config_identifier(form_data.config_path)
-    }
+    payload = {"config_path": normalize_training_config_identifier(form_data.config_path)}
     if form_data.base_model:
         payload["base_model"] = form_data.base_model
     if form_data.output_dir:
@@ -1034,6 +1058,7 @@ async def create_training_job(
         payload=json.dumps(payload),
         stream=False,
         key=connection["key"],
+        ticket=mint_service_ticket(LLAMOLOTL_AUDIENCE, "jobs:create"),
     )
 
 
@@ -1050,6 +1075,7 @@ async def get_training_job(
         f"{connection['control_url']}/api/jobs/{job_id}",
         connection["key"],
         raise_on_error=True,
+        ticket=mint_service_ticket(LLAMOLOTL_AUDIENCE, "jobs:read"),
     )
     if result is None:
         raise HTTPException(status_code=500, detail="Self.AI UI: Server Connection Error")
@@ -1071,6 +1097,7 @@ async def get_training_job_logs(
         connection["key"],
         params={"tail": tail},
         raise_on_error=True,
+        ticket=mint_service_ticket(LLAMOLOTL_AUDIENCE, "jobs:read"),
     )
     if result is None:
         raise HTTPException(status_code=500, detail="Self.AI UI: Server Connection Error")
@@ -1090,6 +1117,7 @@ async def approve_training_job(
         payload="{}",
         stream=False,
         key=connection["key"],
+        ticket=mint_service_ticket(LLAMOLOTL_AUDIENCE, "jobs:write"),
     )
 
 
@@ -1105,6 +1133,7 @@ async def cancel_training_job(
     return await send_delete_request(
         f"{connection['control_url']}/api/jobs/{job_id}",
         key=connection["key"],
+        ticket=mint_service_ticket(LLAMOLOTL_AUDIENCE, "jobs:write"),
     )
 
 
@@ -1120,6 +1149,12 @@ async def list_training_outputs(
         f"{connection['control_url']}/api/models",
         connection["key"],
         raise_on_error=True,
+        # This calls control_url's /api/models (list_models), scoped models:read
+        # on the validating side — not a jobs:read-scoped /api/outputs endpoint
+        # (that endpoint doesn't appear to exist on self.llamolotl; pre-existing
+        # behavior, not introduced by this pass — ticket scope matches the
+        # actual endpoint being hit).
+        ticket=mint_service_ticket(LLAMOLOTL_AUDIENCE, "models:read"),
     )
     if result is None:
         raise HTTPException(status_code=500, detail="Self.AI UI: Server Connection Error")
@@ -1135,9 +1170,7 @@ async def list_training_outputs(
 
 @router.get("/props")
 @router.get("/props/{url_idx}")
-async def get_props(
-    request: Request, url_idx: Optional[int] = None, user=Depends(get_verified_user)
-):
+async def get_props(request: Request, url_idx: Optional[int] = None, user=Depends(get_verified_user)):
     if url_idx is not None:
         url = request.app.state.config.LLAMOLOTL_BASE_URLS[url_idx]
     elif request.app.state.config.LLAMOLOTL_BASE_URLS:
@@ -1154,9 +1187,7 @@ async def get_props(
 
 @router.get("/slots")
 @router.get("/slots/{url_idx}")
-async def get_slots(
-    request: Request, url_idx: Optional[int] = None, user=Depends(get_verified_user)
-):
+async def get_slots(request: Request, url_idx: Optional[int] = None, user=Depends(get_verified_user)):
     if url_idx is not None:
         url = request.app.state.config.LLAMOLOTL_BASE_URLS[url_idx]
     elif request.app.state.config.LLAMOLOTL_BASE_URLS:
@@ -1173,9 +1204,7 @@ async def get_slots(
 
 @router.get("/lora-adapters")
 @router.get("/lora-adapters/{url_idx}")
-async def get_lora_adapters(
-    request: Request, url_idx: Optional[int] = None, user=Depends(get_verified_user)
-):
+async def get_lora_adapters(request: Request, url_idx: Optional[int] = None, user=Depends(get_verified_user)):
     if url_idx is not None:
         url = request.app.state.config.LLAMOLOTL_BASE_URLS[url_idx]
     elif request.app.state.config.LLAMOLOTL_BASE_URLS:
@@ -1203,9 +1232,7 @@ class ModelActionForm(BaseModel):
 
 @router.get("/model-status")
 @router.get("/model-status/{url_idx}")
-async def get_model_status(
-    request: Request, url_idx: Optional[int] = None, user=Depends(get_verified_user)
-):
+async def get_model_status(request: Request, url_idx: Optional[int] = None, user=Depends(get_verified_user)):
     """Get fresh model status (loaded/loading/unloaded) bypassing cache."""
     if url_idx is not None:
         url = request.app.state.config.LLAMOLOTL_BASE_URLS[url_idx]
@@ -1355,6 +1382,7 @@ async def run_heretic(
         payload=json.dumps(payload),
         stream=False,
         key=connection["key"],
+        ticket=mint_service_ticket(LLAMOLOTL_AUDIENCE, "jobs:create"),
     )
 
 
@@ -1371,6 +1399,7 @@ async def get_heretic_status(
         f"{connection['control_url']}/api/heretic/status/{task_id}",
         connection["key"],
         raise_on_error=True,
+        ticket=mint_service_ticket(LLAMOLOTL_AUDIENCE, "jobs:read"),
     )
     if result is None:
         raise HTTPException(status_code=500, detail="Self.AI UI: Server Connection Error")
@@ -1389,6 +1418,7 @@ async def get_heretic_config(
         f"{connection['control_url']}/api/heretic/config",
         connection["key"],
         raise_on_error=True,
+        ticket=mint_service_ticket(LLAMOLOTL_AUDIENCE, "jobs:read"),
     )
     if result is None:
         raise HTTPException(status_code=500, detail="Self.AI UI: Server Connection Error")

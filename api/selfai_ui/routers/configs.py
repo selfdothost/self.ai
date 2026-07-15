@@ -1,12 +1,10 @@
+from typing import Optional
+
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel
 
-from typing import Optional
-
+from selfai_ui.config import BannerModel, get_config, save_config
 from selfai_ui.utils.auth import get_admin_user, get_verified_user
-from selfai_ui.config import get_config, save_config
-from selfai_ui.config import BannerModel
-
 
 router = APIRouter()
 
@@ -53,9 +51,7 @@ async def get_models_config(request: Request, user=Depends(get_admin_user)):
 
 
 @router.post("/models", response_model=ModelsConfigForm)
-async def set_models_config(
-    request: Request, form_data: ModelsConfigForm, user=Depends(get_admin_user)
-):
+async def set_models_config(request: Request, form_data: ModelsConfigForm, user=Depends(get_admin_user)):
     request.app.state.config.DEFAULT_MODELS = form_data.DEFAULT_MODELS
     request.app.state.config.MODEL_ORDER_LIST = form_data.MODEL_ORDER_LIST
     return {

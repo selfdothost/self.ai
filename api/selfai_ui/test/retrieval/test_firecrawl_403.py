@@ -7,15 +7,16 @@ calls are made and no Firecrawl instance is required.
 Run from the backend container:
     pytest selfai_ui/test/retrieval/test_firecrawl_403.py -v
 """
+
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from selfai_ui.retrieval.web.firecrawl import SafeFirecrawlLoader
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_page(url: str, status_code: int = 200, markdown: str = "content"):
     """Build a raw Firecrawl page dict as returned by the /v2/crawl poll."""
@@ -43,6 +44,7 @@ def _poll_response(status: str, pages: list):
 
 class _FakeStart:
     """Minimal stand-in for the object returned by async_app.start_crawl()."""
+
     id = "fake-crawl-id"
 
 
@@ -86,13 +88,15 @@ def _patched_crawl(poll_responses: list, max_consecutive_403s=None, poll_interva
             http.get = AsyncMock(side_effect=poll_responses)
             MockHttpx.return_value = http
 
-            docs = _run(loader.crawl_with_progress(
-                job_state,
-                limit=10,
-                poll_interval=poll_interval,
-                timeout=60,
-                max_consecutive_403s=max_consecutive_403s,
-            ))
+            docs = _run(
+                loader.crawl_with_progress(
+                    job_state,
+                    limit=10,
+                    poll_interval=poll_interval,
+                    timeout=60,
+                    max_consecutive_403s=max_consecutive_403s,
+                )
+            )
 
     return job_state, docs, app_instance
 
@@ -101,13 +105,14 @@ def _patched_crawl(poll_responses: list, max_consecutive_403s=None, poll_interva
 # Tests
 # ---------------------------------------------------------------------------
 
+
 def test_consecutive_403s_at_threshold_cancels():
     """Exactly n=3 consecutive 403 pages should cancel the crawl."""
     pages = [_make_page(f"https://example.com/{i}", status_code=403, markdown="") for i in range(3)]
     job_state, docs, app = _patched_crawl(
         poll_responses=[
-            _poll_response("scraping", []),          # first poll — no data yet
-            _poll_response("scraping", pages),       # second poll — all 403s arrive
+            _poll_response("scraping", []),  # first poll — no data yet
+            _poll_response("scraping", pages),  # second poll — all 403s arrive
         ],
         max_consecutive_403s=3,
     )

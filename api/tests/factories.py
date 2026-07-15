@@ -41,6 +41,7 @@ def _uid() -> str:
 # Base factory
 # ---------------------------------------------------------------------------
 
+
 class _Factory:
     model: Any = None
 
@@ -68,6 +69,7 @@ class _Factory:
 # ---------------------------------------------------------------------------
 # User + Auth
 # ---------------------------------------------------------------------------
+
 
 class UserFactory(_Factory):
     model = User
@@ -111,6 +113,7 @@ class AuthFactory(_Factory):
 # Chat
 # ---------------------------------------------------------------------------
 
+
 class ChatFactory(_Factory):
     model = Chat
 
@@ -134,6 +137,7 @@ class ChatFactory(_Factory):
 # ---------------------------------------------------------------------------
 # File / Knowledge
 # ---------------------------------------------------------------------------
+
 
 class FileFactory(_Factory):
     model = File
@@ -175,6 +179,7 @@ class KnowledgeFactory(_Factory):
 # ---------------------------------------------------------------------------
 # Tool / Function
 # ---------------------------------------------------------------------------
+
 
 class ToolFactory(_Factory):
     model = Tool
@@ -218,6 +223,7 @@ class FunctionFactory(_Factory):
 # ---------------------------------------------------------------------------
 # Training / Eval / Curator Jobs
 # ---------------------------------------------------------------------------
+
 
 class TrainingCourseFactory(_Factory):
     model = TrainingCourse
@@ -306,6 +312,7 @@ class CuratorJobFactory(_Factory):
 # ---------------------------------------------------------------------------
 # Job Windows
 # ---------------------------------------------------------------------------
+
 
 class JobWindowFactory(_Factory):
     model = JobWindow

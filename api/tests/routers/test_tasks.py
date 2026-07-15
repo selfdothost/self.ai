@@ -9,7 +9,6 @@ doesn't exist, since MODELS state is needed for them to generate payloads.
 
 import pytest
 
-
 TASK_ENDPOINTS = [
     "/api/v1/tasks/title/completions",
     "/api/v1/tasks/tags/completions",
@@ -36,8 +35,7 @@ def test_task_endpoint_rejects_unknown_model(authenticated_user, path):
     # Router raises HTTPException(status_code=404, detail="Model not found")
     # at tasks.py line 156 when model_id not in models. Pin 404.
     assert resp.status_code == 404, (
-        f"{path} should 404 for unknown model, got {resp.status_code}: "
-        f"{resp.text[:200]}"
+        f"{path} should 404 for unknown model, got {resp.status_code}: " f"{resp.text[:200]}"
     )
 
 

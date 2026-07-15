@@ -1,0 +1,19 @@
+# requirements-dev.txt — test-only dependencies for api/tests/.
+#
+# Layer on top of requirements-api.txt (the API-tier runtime set), NOT
+# requirements.txt (the old monolith set, which still carries the torch-pulling
+# deps requirements-api.txt deliberately dropped). CI/local test installs are:
+#
+#   pip install -r requirements-api.txt -r requirements-dev.txt
+#
+# This mirrors the "## Tests" block that already exists in requirements.txt
+# (kept there too for the combined/monolith image path) — keep the two in sync.
+
+pytest~=8.3.2
+pytest-docker~=3.1.1
+pytest-timeout~=2.3
+pytest-mock~=3.14
+factory-boy~=3.3
+respx~=0.21
+aioresponses~=0.7
+responses~=0.25

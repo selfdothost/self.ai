@@ -1,19 +1,17 @@
 import logging
 import threading
 import uuid
-import jwt
-
 from datetime import UTC, datetime, timedelta
-from typing import Optional, Union, List, Dict
+from typing import Dict, Optional, Union
 
-from selfai_ui.models.users import Users
+import jwt
+from fastapi import Depends, HTTPException, Request, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from passlib.context import CryptContext
 
 from selfai_ui.constants import ERROR_MESSAGES
 from selfai_ui.env import WEBUI_SECRET_KEY
-
-from fastapi import Depends, HTTPException, Request, Response, status
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from passlib.context import CryptContext
+from selfai_ui.models.users import Users
 
 logging.getLogger("passlib").setLevel(logging.ERROR)
 
@@ -76,14 +74,13 @@ def get_eval_token_info(token: str) -> Optional[dict]:
     with _eval_tokens_lock:
         return _eval_tokens.get(token)
 
+
 bearer_security = HTTPBearer(auto_error=False)
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
 def verify_password(plain_password, hashed_password):
-    return (
-        pwd_context.verify(plain_password, hashed_password) if hashed_password else None
-    )
+    return pwd_context.verify(plain_password, hashed_password) if hashed_password else None
 
 
 def get_password_hash(password):
@@ -163,29 +160,22 @@ def get_current_user(
     # auth by api key
     if token.startswith("sk-"):
         if not request.state.enable_api_key:
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.API_KEY_NOT_ALLOWED
-            )
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.API_KEY_NOT_ALLOWED)
 
         if request.app.state.config.ENABLE_API_KEY_ENDPOINT_RESTRICTIONS:
             allowed_paths = [
-                path.strip()
-                for path in str(
-                    request.app.state.config.API_KEY_ALLOWED_ENDPOINTS
-                ).split(",")
+                path.strip() for path in str(request.app.state.config.API_KEY_ALLOWED_ENDPOINTS).split(",")
             ]
 
             if request.url.path not in allowed_paths:
-                raise HTTPException(
-                    status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.API_KEY_NOT_ALLOWED
-                )
+                raise HTTPException(status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.API_KEY_NOT_ALLOWED)
 
         return get_current_user_by_api_key(token)
 
     # auth by jwt token
     try:
         data = decode_token(token)
-    except Exception as e:
+    except Exception:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token",

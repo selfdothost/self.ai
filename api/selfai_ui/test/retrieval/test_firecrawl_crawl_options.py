@@ -7,15 +7,16 @@ All external I/O is mocked — no real network calls or Firecrawl instance neede
 Run from the backend container:
     pytest selfai_ui/test/retrieval/test_firecrawl_crawl_options.py -v
 """
+
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch, call
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from selfai_ui.retrieval.web.firecrawl import SafeFirecrawlLoader
-
 
 # ---------------------------------------------------------------------------
 # Helpers (same pattern as test_firecrawl_403.py)
 # ---------------------------------------------------------------------------
+
 
 class _FakeStart:
     id = "fake-crawl-id"
@@ -74,10 +75,12 @@ def _fresh_job_state():
 # Tests: start_crawl kwargs
 # ---------------------------------------------------------------------------
 
+
 def test_include_paths_passed_to_start_crawl():
     loader = _make_loader()
     docs, app = _run_crawl(
-        loader, _fresh_job_state(),
+        loader,
+        _fresh_job_state(),
         [_completed_response()],
         limit=5,
         include_paths=["/docs/.*", "/blog/.*"],
@@ -91,7 +94,8 @@ def test_include_paths_passed_to_start_crawl():
 def test_exclude_paths_passed_to_start_crawl():
     loader = _make_loader()
     docs, app = _run_crawl(
-        loader, _fresh_job_state(),
+        loader,
+        _fresh_job_state(),
         [_completed_response()],
         limit=5,
         exclude_paths=["/admin/.*", "/login"],
@@ -105,7 +109,8 @@ def test_exclude_paths_passed_to_start_crawl():
 def test_regex_on_full_url_passed_to_start_crawl():
     loader = _make_loader()
     docs, app = _run_crawl(
-        loader, _fresh_job_state(),
+        loader,
+        _fresh_job_state(),
         [_completed_response()],
         limit=5,
         regex_on_full_url=True,
@@ -120,7 +125,8 @@ def test_regex_on_full_url_false_is_passed():
     """Explicitly False should still be forwarded (not omitted)."""
     loader = _make_loader()
     docs, app = _run_crawl(
-        loader, _fresh_job_state(),
+        loader,
+        _fresh_job_state(),
         [_completed_response()],
         limit=5,
         regex_on_full_url=False,
@@ -135,7 +141,8 @@ def test_regex_on_full_url_none_omitted():
     """None (default) should not send the key at all."""
     loader = _make_loader()
     docs, app = _run_crawl(
-        loader, _fresh_job_state(),
+        loader,
+        _fresh_job_state(),
         [_completed_response()],
         limit=5,
         regex_on_full_url=None,
@@ -150,11 +157,13 @@ def test_regex_on_full_url_none_omitted():
 # Tests: crawlEntireDomain overrides limit
 # ---------------------------------------------------------------------------
 
+
 def test_crawl_entire_domain_omits_limit():
     """When crawl_entire_domain=True, limit must NOT be sent to Firecrawl."""
     loader = _make_loader()
     docs, app = _run_crawl(
-        loader, _fresh_job_state(),
+        loader,
+        _fresh_job_state(),
         [_completed_response()],
         limit=10,
         crawl_entire_domain=True,
@@ -170,7 +179,8 @@ def test_crawl_entire_domain_false_includes_limit():
     """When crawl_entire_domain=False, limit is still sent normally."""
     loader = _make_loader()
     docs, app = _run_crawl(
-        loader, _fresh_job_state(),
+        loader,
+        _fresh_job_state(),
         [_completed_response()],
         limit=7,
         crawl_entire_domain=False,
@@ -186,7 +196,8 @@ def test_default_no_crawl_entire_domain_includes_limit():
     """Default (crawl_entire_domain=None) keeps the limit."""
     loader = _make_loader()
     docs, app = _run_crawl(
-        loader, _fresh_job_state(),
+        loader,
+        _fresh_job_state(),
         [_completed_response()],
         limit=3,
         poll_interval=0,
@@ -201,7 +212,8 @@ def test_crawl_entire_domain_with_include_exclude_paths():
     """crawl_entire_domain + path filters should all reach start_crawl."""
     loader = _make_loader()
     docs, app = _run_crawl(
-        loader, _fresh_job_state(),
+        loader,
+        _fresh_job_state(),
         [_completed_response()],
         limit=10,
         crawl_entire_domain=True,
@@ -223,10 +235,12 @@ def test_crawl_entire_domain_with_include_exclude_paths():
 # Tests: empty/None paths are omitted
 # ---------------------------------------------------------------------------
 
+
 def test_empty_include_paths_not_sent():
     loader = _make_loader()
     docs, app = _run_crawl(
-        loader, _fresh_job_state(),
+        loader,
+        _fresh_job_state(),
         [_completed_response()],
         limit=5,
         include_paths=[],
@@ -240,7 +254,8 @@ def test_empty_include_paths_not_sent():
 def test_none_exclude_paths_not_sent():
     loader = _make_loader()
     docs, app = _run_crawl(
-        loader, _fresh_job_state(),
+        loader,
+        _fresh_job_state(),
         [_completed_response()],
         limit=5,
         exclude_paths=None,

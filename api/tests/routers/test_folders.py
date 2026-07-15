@@ -29,9 +29,7 @@ def test_create_duplicate_folder_rejected(authenticated_user):
 
 @pytest.mark.tier0
 def test_get_folder_by_id(authenticated_user):
-    created = authenticated_user.post(
-        "/api/v1/folders/", json={"name": "Specific"}
-    ).json()
+    created = authenticated_user.post("/api/v1/folders/", json={"name": "Specific"}).json()
     resp = authenticated_user.get(f"/api/v1/folders/{created['id']}")
     assert resp.status_code == 200
     assert resp.json()["name"] == "Specific"
@@ -45,12 +43,8 @@ def test_get_folder_not_found(authenticated_user):
 
 @pytest.mark.tier0
 def test_update_folder_name(authenticated_user):
-    created = authenticated_user.post(
-        "/api/v1/folders/", json={"name": "Old"}
-    ).json()
-    resp = authenticated_user.post(
-        f"/api/v1/folders/{created['id']}/update", json={"name": "New"}
-    )
+    created = authenticated_user.post("/api/v1/folders/", json={"name": "Old"}).json()
+    resp = authenticated_user.post(f"/api/v1/folders/{created['id']}/update", json={"name": "New"})
     assert resp.status_code == 200
     refetch = authenticated_user.get(f"/api/v1/folders/{created['id']}").json()
     assert refetch["name"] == "New"
@@ -58,9 +52,7 @@ def test_update_folder_name(authenticated_user):
 
 @pytest.mark.tier0
 def test_delete_folder(authenticated_user):
-    created = authenticated_user.post(
-        "/api/v1/folders/", json={"name": "ToDelete"}
-    ).json()
+    created = authenticated_user.post("/api/v1/folders/", json={"name": "ToDelete"}).json()
     resp = authenticated_user.delete(f"/api/v1/folders/{created['id']}")
     assert resp.status_code == 200
     # After delete, get returns 404
@@ -71,15 +63,9 @@ def test_delete_folder(authenticated_user):
 @pytest.mark.tier0
 def test_reparent_folder(authenticated_user):
     """Move a child folder under a different parent."""
-    parent1 = authenticated_user.post(
-        "/api/v1/folders/", json={"name": "Parent1"}
-    ).json()
-    parent2 = authenticated_user.post(
-        "/api/v1/folders/", json={"name": "Parent2"}
-    ).json()
-    child = authenticated_user.post(
-        "/api/v1/folders/", json={"name": "Child"}
-    ).json()
+    parent1 = authenticated_user.post("/api/v1/folders/", json={"name": "Parent1"}).json()
+    parent2 = authenticated_user.post("/api/v1/folders/", json={"name": "Parent2"}).json()
+    child = authenticated_user.post("/api/v1/folders/", json={"name": "Child"}).json()
     resp = authenticated_user.post(
         f"/api/v1/folders/{child['id']}/update/parent",
         json={"parent_id": parent1["id"]},
@@ -96,9 +82,11 @@ def test_reparent_folder(authenticated_user):
 @pytest.mark.tier0
 def test_folder_cross_user_isolation(authenticated_user, db_session):
     """User A cannot access user B's folder."""
-    from tests.factories import UserFactory
+    import time
+    import uuid
+
     from selfai_ui.models.folders import Folder
-    import uuid, time
+    from tests.factories import UserFactory
 
     user_b = UserFactory.create(db_session)
     folder_b = Folder(

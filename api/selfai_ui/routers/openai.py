@@ -3,42 +3,34 @@ import hashlib
 import json
 import logging
 from pathlib import Path
-from typing import Literal, Optional, overload
+from typing import Optional
 
 import aiohttp
-from aiocache import cached
 import requests
-
-
-from fastapi import Depends, FastAPI, HTTPException, Request, APIRouter
-from fastapi.middleware.cors import CORSMiddleware
+from aiocache import cached
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
-from selfai_ui.models.models import Models
 from selfai_ui.config import (
     CACHE_DIR,
 )
+from selfai_ui.constants import ERROR_MESSAGES
 from selfai_ui.env import (
     AIOHTTP_CLIENT_TIMEOUT,
     AIOHTTP_CLIENT_TIMEOUT_OPENAI_MODEL_LIST,
-    ENABLE_FORWARD_USER_INFO_HEADERS,
     BYPASS_MODEL_ACCESS_CONTROL,
+    ENABLE_FORWARD_USER_INFO_HEADERS,
+    SRC_LOG_LEVELS,
 )
-
-from selfai_ui.constants import ERROR_MESSAGES
-from selfai_ui.env import ENV, SRC_LOG_LEVELS
-
-
+from selfai_ui.models.models import Models
+from selfai_ui.utils.access_control import has_access
+from selfai_ui.utils.auth import get_admin_user, get_verified_user
 from selfai_ui.utils.payload import (
     apply_model_params_to_body_openai,
     apply_model_system_prompt_to_body,
 )
-
-from selfai_ui.utils.auth import get_admin_user, get_verified_user
-from selfai_ui.utils.access_control import has_access
-
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["OPENAI"])
@@ -55,9 +47,7 @@ async def send_get_request(url, key=None):
     timeout = aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT_OPENAI_MODEL_LIST)
     try:
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
-            async with session.get(
-                url, headers={**({"Authorization": f"Bearer {key}"} if key else {})}
-            ) as response:
+            async with session.get(url, headers={**({"Authorization": f"Bearer {key}"} if key else {})}) as response:
                 return await response.json()
     except Exception as e:
         # Handle connection error here
@@ -118,29 +108,20 @@ class OpenAIConfigForm(BaseModel):
 
 
 @router.post("/config/update")
-async def update_config(
-    request: Request, form_data: OpenAIConfigForm, user=Depends(get_admin_user)
-):
+async def update_config(request: Request, form_data: OpenAIConfigForm, user=Depends(get_admin_user)):
     request.app.state.config.ENABLE_OPENAI_API = form_data.ENABLE_OPENAI_API
     request.app.state.config.OPENAI_API_BASE_URLS = form_data.OPENAI_API_BASE_URLS
     request.app.state.config.OPENAI_API_KEYS = form_data.OPENAI_API_KEYS
 
     # Check if API KEYS length is same than API URLS length
-    if len(request.app.state.config.OPENAI_API_KEYS) != len(
-        request.app.state.config.OPENAI_API_BASE_URLS
-    ):
-        if len(request.app.state.config.OPENAI_API_KEYS) > len(
-            request.app.state.config.OPENAI_API_BASE_URLS
-        ):
-            request.app.state.config.OPENAI_API_KEYS = (
-                request.app.state.config.OPENAI_API_KEYS[
-                    : len(request.app.state.config.OPENAI_API_BASE_URLS)
-                ]
-            )
+    if len(request.app.state.config.OPENAI_API_KEYS) != len(request.app.state.config.OPENAI_API_BASE_URLS):
+        if len(request.app.state.config.OPENAI_API_KEYS) > len(request.app.state.config.OPENAI_API_BASE_URLS):
+            request.app.state.config.OPENAI_API_KEYS = request.app.state.config.OPENAI_API_KEYS[
+                : len(request.app.state.config.OPENAI_API_BASE_URLS)
+            ]
         else:
             request.app.state.config.OPENAI_API_KEYS += [""] * (
-                len(request.app.state.config.OPENAI_API_BASE_URLS)
-                - len(request.app.state.config.OPENAI_API_KEYS)
+                len(request.app.state.config.OPENAI_API_BASE_URLS) - len(request.app.state.config.OPENAI_API_KEYS)
             )
 
     request.app.state.config.OPENAI_API_CONFIGS = form_data.OPENAI_API_CONFIGS
@@ -163,9 +144,7 @@ async def update_config(
 async def speech(request: Request, user=Depends(get_verified_user)):
     idx = None
     try:
-        idx = request.app.state.config.OPENAI_API_BASE_URLS.index(
-            "https://api.openai.com/v1"
-        )
+        idx = request.app.state.config.OPENAI_API_BASE_URLS.index("https://api.openai.com/v1")
 
         body = await request.body()
         name = hashlib.sha256(body).hexdigest()
@@ -265,11 +244,7 @@ async def get_all_models_responses(request: Request) -> list:
     request_tasks = []
     for idx, url in enumerate(request.app.state.config.OPENAI_API_BASE_URLS):
         if url not in request.app.state.config.OPENAI_API_CONFIGS:
-            request_tasks.append(
-                send_get_request(
-                    f"{url}/models", request.app.state.config.OPENAI_API_KEYS[idx]
-                )
-            )
+            request_tasks.append(send_get_request(f"{url}/models", request.app.state.config.OPENAI_API_KEYS[idx]))
         else:
             api_config = request.app.state.config.OPENAI_API_CONFIGS.get(url, {})
 
@@ -299,9 +274,7 @@ async def get_all_models_responses(request: Request) -> list:
                         ],
                     }
 
-                    request_tasks.append(
-                        asyncio.ensure_future(asyncio.sleep(0, model_list))
-                    )
+                    request_tasks.append(asyncio.ensure_future(asyncio.sleep(0, model_list)))
             else:
                 request_tasks.append(asyncio.ensure_future(asyncio.sleep(0, None)))
 
@@ -315,9 +288,7 @@ async def get_all_models_responses(request: Request) -> list:
             prefix_id = api_config.get("prefix_id", None)
 
             if prefix_id:
-                for model in (
-                    response if isinstance(response, list) else response.get("data", [])
-                ):
+                for model in response if isinstance(response, list) else response.get("data", []):
                     model["id"] = f"{prefix_id}.{model['id']}"
 
     log.debug(f"get_all_models:responses() {responses}")
@@ -369,8 +340,7 @@ async def get_all_models(request: Request) -> dict[str, list]:
                             "urlIdx": idx,
                         }
                         for model in models
-                        if "api.openai.com"
-                        not in request.app.state.config.OPENAI_API_BASE_URLS[idx]
+                        if "api.openai.com" not in request.app.state.config.OPENAI_API_BASE_URLS[idx]
                         or not any(
                             name in model["id"]
                             for name in [
@@ -396,9 +366,7 @@ async def get_all_models(request: Request) -> dict[str, list]:
 
 @router.get("/models")
 @router.get("/models/{url_idx}")
-async def get_models(
-    request: Request, url_idx: Optional[int] = None, user=Depends(get_verified_user)
-):
+async def get_models(request: Request, url_idx: Optional[int] = None, user=Depends(get_verified_user)):
     models = {
         "data": [],
     }
@@ -411,9 +379,7 @@ async def get_models(
 
         r = None
         async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(
-                total=AIOHTTP_CLIENT_TIMEOUT_OPENAI_MODEL_LIST
-            )
+            timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT_OPENAI_MODEL_LIST)
         ) as session:
             try:
                 async with session.get(
@@ -444,9 +410,7 @@ async def get_models(
                                 error_detail = f"External Error: {res['error']}"
                         except Exception:
                             pass
-                        raise HTTPException(
-                            status_code=r.status, detail=error_detail
-                        )
+                        raise HTTPException(status_code=r.status, detail=error_detail)
 
                     response_data = await r.json()
 
@@ -476,9 +440,7 @@ async def get_models(
             except aiohttp.ClientError as e:
                 # ClientError covers all aiohttp requests issues
                 log.exception(f"Client error: {str(e)}")
-                raise HTTPException(
-                    status_code=500, detail="Self.AI UI: Server Connection Error"
-                )
+                raise HTTPException(status_code=500, detail="Self.AI UI: Server Connection Error")
             except Exception as e:
                 log.exception(f"Unexpected error: {e}")
                 error_detail = f"Unexpected error: {str(e)}"
@@ -496,9 +458,7 @@ class ConnectionVerificationForm(BaseModel):
 
 
 @router.post("/verify")
-async def verify_connection(
-    form_data: ConnectionVerificationForm, user=Depends(get_admin_user)
-):
+async def verify_connection(form_data: ConnectionVerificationForm, user=Depends(get_admin_user)):
     url = form_data.url
     key = form_data.key
 
@@ -527,9 +487,7 @@ async def verify_connection(
         except aiohttp.ClientError as e:
             # ClientError covers all aiohttp requests issues
             log.exception(f"Client error: {str(e)}")
-            raise HTTPException(
-                status_code=500, detail="Self.AI UI: Server Connection Error"
-            )
+            raise HTTPException(status_code=500, detail="Self.AI UI: Server Connection Error")
         except Exception as e:
             log.exception(f"Unexpected error: {e}")
             error_detail = f"Unexpected error: {str(e)}"
@@ -568,9 +526,7 @@ async def generate_chat_completion(
         if not bypass_filter and user.role == "user":
             if not (
                 user.id == model_info.user_id
-                or has_access(
-                    user.id, type="read", access_control=model_info.access_control
-                )
+                or has_access(user.id, type="read", access_control=model_info.access_control)
             ):
                 raise HTTPException(
                     status_code=403,
@@ -593,9 +549,7 @@ async def generate_chat_completion(
         )
 
     # Get the API config for the model
-    api_config = request.app.state.config.OPENAI_API_CONFIGS.get(
-        request.app.state.config.OPENAI_API_BASE_URLS[idx], {}
-    )
+    api_config = request.app.state.config.OPENAI_API_CONFIGS.get(request.app.state.config.OPENAI_API_BASE_URLS[idx], {})
 
     prefix_id = api_config.get("prefix_id", None)
     if prefix_id:
@@ -635,9 +589,7 @@ async def generate_chat_completion(
     response = None
 
     try:
-        session = aiohttp.ClientSession(
-            trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
-        )
+        session = aiohttp.ClientSession(trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT))
 
         r = await session.request(
             method="POST",
@@ -674,9 +626,7 @@ async def generate_chat_completion(
                 r.content,
                 status_code=r.status,
                 headers=dict(r.headers),
-                background=BackgroundTask(
-                    cleanup_response, response=r, session=session
-                ),
+                background=BackgroundTask(cleanup_response, response=r, session=session),
             )
         else:
             try:
@@ -739,9 +689,7 @@ async def generate_completion(
         if not bypass_filter and user.role == "user":
             if not (
                 user.id == model_info.user_id
-                or has_access(
-                    user.id, type="read", access_control=model_info.access_control
-                )
+                or has_access(user.id, type="read", access_control=model_info.access_control)
             ):
                 raise HTTPException(
                     status_code=403,
@@ -763,9 +711,7 @@ async def generate_completion(
             detail="Model not found",
         )
 
-    api_config = request.app.state.config.OPENAI_API_CONFIGS.get(
-        request.app.state.config.OPENAI_API_BASE_URLS[idx], {}
-    )
+    api_config = request.app.state.config.OPENAI_API_CONFIGS.get(request.app.state.config.OPENAI_API_BASE_URLS[idx], {})
 
     prefix_id = api_config.get("prefix_id", None)
     if prefix_id:
@@ -791,9 +737,7 @@ async def generate_completion(
     response = None
 
     try:
-        session = aiohttp.ClientSession(
-            trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
-        )
+        session = aiohttp.ClientSession(trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT))
 
         r = await session.request(
             method="POST",
@@ -829,9 +773,7 @@ async def generate_completion(
                 r.content,
                 status_code=r.status,
                 headers=dict(r.headers),
-                background=BackgroundTask(
-                    cleanup_response, response=r, session=session
-                ),
+                background=BackgroundTask(cleanup_response, response=r, session=session),
             )
         else:
             try:
@@ -909,9 +851,7 @@ async def proxy(path: str, request: Request, user=Depends(get_verified_user)):
                 r.content,
                 status_code=r.status,
                 headers=dict(r.headers),
-                background=BackgroundTask(
-                    cleanup_response, response=r, session=session
-                ),
+                background=BackgroundTask(cleanup_response, response=r, session=session),
             )
         else:
             response_data = await r.json()

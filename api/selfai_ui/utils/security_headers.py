@@ -1,9 +1,9 @@
-import re
 import os
+import re
+from typing import Dict
 
 from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
-from typing import Dict
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -86,7 +86,11 @@ def set_xframe(value: str):
 
 # Set Permissions-Policy response header
 def set_permissions_policy(value: str):
-    pattern = r"^(?:(accelerometer|autoplay|camera|clipboard-read|clipboard-write|fullscreen|geolocation|gyroscope|magnetometer|microphone|midi|payment|picture-in-picture|sync-xhr|usb|xr-spatial-tracking)=\((self)?\),?)*$"
+    pattern = (
+        r"^(?:(accelerometer|autoplay|camera|clipboard-read|clipboard-write|fullscreen|geolocation"
+        r"|gyroscope|magnetometer|microphone|midi|payment|picture-in-picture|sync-xhr|usb"
+        r"|xr-spatial-tracking)=\((self)?\),?)*$"
+    )
     match = re.match(pattern, value, re.IGNORECASE)
     if not match:
         value = "none"
@@ -95,7 +99,10 @@ def set_permissions_policy(value: str):
 
 # Set Referrer-Policy response header
 def set_referrer(value: str):
-    pattern = r"^(no-referrer|no-referrer-when-downgrade|origin|origin-when-cross-origin|same-origin|strict-origin|strict-origin-when-cross-origin|unsafe-url)$"
+    pattern = (
+        r"^(no-referrer|no-referrer-when-downgrade|origin|origin-when-cross-origin|same-origin"
+        r"|strict-origin|strict-origin-when-cross-origin|unsafe-url)$"
+    )
     match = re.match(pattern, value, re.IGNORECASE)
     if not match:
         value = "no-referrer"
@@ -104,7 +111,11 @@ def set_referrer(value: str):
 
 # Set Cache-Control response header
 def set_cache_control(value: str):
-    pattern = r"^(public|private|no-cache|no-store|must-revalidate|proxy-revalidate|max-age=\d+|s-maxage=\d+|no-transform|immutable)(,\s*(public|private|no-cache|no-store|must-revalidate|proxy-revalidate|max-age=\d+|s-maxage=\d+|no-transform|immutable))*$"
+    _cache_directive = (
+        r"public|private|no-cache|no-store|must-revalidate|proxy-revalidate"
+        r"|max-age=\d+|s-maxage=\d+|no-transform|immutable"
+    )
+    pattern = rf"^({_cache_directive})(,\s*({_cache_directive}))*$"
     match = re.match(pattern, value, re.IGNORECASE)
     if not match:
         value = "no-store, max-age=0"

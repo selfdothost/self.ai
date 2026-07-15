@@ -21,9 +21,7 @@ def test_list_pipelines_admin_access(authenticated_admin):
     pipeline-capable OpenAI backend is configured, but endpoint must
     return 200 regardless (unreachable upstreams are filtered to empty)."""
     resp = authenticated_admin.get("/api/v1/pipelines/list")
-    assert resp.status_code == 200, (
-        f"Pipelines list returned {resp.status_code}: {resp.text[:200]}"
-    )
+    assert resp.status_code == 200, f"Pipelines list returned {resp.status_code}: {resp.text[:200]}"
     body = resp.json()
     assert "data" in body
     assert isinstance(body["data"], list)
@@ -38,6 +36,7 @@ def test_get_pipelines_admin_only(authenticated_user):
 @pytest.mark.tier0
 def test_upload_pipeline_admin_only(authenticated_user):
     import io
+
     resp = authenticated_user.post(
         "/api/v1/pipelines/upload",
         files={"file": ("bogus.py", io.BytesIO(b"pass"), "text/x-python")},

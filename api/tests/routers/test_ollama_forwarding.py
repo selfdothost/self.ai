@@ -21,9 +21,7 @@ def mocked_ollama_responses(test_app):
     Any call that isn't explicitly mocked will raise
     ConnectionError — the zero-real-network contract from proxies R9.
     """
-    urls = getattr(
-        test_app.state.config, "OLLAMA_BASE_URLS", ["http://self-ollama:11434"]
-    )
+    urls = getattr(test_app.state.config, "OLLAMA_BASE_URLS", ["http://self-ollama:11434"])
     base = urls[0].rstrip("/")
     with responses.RequestsMock() as rsps:
         rsps.base_url = base
@@ -34,16 +32,11 @@ def mocked_ollama_responses(test_app):
 # T-R01 / R1 AC1: list models
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.tier1
-def test_ollama_tags_forwards_and_returns_upstream_body(
-    authenticated_admin, mocked_ollama_responses
-):
+def test_ollama_tags_forwards_and_returns_upstream_body(authenticated_admin, mocked_ollama_responses):
     """GET /ollama/api/tags/0 forwards to upstream and returns its body."""
-    expected_body = {
-        "models": [
-            {"name": "llama3:8b", "size": 1234, "digest": "sha256:abc"}
-        ]
-    }
+    expected_body = {"models": [{"name": "llama3:8b", "size": 1234, "digest": "sha256:abc"}]}
     mocked_ollama_responses.get(
         f"{mocked_ollama_responses.base_url}/api/tags",
         json=expected_body,
@@ -61,10 +54,9 @@ def test_ollama_tags_forwards_and_returns_upstream_body(
 # T-R01 / R1 AC5+6: 4xx / 5xx passthrough
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.tier1
-def test_ollama_tags_passthrough_4xx(
-    authenticated_admin, mocked_ollama_responses
-):
+def test_ollama_tags_passthrough_4xx(authenticated_admin, mocked_ollama_responses):
     """Upstream 404 is preserved (router raises with upstream status)."""
     mocked_ollama_responses.get(
         f"{mocked_ollama_responses.base_url}/api/tags",
@@ -77,9 +69,7 @@ def test_ollama_tags_passthrough_4xx(
 
 
 @pytest.mark.tier1
-def test_ollama_tags_passthrough_5xx(
-    authenticated_admin, mocked_ollama_responses
-):
+def test_ollama_tags_passthrough_5xx(authenticated_admin, mocked_ollama_responses):
     """Upstream 500 is preserved (router raises with upstream status)."""
     mocked_ollama_responses.get(
         f"{mocked_ollama_responses.base_url}/api/tags",
@@ -94,6 +84,7 @@ def test_ollama_tags_passthrough_5xx(
 # ---------------------------------------------------------------------------
 # T-R01 / R1 AC1: api/version
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.tier1
 def test_ollama_version_forwards(authenticated_admin, mocked_ollama_responses):
@@ -113,10 +104,9 @@ def test_ollama_version_forwards(authenticated_admin, mocked_ollama_responses):
 # T-R01 / R1 AC7: zero real network calls
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.tier1
-def test_ollama_tags_no_unmocked_call(
-    authenticated_admin, mocked_ollama_responses
-):
+def test_ollama_tags_no_unmocked_call(authenticated_admin, mocked_ollama_responses):
     """A test that registers no mocks fails when an upstream call is made.
 
     This proves our mocking discipline: if a proxy test forgets to mock

@@ -1,16 +1,16 @@
 import logging
 import time
-from typing import Any, Optional
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from selfai_ui.utils.auth import get_admin_user
 from selfai_ui.env import SRC_LOG_LEVELS
 from selfai_ui.internal.db import get_db
+from selfai_ui.models.curator_jobs import CuratorJob, CuratorJobModel, CuratorJobs
 from selfai_ui.models.eval_jobs import EvalJob, EvalJobModel, EvalJobs
 from selfai_ui.models.training import TrainingJob, TrainingJobModel, TrainingJobs
-from selfai_ui.models.curator_jobs import CuratorJob, CuratorJobModel, CuratorJobs
+from selfai_ui.utils.auth import get_admin_user
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS.get("MAIN", logging.INFO))
@@ -28,7 +28,7 @@ class QueueItem(BaseModel):
     status: str
     created_at: int
     # type-specific label fields
-    label: str           # human-readable description
+    label: str  # human-readable description
     model_id: Optional[str] = None
 
 
@@ -110,24 +110,22 @@ def _update_priority(job_type: str, job_id: str, priority: str):
     """Set priority on a job row directly via db."""
     with get_db() as db:
         if job_type == "training":
-            db.query(TrainingJob).filter_by(id=job_id).update(
-                {"priority": priority, "updated_at": int(time.time())}
-            )
+            db.query(TrainingJob).filter_by(id=job_id).update({"priority": priority, "updated_at": int(time.time())})
         elif job_type in ("language-eval", "code-eval"):
-            db.query(EvalJob).filter_by(id=job_id).update(
-                {"priority": priority, "updated_at": int(time.time())}
-            )
+            db.query(EvalJob).filter_by(id=job_id).update({"priority": priority, "updated_at": int(time.time())})
         elif job_type == "curator":
-            db.query(CuratorJob).filter_by(id=job_id).update(
-                {"priority": priority, "updated_at": int(time.time())}
-            )
+            db.query(CuratorJob).filter_by(id=job_id).update({"priority": priority, "updated_at": int(time.time())})
         db.commit()
 
 
 def _update_status_and_priority(job_type: str, job_id: str, priority: str, status: str):
     """Set both priority and status on a job row."""
     with get_db() as db:
-        fields = {"priority": priority, "status": status, "updated_at": int(time.time())}
+        fields = {
+            "priority": priority,
+            "status": status,
+            "updated_at": int(time.time()),
+        }
         if job_type == "training":
             db.query(TrainingJob).filter_by(id=job_id).update(fields)
         elif job_type in ("language-eval", "code-eval"):
@@ -146,9 +144,7 @@ async def run_now(job_type: str, job_id: str, user=Depends(get_admin_user)):
 
     terminal = {"completed", "failed", "cancelled"}
     if job.status in terminal:
-        raise HTTPException(
-            status_code=400, detail="Cannot run-now a job that has already completed"
-        )
+        raise HTTPException(status_code=400, detail="Cannot run-now a job that has already completed")
 
     _update_status_and_priority(job_type, job_id, priority="run_now", status="queued")
     return {"message": "Job set to run_now"}
@@ -163,9 +159,7 @@ async def promote(job_type: str, job_id: str, user=Depends(get_admin_user)):
 
     terminal = {"completed", "failed", "cancelled"}
     if job.status in terminal:
-        raise HTTPException(
-            status_code=400, detail="Cannot promote a job that has already completed"
-        )
+        raise HTTPException(status_code=400, detail="Cannot promote a job that has already completed")
     if job.priority == "run_now":
         raise HTTPException(status_code=400, detail="Job is already run_now")
 

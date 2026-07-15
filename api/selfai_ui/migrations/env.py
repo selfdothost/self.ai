@@ -1,9 +1,10 @@
 from logging.config import fileConfig
 
 from alembic import context
-from selfai_ui.models.auths import Auth
-from selfai_ui.env import DATABASE_URL
 from sqlalchemy import engine_from_config, pool
+
+from selfai_ui.env import DATABASE_URL
+from selfai_ui.models.auths import Auth
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

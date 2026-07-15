@@ -1,12 +1,11 @@
 import time
 from typing import Optional
 
-from selfai_ui.internal.db import Base, get_db
-from selfai_ui.models.users import Users, UserResponse
-
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import BigInteger, Column, String, Text, JSON
+from sqlalchemy import JSON, BigInteger, Column, String, Text
 
+from selfai_ui.internal.db import Base, get_db
+from selfai_ui.models.users import UserResponse, Users
 from selfai_ui.utils.access_control import has_access
 
 ####################
@@ -69,9 +68,7 @@ class PromptForm(BaseModel):
 
 
 class PromptsTable:
-    def insert_new_prompt(
-        self, user_id: str, form_data: PromptForm
-    ) -> Optional[PromptModel]:
+    def insert_new_prompt(self, user_id: str, form_data: PromptForm) -> Optional[PromptModel]:
         prompt = PromptModel(
             **{
                 "user_id": user_id,
@@ -118,21 +115,16 @@ class PromptsTable:
 
             return prompts
 
-    def get_prompts_by_user_id(
-        self, user_id: str, permission: str = "write"
-    ) -> list[PromptUserResponse]:
+    def get_prompts_by_user_id(self, user_id: str, permission: str = "write") -> list[PromptUserResponse]:
         prompts = self.get_prompts()
 
         return [
             prompt
             for prompt in prompts
-            if prompt.user_id == user_id
-            or has_access(user_id, permission, prompt.access_control)
+            if prompt.user_id == user_id or has_access(user_id, permission, prompt.access_control)
         ]
 
-    def update_prompt_by_command(
-        self, command: str, form_data: PromptForm
-    ) -> Optional[PromptModel]:
+    def update_prompt_by_command(self, command: str, form_data: PromptForm) -> Optional[PromptModel]:
         try:
             with get_db() as db:
                 prompt = db.query(Prompt).filter_by(command=command).first()

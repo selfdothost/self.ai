@@ -1,29 +1,22 @@
 import logging
+import operator
 import os
-import uuid
-from typing import Optional, Union
+from typing import Any, Optional, Sequence, Union
 
-import asyncio
 import requests
-
 from huggingface_hub import snapshot_download
 from langchain.retrievers import ContextualCompressionRetriever, EnsembleRetriever
 from langchain_community.retrievers import BM25Retriever
-from langchain_core.documents import Document
+from langchain_core.callbacks import CallbackManagerForRetrieverRun, Callbacks
+from langchain_core.documents import BaseDocumentCompressor, Document
+from langchain_core.retrievers import BaseRetriever
+from pydantic import ConfigDict
 
+from selfai_ui.env import OFFLINE_MODE, SRC_LOG_LEVELS
 from selfai_ui.retrieval.vector.connector import VECTOR_DB_CLIENT
-from selfai_ui.utils.misc import get_last_user_message
-
-from selfai_ui.env import SRC_LOG_LEVELS, OFFLINE_MODE
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["RAG"])
-
-
-from typing import Any
-
-from langchain_core.callbacks import CallbackManagerForRetrieverRun
-from langchain_core.retrievers import BaseRetriever
 
 
 class VectorSearchRetriever(BaseRetriever):
@@ -102,9 +95,7 @@ def query_doc_with_hybrid_search(
             top_k=k,
         )
 
-        ensemble_retriever = EnsembleRetriever(
-            retrievers=[bm25_retriever, vector_search_retriever], weights=[0.5, 0.5]
-        )
+        ensemble_retriever = EnsembleRetriever(retrievers=[bm25_retriever, vector_search_retriever], weights=[0.5, 0.5])
         compressor = RerankCompressor(
             embedding_function=embedding_function,
             top_n=k,
@@ -123,18 +114,13 @@ def query_doc_with_hybrid_search(
             "metadatas": [[d.metadata for d in result]],
         }
 
-        log.info(
-            "query_doc_with_hybrid_search:result "
-            + f'{result["metadatas"]} {result["distances"]}'
-        )
+        log.info("query_doc_with_hybrid_search:result " + f'{result["metadatas"]} {result["distances"]}')
         return result
     except Exception as e:
         raise e
 
 
-def merge_and_sort_query_results(
-    query_results: list[dict], k: int, reverse: bool = False
-) -> list[dict]:
+def merge_and_sort_query_results(query_results: list[dict], k: int, reverse: bool = False) -> list[dict]:
     # Initialize lists to store combined data
     combined_distances = []
     combined_documents = []
@@ -225,15 +211,11 @@ def query_collection_with_hybrid_search(
                 )
                 results.append(result)
         except Exception as e:
-            log.exception(
-                "Error when querying the collection with " f"hybrid_search: {e}"
-            )
+            log.exception("Error when querying the collection with " f"hybrid_search: {e}")
             error = True
 
     if error:
-        raise Exception(
-            "Hybrid search failed for all collections. Using Non hybrid search as fallback."
-        )
+        raise Exception("Hybrid search failed for all collections. Using Non hybrid search as fallback.")
 
     return merge_and_sort_query_results(results, k=k, reverse=True)
 
@@ -253,6 +235,7 @@ def get_embedding_function(
         # AttributeError on None: configure an OpenAI-compatible embeddings
         # endpoint, or run the full image to embed locally.
         if embedding_function is None:
+
             def _no_local_embeddings(query):
                 raise RuntimeError(
                     "No embedding backend is configured. The API-only image "
@@ -266,13 +249,15 @@ def get_embedding_function(
             return _no_local_embeddings
         return lambda query: embedding_function.encode(query).tolist()
     elif embedding_engine in ["ollama", "openai"]:
-        func = lambda query: generate_embeddings(
-            engine=embedding_engine,
-            model=embedding_model,
-            text=query,
-            url=url,
-            key=key,
-        )
+
+        def func(query):
+            return generate_embeddings(
+                engine=embedding_engine,
+                model=embedding_model,
+                text=query,
+                url=url,
+                key=key,
+            )
 
         def generate_multiple(query, func):
             if isinstance(query, list):
@@ -343,11 +328,8 @@ def get_sources_from_files(
                                 reranking_function=reranking_function,
                                 r=r,
                             )
-                        except Exception as e:
-                            log.debug(
-                                "Error when using hybrid search, using"
-                                " non hybrid search as fallback."
-                            )
+                        except Exception:
+                            log.debug("Error when using hybrid search, using" " non hybrid search as fallback.")
 
                     if (not hybrid_search) or (context is None):
                         context = query_collection(
@@ -404,11 +386,7 @@ def get_model_path(model: str, update_model: bool = False):
     log.debug(f"snapshot_kwargs: {snapshot_kwargs}")
 
     # Inspiration from upstream sentence_transformers
-    if (
-        os.path.exists(model)
-        or ("\\" in model or model.count("/") > 1)
-        and local_files_only
-    ):
+    if os.path.exists(model) or ("\\" in model or model.count("/") > 1) and local_files_only:
         # If fully qualified path exists, return input, else set repo_id
         return model
     elif "/" not in model:
@@ -430,9 +408,7 @@ def get_model_path(model: str, update_model: bool = False):
 def generate_openai_batch_embeddings(
     model: str, texts: list[str], url: str = "https://api.openai.com/v1", key: str = ""
 ) -> Optional[list[list[float]]]:
-    def validate_embeddings_shape(
-        embeddings: list, endpoint: str
-    ) -> list[list[float]]:
+    def validate_embeddings_shape(embeddings: list, endpoint: str) -> list[list[float]]:
         if not isinstance(embeddings, list) or len(embeddings) == 0:
             raise RuntimeError(f"No embeddings returned from {endpoint}")
 
@@ -470,9 +446,7 @@ def generate_openai_batch_embeddings(
                 )
         except Exception:
             pass
-        raise RuntimeError(
-            f"Embedding request failed at {url}/embeddings: {error_detail}"
-        ) from e
+        raise RuntimeError(f"Embedding request failed at {url}/embeddings: {error_detail}") from e
 
     data = r.json()
 
@@ -487,18 +461,14 @@ def generate_openai_batch_embeddings(
             embeddings = [elem["embedding"] for elem in data]
             return validate_embeddings_shape(embeddings, f"{url}/embeddings")
         except Exception as e:
-            raise RuntimeError(
-                "Invalid non-OAI embeddings response format returned by embedding server"
-            ) from e
+            raise RuntimeError("Invalid non-OAI embeddings response format returned by embedding server") from e
 
     # Some providers return an embeddings key directly.
     if isinstance(data, dict) and "embeddings" in data:
         embeddings = data["embeddings"]
         return validate_embeddings_shape(embeddings, f"{url}/embeddings")
 
-    raise RuntimeError(
-        f"Unexpected embeddings response format from {url}/embeddings: {type(data).__name__}"
-    )
+    raise RuntimeError(f"Unexpected embeddings response format from {url}/embeddings: {type(data).__name__}")
 
 
 def generate_ollama_batch_embeddings(
@@ -526,17 +496,13 @@ def generate_ollama_batch_embeddings(
                 )
         except Exception:
             pass
-        raise RuntimeError(
-            f"Embedding request failed at {url}/api/embed: {error_detail}"
-        ) from e
+        raise RuntimeError(f"Embedding request failed at {url}/api/embed: {error_detail}") from e
 
     data = r.json()
     if isinstance(data, dict) and "embeddings" in data:
         return data["embeddings"]
 
-    raise RuntimeError(
-        f"Unexpected embeddings response format from {url}/api/embed: {type(data).__name__}"
-    )
+    raise RuntimeError(f"Unexpected embeddings response format from {url}/api/embed: {type(data).__name__}")
 
 
 def generate_embeddings(engine: str, model: str, text: Union[str, list[str]], **kwargs):
@@ -545,13 +511,9 @@ def generate_embeddings(engine: str, model: str, text: Union[str, list[str]], **
 
     if engine == "ollama":
         if isinstance(text, list):
-            embeddings = generate_ollama_batch_embeddings(
-                **{"model": model, "texts": text, "url": url, "key": key}
-            )
+            embeddings = generate_ollama_batch_embeddings(**{"model": model, "texts": text, "url": url, "key": key})
         else:
-            embeddings = generate_ollama_batch_embeddings(
-                **{"model": model, "texts": [text], "url": url, "key": key}
-            )
+            embeddings = generate_ollama_batch_embeddings(**{"model": model, "texts": [text], "url": url, "key": key})
         if embeddings is None or len(embeddings) == 0:
             raise RuntimeError("No embeddings returned by ollama embedding endpoint")
         return embeddings[0] if isinstance(text, str) else embeddings
@@ -565,22 +527,13 @@ def generate_embeddings(engine: str, model: str, text: Union[str, list[str]], **
         return embeddings[0] if isinstance(text, str) else embeddings
 
 
-import operator
-from typing import Optional, Sequence
-
-from langchain_core.callbacks import Callbacks
-from langchain_core.documents import BaseDocumentCompressor, Document
-
-
 class RerankCompressor(BaseDocumentCompressor):
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
     embedding_function: Any
     top_n: int
     reranking_function: Any
     r_score: float
-
-    class Config:
-        extra = "forbid"
-        arbitrary_types_allowed = True
 
     def compress_documents(
         self,
@@ -591,23 +544,17 @@ class RerankCompressor(BaseDocumentCompressor):
         reranking = self.reranking_function is not None
 
         if reranking:
-            scores = self.reranking_function.predict(
-                [(query, doc.page_content) for doc in documents]
-            )
+            scores = self.reranking_function.predict([(query, doc.page_content) for doc in documents])
         else:
             from sentence_transformers import util
 
             query_embedding = self.embedding_function(query)
-            document_embedding = self.embedding_function(
-                [doc.page_content for doc in documents]
-            )
+            document_embedding = self.embedding_function([doc.page_content for doc in documents])
             scores = util.cos_sim(query_embedding, document_embedding)[0]
 
         docs_with_scores = list(zip(documents, scores.tolist()))
         if self.r_score:
-            docs_with_scores = [
-                (d, s) for d, s in docs_with_scores if s >= self.r_score
-            ]
+            docs_with_scores = [(d, s) for d, s in docs_with_scores if s >= self.r_score]
 
         result = sorted(docs_with_scores, key=operator.itemgetter(1), reverse=True)
         final_results = []

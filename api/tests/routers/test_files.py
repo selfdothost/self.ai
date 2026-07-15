@@ -6,6 +6,7 @@ size/MIME/traversal concerns. Here we test metadata CRUD + content R/W.
 """
 
 import io
+
 import pytest
 
 
@@ -35,9 +36,7 @@ def test_upload_list_delete_round_trip(authenticated_user, test_app, monkeypatch
             "Upload succeeded through to retrieval backend processing "
             "which is not mocked. Upstream retrieval backend failure."
         )
-    assert resp.status_code == 200, (
-        f"Upload failed with {resp.status_code}: {resp.text[:200]}"
-    )
+    assert resp.status_code == 200, f"Upload failed with {resp.status_code}: {resp.text[:200]}"
 
     file_id = resp.json()["id"]
 
@@ -60,16 +59,12 @@ def test_get_file_not_found(authenticated_user):
 
 
 @pytest.mark.tier0
-def test_files_cross_user_isolation(
-    authenticated_user, db_session
-):
+def test_files_cross_user_isolation(authenticated_user, db_session):
     """User A does not see user B's files in list."""
-    from tests.factories import UserFactory, FileFactory
+    from tests.factories import FileFactory, UserFactory
 
     user_b = UserFactory.create(db_session)
-    file_b = FileFactory.create(
-        db_session, user_id=user_b.id, filename="B.txt"
-    )
+    file_b = FileFactory.create(db_session, user_id=user_b.id, filename="B.txt")
 
     listing = authenticated_user.get("/api/v1/files/").json()
     assert not any(f.get("filename") == "B.txt" for f in listing)

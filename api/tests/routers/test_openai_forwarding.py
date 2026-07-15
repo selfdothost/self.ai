@@ -21,9 +21,7 @@ def mocked_openai(test_app):
     Any unmocked call fails the request. At least one registered
     mock must have been called or the test fails at teardown.
     """
-    urls = getattr(
-        test_app.state.config, "OPENAI_API_BASE_URLS", ["https://api.openai.com/v1"]
-    )
+    urls = getattr(test_app.state.config, "OPENAI_API_BASE_URLS", ["https://api.openai.com/v1"])
     with aioresponses() as m:
         m.base_url = urls[0].rstrip("/")
         yield m

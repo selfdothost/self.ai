@@ -5,8 +5,8 @@ from typing import Optional
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import BigInteger, Column, Integer, Text
 
-from selfai_ui.internal.db import Base, get_db
 from selfai_ui.env import SRC_LOG_LEVELS
+from selfai_ui.internal.db import Base, get_db
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MODELS"])
@@ -54,11 +54,7 @@ class BenchmarkConfigUpdate(BaseModel):
 class BenchmarkConfigTable:
     def get_all(self) -> list[BenchmarkConfigModel]:
         with get_db() as db:
-            rows = (
-                db.query(BenchmarkConfig)
-                .order_by(BenchmarkConfig.eval_type, BenchmarkConfig.benchmark)
-                .all()
-            )
+            rows = db.query(BenchmarkConfig).order_by(BenchmarkConfig.eval_type, BenchmarkConfig.benchmark).all()
             return [BenchmarkConfigModel.model_validate(r) for r in rows]
 
     def get_by_id(self, id: str) -> Optional[BenchmarkConfigModel]:
@@ -72,11 +68,7 @@ class BenchmarkConfigTable:
     def get_by_benchmark(self, benchmark: str, eval_type: str) -> Optional[BenchmarkConfigModel]:
         try:
             with get_db() as db:
-                row = (
-                    db.query(BenchmarkConfig)
-                    .filter_by(benchmark=benchmark, eval_type=eval_type)
-                    .first()
-                )
+                row = db.query(BenchmarkConfig).filter_by(benchmark=benchmark, eval_type=eval_type).first()
                 return BenchmarkConfigModel.model_validate(row) if row else None
         except Exception:
             return None

@@ -6,8 +6,8 @@ Create Date: 2024-10-16 02:02:35.241684
 
 """
 
-from alembic import op
 import sqlalchemy as sa
+from alembic import op
 
 revision = "c69f45358db4"
 down_revision = "3ab32c4b8f59"
@@ -25,9 +25,7 @@ def upgrade():
         sa.Column("items", sa.JSON(), nullable=True),
         sa.Column("meta", sa.JSON(), nullable=True),
         sa.Column("is_expanded", sa.Boolean(), default=False, nullable=False),
-        sa.Column(
-            "created_at", sa.DateTime(), server_default=sa.func.now(), nullable=False
-        ),
+        sa.Column("created_at", sa.DateTime(), server_default=sa.func.now(), nullable=False),
         sa.Column(
             "updated_at",
             sa.DateTime(),

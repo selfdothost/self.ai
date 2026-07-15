@@ -1,59 +1,49 @@
-import time
-import logging
-import sys
-
-from aiocache import cached
-from typing import Any, Optional
-import random
-import json
 import inspect
+import json
+import logging
+import random
+import sys
+from typing import Any
 
 from fastapi import Request
-from starlette.responses import Response, StreamingResponse
+from starlette.responses import StreamingResponse
 
-
-from selfai_ui.models.users import UserModel
-
-from selfai_ui.socket.main import (
-    get_event_call,
-    get_event_emitter,
-)
+from selfai_ui.env import BYPASS_MODEL_ACCESS_CONTROL, GLOBAL_LOG_LEVEL, SRC_LOG_LEVELS
 from selfai_ui.functions import generate_function_chat_completion
-
-from selfai_ui.routers.openai import (
-    generate_chat_completion as generate_openai_chat_completion,
-    generate_completion as generate_openai_completion,
-)
-
-from selfai_ui.routers.ollama import (
-    generate_chat_completion as generate_ollama_chat_completion,
-    generate_openai_completion as generate_ollama_completion,
-)
-
+from selfai_ui.models.functions import Functions
 from selfai_ui.routers.llamolotl import (
     generate_chat_completion as generate_llamolotl_chat_completion,
+)
+from selfai_ui.routers.llamolotl import (
     generate_completion as generate_llamolotl_completion,
 )
-
+from selfai_ui.routers.ollama import (
+    generate_chat_completion as generate_ollama_chat_completion,
+)
+from selfai_ui.routers.ollama import (
+    generate_openai_completion as generate_ollama_completion,
+)
+from selfai_ui.routers.openai import (
+    generate_chat_completion as generate_openai_chat_completion,
+)
+from selfai_ui.routers.openai import (
+    generate_completion as generate_openai_completion,
+)
 from selfai_ui.routers.pipelines import (
     process_pipeline_inlet_filter,
     process_pipeline_outlet_filter,
 )
-
-from selfai_ui.models.functions import Functions
-from selfai_ui.models.models import Models
-
-
-from selfai_ui.utils.plugin import load_function_module_by_id
-from selfai_ui.utils.models import get_all_models, check_model_access
+from selfai_ui.socket.main import (
+    get_event_call,
+    get_event_emitter,
+)
+from selfai_ui.utils.models import check_model_access, get_all_models
 from selfai_ui.utils.payload import convert_payload_openai_to_ollama
+from selfai_ui.utils.plugin import get_function_priority, load_function_module_by_id
 from selfai_ui.utils.response import (
     convert_response_ollama_to_openai,
     convert_streaming_response_ollama_to_openai,
 )
-
-from selfai_ui.env import SRC_LOG_LEVELS, GLOBAL_LOG_LEVEL, BYPASS_MODEL_ACCESS_CONTROL
-
 
 logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
 log = logging.getLogger(__name__)
@@ -105,24 +95,20 @@ async def generate_chat_completion(
             selected_model_id = random.choice(model_ids)
         else:
             model_ids = [
-                model["id"]
-                for model in list(request.app.state.MODELS.values())
-                if model.get("owned_by") != "arena"
+                model["id"] for model in list(request.app.state.MODELS.values()) if model.get("owned_by") != "arena"
             ]
             selected_model_id = random.choice(model_ids)
 
         form_data["model"] = selected_model_id
 
-        if form_data.get("stream") == True:
+        if form_data.get("stream"):
 
             async def stream_wrapper(stream):
                 yield f"data: {json.dumps({'selected_model_id': selected_model_id})}\n\n"
                 async for chunk in stream:
                     yield chunk
 
-            response = await generate_chat_completion(
-                request, form_data, user, bypass_filter=True
-            )
+            response = await generate_chat_completion(request, form_data, user, bypass_filter=True)
             return StreamingResponse(
                 stream_wrapper(response.body_iterator),
                 media_type="text/event-stream",
@@ -130,19 +116,14 @@ async def generate_chat_completion(
             )
         else:
             return {
-                **(
-                    await generate_chat_completion(
-                        request, form_data, user, bypass_filter=True
-                    )
-                ),
+                **(await generate_chat_completion(request, form_data, user, bypass_filter=True)),
                 "selected_model_id": selected_model_id,
             }
 
     if model.get("pipe"):
-        # Below does not require bypass_filter because this is the only route the uses this function and it is already bypassing the filter
-        return await generate_function_chat_completion(
-            request, form_data, user=user, models=models
-        )
+        # Below does not require bypass_filter because this is the only route the uses
+        # this function and it is already bypassing the filter
+        return await generate_function_chat_completion(request, form_data, user=user, models=models)
     if model["owned_by"] == "ollama":
         # Using /ollama/api/chat endpoint
         form_data = convert_payload_openai_to_ollama(form_data)
@@ -198,9 +179,7 @@ async def generate_completion(
             raise e
 
     if model["owned_by"] == "ollama":
-        return await generate_ollama_completion(
-            request=request, form_data=form_data, user=user
-        )
+        return await generate_ollama_completion(request=request, form_data=form_data, user=user)
     elif model["owned_by"] == "llamolotl":
         return await generate_llamolotl_completion(
             request=request, form_data=form_data, user=user, bypass_filter=bypass_filter
@@ -246,28 +225,16 @@ async def chat_completed(request: Request, form_data: dict, user: Any):
         }
     )
 
-    def get_priority(function_id):
-        function = Functions.get_function_by_id(function_id)
-        if function is not None and hasattr(function, "valves"):
-            # TODO: Fix FunctionModel to include vavles
-            return (function.valves if function.valves else {}).get("priority", 0)
-        return 0
-
     filter_ids = [function.id for function in Functions.get_global_filter_functions()]
     if "info" in model and "meta" in model["info"]:
         filter_ids.extend(model["info"]["meta"].get("filterIds", []))
         filter_ids = list(set(filter_ids))
 
-    enabled_filter_ids = [
-        function.id
-        for function in Functions.get_functions_by_type("filter", active_only=True)
-    ]
-    filter_ids = [
-        filter_id for filter_id in filter_ids if filter_id in enabled_filter_ids
-    ]
+    enabled_filter_ids = [function.id for function in Functions.get_functions_by_type("filter", active_only=True)]
+    filter_ids = [filter_id for filter_id in filter_ids if filter_id in enabled_filter_ids]
 
-    # Sort filter_ids by priority, using the get_priority function
-    filter_ids.sort(key=get_priority)
+    # Sort filter_ids by priority, using the shared get_function_priority helper
+    filter_ids.sort(key=get_function_priority)
 
     for filter_id in filter_ids:
         filter = Functions.get_function_by_id(filter_id)
@@ -282,9 +249,7 @@ async def chat_completed(request: Request, form_data: dict, user: Any):
 
         if hasattr(function_module, "valves") and hasattr(function_module, "Valves"):
             valves = Functions.get_function_valves_by_id(filter_id)
-            function_module.valves = function_module.Valves(
-                **(valves if valves else {})
-            )
+            function_module.valves = function_module.Valves(**(valves if valves else {}))
 
         if not hasattr(function_module, "outlet"):
             continue
@@ -320,9 +285,7 @@ async def chat_completed(request: Request, form_data: dict, user: Any):
                 try:
                     if hasattr(function_module, "UserValves"):
                         __user__["valves"] = function_module.UserValves(
-                            **Functions.get_user_valves_by_id_and_user_id(
-                                filter_id, user.id
-                            )
+                            **Functions.get_user_valves_by_id_and_user_id(filter_id, user.id)
                         )
                 except Exception as e:
                     print(e)
@@ -421,9 +384,7 @@ async def chat_action(request: Request, action_id: str, form_data: dict, user: A
                 try:
                     if hasattr(function_module, "UserValves"):
                         __user__["valves"] = function_module.UserValves(
-                            **Functions.get_user_valves_by_id_and_user_id(
-                                action_id, user.id
-                            )
+                            **Functions.get_user_valves_by_id_and_user_id(action_id, user.id)
                         )
                 except Exception as e:
                     print(e)

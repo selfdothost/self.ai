@@ -3,12 +3,12 @@ import time
 import uuid
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict
-from sqlalchemy import BigInteger, Column, Text, JSON
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import JSON, BigInteger, Column, Text
 
-from selfai_ui.internal.db import Base, get_db
 from selfai_ui.env import SRC_LOG_LEVELS
-from selfai_ui.models.users import Users, UserResponse
+from selfai_ui.internal.db import Base, get_db
+from selfai_ui.models.users import UserResponse, Users
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MODELS"])
@@ -27,7 +27,7 @@ class EvalJob(Base):
 
     eval_type = Column(Text, default="code-eval")  # "code-eval" or "language-eval"
     benchmark = Column(Text)  # e.g. humaneval, mbpp, apps, hellaswag, mmlu, etc.
-    model_id = Column(Text)   # HuggingFace model ID to evaluate
+    model_id = Column(Text)  # HuggingFace model ID to evaluate
 
     # States: pending -> scheduled -> queued -> running -> completed | failed | cancelled
     status = Column(Text)
@@ -71,8 +71,8 @@ class EvalJobWithUser(EvalJobModel):
 class EvalJobForm(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
     eval_type: str = "code-eval"
-    benchmark: str
-    model_id: str
+    benchmark: str = Field(max_length=200)
+    model_id: str = Field(max_length=200)
     total_samples: Optional[int] = None
     dry_run: bool = False
 
@@ -88,9 +88,7 @@ class EvalJobStatusUpdate(BaseModel):
 
 
 class EvalJobTable:
-    def insert_new_job(
-        self, user_id: str, form_data: EvalJobForm
-    ) -> Optional[EvalJobModel]:
+    def insert_new_job(self, user_id: str, form_data: EvalJobForm) -> Optional[EvalJobModel]:
         with get_db() as db:
             meta = {}
             if form_data.total_samples is not None:
@@ -122,11 +120,7 @@ class EvalJobTable:
     def get_all_jobs(self) -> list[EvalJobWithUser]:
         with get_db() as db:
             jobs = []
-            for job in (
-                db.query(EvalJob)
-                .order_by(EvalJob.created_at.desc())
-                .all()
-            ):
+            for job in db.query(EvalJob).order_by(EvalJob.created_at.desc()).all():
                 user = Users.get_user_by_id(job.user_id)
                 jobs.append(
                     EvalJobWithUser.model_validate(
@@ -150,9 +144,7 @@ class EvalJobTable:
         except Exception:
             return None
 
-    def update_job_status(
-        self, id: str, update: EvalJobStatusUpdate
-    ) -> Optional[EvalJobModel]:
+    def update_job_status(self, id: str, update: EvalJobStatusUpdate) -> Optional[EvalJobModel]:
         try:
             with get_db() as db:
                 fields: dict = {"status": update.status, "updated_at": int(time.time())}
@@ -173,9 +165,7 @@ class EvalJobTable:
                     return None
                 existing = job.meta or {}
                 existing.update(meta)
-                db.query(EvalJob).filter_by(id=id).update(
-                    {"meta": existing, "updated_at": int(time.time())}
-                )
+                db.query(EvalJob).filter_by(id=id).update({"meta": existing, "updated_at": int(time.time())})
                 db.commit()
                 return self.get_job_by_id(id=id)
         except Exception as e:
@@ -186,12 +176,7 @@ class EvalJobTable:
         """Return the oldest job with status 'queued', or None."""
         try:
             with get_db() as db:
-                job = (
-                    db.query(EvalJob)
-                    .filter_by(status="queued")
-                    .order_by(EvalJob.created_at.asc())
-                    .first()
-                )
+                job = db.query(EvalJob).filter_by(status="queued").order_by(EvalJob.created_at.asc()).first()
                 return EvalJobModel.model_validate(job) if job else None
         except Exception:
             return None
@@ -209,9 +194,7 @@ class EvalJobTable:
         """Check if any job is currently running."""
         try:
             with get_db() as db:
-                return (
-                    db.query(EvalJob).filter_by(status="running").first() is not None
-                )
+                return db.query(EvalJob).filter_by(status="running").first() is not None
         except Exception:
             return False
 
@@ -239,9 +222,7 @@ class EvalJobTable:
             )
             return [EvalJobModel.model_validate(r) for r in rows]
 
-    def update_job_scheduled_for(
-        self, id: str, scheduled_for: Optional[int]
-    ) -> Optional[EvalJobModel]:
+    def update_job_scheduled_for(self, id: str, scheduled_for: Optional[int]) -> Optional[EvalJobModel]:
         try:
             with get_db() as db:
                 fields: dict = {"updated_at": int(time.time())}

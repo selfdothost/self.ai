@@ -27,8 +27,7 @@ def test_resources_admin_access(authenticated_admin):
     """Admin reading resources returns 200 + dict body."""
     resp = authenticated_admin.get("/api/system/resources")
     assert resp.status_code == 200, (
-        f"System resources unexpectedly returned {resp.status_code}. "
-        f"Body: {resp.text[:200]}"
+        f"System resources unexpectedly returned {resp.status_code}. " f"Body: {resp.text[:200]}"
     )
     assert isinstance(resp.json(), dict)
 
@@ -43,7 +42,6 @@ def test_processes_admin_only(authenticated_user):
 def test_processes_admin_access(authenticated_admin):
     resp = authenticated_admin.get("/api/system/processes")
     assert resp.status_code == 200, (
-        f"System processes unexpectedly returned {resp.status_code}. "
-        f"Body: {resp.text[:200]}"
+        f"System processes unexpectedly returned {resp.status_code}. " f"Body: {resp.text[:200]}"
     )
     assert isinstance(resp.json(), dict)

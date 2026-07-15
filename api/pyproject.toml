@@ -1,0 +1,51 @@
+# pyproject.toml — lint configuration for the self.ai API server (api/).
+#
+# Scoped to api/ only for now (the FastAPI backend); this repo has no other
+# in-tree Python outside vendored submodules, which keep their own tooling.
+#
+# Wired into CI as `lint:ruff` in .gitlab-ci.yml with allow_failure: true —
+# api/selfai_ui is a hard fork of Open-WebUI v0.5.4 that has never been
+# ruff-checked, so a first run is expected to surface a real backlog. Fixing
+# that backlog is separate follow-up work (selfshipyard/selfai/self.ai#28);
+# this file only wires up the gate.
+
+[tool.ruff]
+target-version = "py311"
+# black==24.8.0 is already a pinned dependency (see requirements.txt /
+# requirements-api.txt) and owns formatting; ruff's own formatter is
+# black-compatible and not invoked here — this config is lint (`ruff check`)
+# only.
+#
+# line-length: 120, not Black's bare default of 88. 88 was never a
+# deliberate choice for this codebase -- it's what an unconfigured
+# pyproject.toml inherits, and this is a 2-year-old hard fork that had
+# never actually been run through Black before self.ai#28. At 88, over a
+# third of the first-ever ruff run's findings (438 of 1204, after Black's
+# own auto-fixes) were long strings/imports/SQL that Black itself refuses
+# to rewrap -- not a real style violation, just a mismatch between the
+# limit and how this dense backend code (long selfai_ui.* import paths,
+# SQLAlchemy queries, user-facing error strings) was actually written.
+# 120 matches Django's own choice for the same reasons. Keep tool.black's
+# line-length in sync with this if either changes.
+line-length = 120
+
+[tool.ruff.lint]
+# Deliberately conservative starting set for a codebase that has never been
+# linted: pyflakes (F) + pycodestyle errors (E) + import sorting (I). Skips
+# stricter/opinionated rule sets (e.g. ANN, D) that would generate a huge new
+# backlog with little immediate payoff on a hard fork of existing code.
+select = ["E", "F", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# config.py's remaining E501s (after the 120-col bump + Black rerun) are all
+# single paragraph-lines inside DEFAULT_*_PROMPT_TEMPLATE triple-quoted
+# strings sent verbatim to the model -- inserting a line break would change
+# the actual prompt text, and there's no way to attach a trailing `# noqa`
+# to a physical line that's the *middle* of a string literal (no comment
+# token exists there). Ignoring E501 file-wide here is a deliberate,
+# documented tradeoff, not an oversight -- everything else in this file
+# (PersistentConfig declarations, etc.) is comfortably under 120 already.
+"selfai_ui/config.py" = ["E501"]
+
+[tool.black]
+line-length = 120

@@ -2,14 +2,13 @@ import logging
 import time
 from typing import Optional
 
-from selfai_ui.internal.db import Base, JSONField, get_db
-from selfai_ui.models.users import Users, UserResponse
-from selfai_ui.env import SRC_LOG_LEVELS
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import BigInteger, Column, String, Text, JSON
+from sqlalchemy import JSON, BigInteger, Column, String, Text
 
+from selfai_ui.env import SRC_LOG_LEVELS
+from selfai_ui.internal.db import Base, JSONField, get_db
+from selfai_ui.models.users import UserResponse, Users
 from selfai_ui.utils.access_control import has_access
-
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MODELS"])
@@ -107,9 +106,7 @@ class ToolValves(BaseModel):
 
 
 class ToolsTable:
-    def insert_new_tool(
-        self, user_id: str, form_data: ToolForm, specs: list[dict]
-    ) -> Optional[ToolModel]:
+    def insert_new_tool(self, user_id: str, form_data: ToolForm, specs: list[dict]) -> Optional[ToolModel]:
         with get_db() as db:
             tool = ToolModel(
                 **{
@@ -157,16 +154,11 @@ class ToolsTable:
                 )
             return tools
 
-    def get_tools_by_user_id(
-        self, user_id: str, permission: str = "write"
-    ) -> list[ToolUserModel]:
+    def get_tools_by_user_id(self, user_id: str, permission: str = "write") -> list[ToolUserModel]:
         tools = self.get_tools()
 
         return [
-            tool
-            for tool in tools
-            if tool.user_id == user_id
-            or has_access(user_id, permission, tool.access_control)
+            tool for tool in tools if tool.user_id == user_id or has_access(user_id, permission, tool.access_control)
         ]
 
     def get_tool_valves_by_id(self, id: str) -> Optional[dict]:
@@ -181,17 +173,13 @@ class ToolsTable:
     def update_tool_valves_by_id(self, id: str, valves: dict) -> Optional[ToolValves]:
         try:
             with get_db() as db:
-                db.query(Tool).filter_by(id=id).update(
-                    {"valves": valves, "updated_at": int(time.time())}
-                )
+                db.query(Tool).filter_by(id=id).update({"valves": valves, "updated_at": int(time.time())})
                 db.commit()
                 return self.get_tool_by_id(id)
         except Exception:
             return None
 
-    def get_user_valves_by_id_and_user_id(
-        self, id: str, user_id: str
-    ) -> Optional[dict]:
+    def get_user_valves_by_id_and_user_id(self, id: str, user_id: str) -> Optional[dict]:
         try:
             user = Users.get_user_by_id(user_id)
             user_settings = user.settings.model_dump() if user.settings else {}
@@ -207,9 +195,7 @@ class ToolsTable:
             print(f"An error occurred: {e}")
             return None
 
-    def update_user_valves_by_id_and_user_id(
-        self, id: str, user_id: str, valves: dict
-    ) -> Optional[dict]:
+    def update_user_valves_by_id_and_user_id(self, id: str, user_id: str, valves: dict) -> Optional[dict]:
         try:
             user = Users.get_user_by_id(user_id)
             user_settings = user.settings.model_dump() if user.settings else {}
@@ -233,9 +219,7 @@ class ToolsTable:
     def update_tool_by_id(self, id: str, updated: dict) -> Optional[ToolModel]:
         try:
             with get_db() as db:
-                db.query(Tool).filter_by(id=id).update(
-                    {**updated, "updated_at": int(time.time())}
-                )
+                db.query(Tool).filter_by(id=id).update({**updated, "updated_at": int(time.time())})
                 db.commit()
 
                 tool = db.query(Tool).get(id)

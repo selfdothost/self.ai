@@ -1,19 +1,15 @@
-import json
 import logging
 import time
-from typing import Optional
 import uuid
+from typing import Iterator, Optional
 
-from selfai_ui.internal.db import Base, get_db
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import JSON, BigInteger, Column, ForeignKey, Index, String, Text
+
 from selfai_ui.env import SRC_LOG_LEVELS
-
+from selfai_ui.internal.db import Base, get_db
 from selfai_ui.models.files import FileMetadataResponse
-from selfai_ui.models.users import Users, UserResponse
-
-
-from pydantic import BaseModel, ConfigDict
-from sqlalchemy import BigInteger, Column, ForeignKey, Index, String, Text, JSON
-
+from selfai_ui.models.users import UserResponse, Users
 from selfai_ui.utils.access_control import has_access
 
 log = logging.getLogger(__name__)
@@ -93,17 +89,15 @@ class KnowledgeUserResponse(KnowledgeUserModel):
 
 
 class KnowledgeForm(BaseModel):
-    name: str
-    description: str
+    name: str = Field(max_length=200)
+    description: str = Field(max_length=2000)
     data: Optional[dict] = None
     meta: Optional[dict] = None
     access_control: Optional[dict] = None
 
 
 class KnowledgeTable:
-    def insert_new_knowledge(
-        self, user_id: str, form_data: KnowledgeForm
-    ) -> Optional[KnowledgeModel]:
+    def insert_new_knowledge(self, user_id: str, form_data: KnowledgeForm) -> Optional[KnowledgeModel]:
         with get_db() as db:
             knowledge = KnowledgeModel(
                 **{
@@ -130,9 +124,7 @@ class KnowledgeTable:
     def get_knowledge_bases(self) -> list[KnowledgeUserModel]:
         with get_db() as db:
             knowledge_bases = []
-            for knowledge in (
-                db.query(Knowledge).order_by(Knowledge.updated_at.desc()).all()
-            ):
+            for knowledge in db.query(Knowledge).order_by(Knowledge.updated_at.desc()).all():
                 user = Users.get_user_by_id(knowledge.user_id)
                 knowledge_bases.append(
                     KnowledgeUserModel.model_validate(
@@ -144,15 +136,12 @@ class KnowledgeTable:
                 )
             return knowledge_bases
 
-    def get_knowledge_bases_by_user_id(
-        self, user_id: str, permission: str = "write"
-    ) -> list[KnowledgeUserModel]:
+    def get_knowledge_bases_by_user_id(self, user_id: str, permission: str = "write") -> list[KnowledgeUserModel]:
         knowledge_bases = self.get_knowledge_bases()
         return [
             knowledge_base
             for knowledge_base in knowledge_bases
-            if knowledge_base.user_id == user_id
-            or has_access(user_id, permission, knowledge_base.access_control)
+            if knowledge_base.user_id == user_id or has_access(user_id, permission, knowledge_base.access_control)
         ]
 
     def get_knowledge_by_id(self, id: str) -> Optional[KnowledgeModel]:
@@ -168,7 +157,6 @@ class KnowledgeTable:
     ) -> Optional[KnowledgeModel]:
         try:
             with get_db() as db:
-                knowledge = self.get_knowledge_by_id(id=id)
                 db.query(Knowledge).filter_by(id=id).update(
                     {
                         **form_data.model_dump(),
@@ -181,15 +169,27 @@ class KnowledgeTable:
             log.exception(e)
             return None
 
-    def update_knowledge_data_by_id(
-        self, id: str, data: dict
-    ) -> Optional[KnowledgeModel]:
+    def update_knowledge_data_by_id(self, id: str, data: dict) -> Optional[KnowledgeModel]:
         try:
             with get_db() as db:
-                knowledge = self.get_knowledge_by_id(id=id)
                 db.query(Knowledge).filter_by(id=id).update(
                     {
                         "data": data,
+                        "updated_at": int(time.time()),
+                    }
+                )
+                db.commit()
+                return self.get_knowledge_by_id(id=id)
+        except Exception as e:
+            log.exception(e)
+            return None
+
+    def update_knowledge_meta_by_id(self, id: str, meta: dict) -> Optional[KnowledgeModel]:
+        try:
+            with get_db() as db:
+                db.query(Knowledge).filter_by(id=id).update(
+                    {
+                        "meta": meta,
                         "updated_at": int(time.time()),
                     }
                 )
@@ -242,20 +242,14 @@ class KnowledgeFile(Base):
     )
     created_at = Column(BigInteger)
 
-    __table_args__ = (
-        Index("ix_knowledge_file_file_id", "file_id"),
-    )
+    __table_args__ = (Index("ix_knowledge_file_file_id", "file_id"),)
 
 
 class KnowledgeFilesTable:
     def add_file_to_knowledge(self, knowledge_id: str, file_id: str) -> bool:
         with get_db() as db:
             try:
-                existing = (
-                    db.query(KnowledgeFile)
-                    .filter_by(knowledge_id=knowledge_id, file_id=file_id)
-                    .first()
-                )
+                existing = db.query(KnowledgeFile).filter_by(knowledge_id=knowledge_id, file_id=file_id).first()
                 if existing:
                     return True
                 db.add(
@@ -274,9 +268,7 @@ class KnowledgeFilesTable:
     def remove_file_from_knowledge(self, knowledge_id: str, file_id: str) -> bool:
         with get_db() as db:
             try:
-                db.query(KnowledgeFile).filter_by(
-                    knowledge_id=knowledge_id, file_id=file_id
-                ).delete()
+                db.query(KnowledgeFile).filter_by(knowledge_id=knowledge_id, file_id=file_id).delete()
                 db.commit()
                 return True
             except Exception:
@@ -292,12 +284,44 @@ class KnowledgeFilesTable:
             )
             return [row.file_id for row in rows]
 
+    def iter_files_by_knowledge_id(
+        self, knowledge_id: str, batch_size: int = 500
+    ) -> Iterator[list]:
+        """Yield a KB's files in ordered batches without ever materializing
+        the whole KB in memory. KBs now regularly carry thousands to
+        millions of documents; get_file_ids_by_knowledge_id() +
+        Files.get_files_by_ids() together load every file's full extracted
+        content into one Python list, which doesn't scale. Keyset-paginated
+        on file.id (covered by knowledge_file's composite PK / the
+        ix_knowledge_file_file_id index) — a fresh short-lived session per
+        batch rather than one connection held for the whole export.
+        """
+        from selfai_ui.models.files import File, FileModel
+
+        last_id = ""
+        while True:
+            with get_db() as db:
+                rows = (
+                    db.query(File)
+                    .join(KnowledgeFile, KnowledgeFile.file_id == File.id)
+                    .filter(
+                        KnowledgeFile.knowledge_id == knowledge_id,
+                        File.id > last_id,
+                    )
+                    .order_by(File.id)
+                    .limit(batch_size)
+                    .all()
+                )
+                batch = [FileModel.model_validate(row) for row in rows]
+            if not batch:
+                return
+            yield batch
+            last_id = batch[-1].id
+
     def remove_all_files_from_knowledge(self, knowledge_id: str) -> bool:
         with get_db() as db:
             try:
-                db.query(KnowledgeFile).filter_by(
-                    knowledge_id=knowledge_id
-                ).delete()
+                db.query(KnowledgeFile).filter_by(knowledge_id=knowledge_id).delete()
                 db.commit()
                 return True
             except Exception:
@@ -305,11 +329,7 @@ class KnowledgeFilesTable:
 
     def get_knowledge_id_for_file(self, file_id: str) -> Optional[str]:
         with get_db() as db:
-            row = (
-                db.query(KnowledgeFile.knowledge_id)
-                .filter_by(file_id=file_id)
-                .first()
-            )
+            row = db.query(KnowledgeFile.knowledge_id).filter_by(file_id=file_id).first()
             return row.knowledge_id if row else None
 
 

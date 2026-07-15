@@ -8,7 +8,6 @@ except for an explicit allowlist of public endpoints.
 import pytest
 from fastapi.routing import APIRoute
 
-
 # Endpoints that are intentionally public
 PUBLIC_ALLOWLIST = {
     "/health",
@@ -89,9 +88,10 @@ def test_all_routes_have_auth_or_allowlisted(test_app):
         if not _route_has_auth_dep(route):
             missing_auth.append(f"{list(route.methods)} {route.path}")
 
-    assert missing_auth == [], (
-        f"The following routes have no auth dependency and are not on the "
-        f"public allowlist:\n" + "\n".join(f"  - {r}" for r in missing_auth)
+    assert (
+        missing_auth == []
+    ), "The following routes have no auth dependency and are not on the " "public allowlist:\n" + "\n".join(
+        f"  - {r}" for r in missing_auth
     )
 
 

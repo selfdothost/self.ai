@@ -3,13 +3,13 @@ import time
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from selfai_ui.utils.auth import get_admin_user
 from selfai_ui.env import SRC_LOG_LEVELS
 from selfai_ui.models.job_windows import (
-    JobWindows,
     JobWindowForm,
+    JobWindows,
     JobWindowWithSlots,
 )
+from selfai_ui.utils.auth import get_admin_user
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS.get("MAIN", logging.INFO))

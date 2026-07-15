@@ -1,8 +1,8 @@
-import requests
 import logging
-import ftfy
 import sys
 
+import ftfy
+import requests
 from langchain_community.document_loaders import (
     BSHTMLLoader,
     CSVLoader,
@@ -12,14 +12,13 @@ from langchain_community.document_loaders import (
     TextLoader,
     UnstructuredEPubLoader,
     UnstructuredExcelLoader,
-    UnstructuredMarkdownLoader,
     UnstructuredPowerPointLoader,
     UnstructuredRSTLoader,
     UnstructuredXMLLoader,
-    YoutubeLoader,
 )
 from langchain_core.documents import Document
-from selfai_ui.env import SRC_LOG_LEVELS, GLOBAL_LOG_LEVEL
+
+from selfai_ui.env import GLOBAL_LOG_LEVEL, SRC_LOG_LEVELS
 
 logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
 log = logging.getLogger(__name__)
@@ -120,26 +119,17 @@ class Loader:
         self.engine = engine
         self.kwargs = kwargs
 
-    def load(
-        self, filename: str, file_content_type: str, file_path: str
-    ) -> list[Document]:
+    def load(self, filename: str, file_content_type: str, file_path: str) -> list[Document]:
         loader = self._get_loader(filename, file_content_type, file_path)
         docs = loader.load()
 
-        return [
-            Document(
-                page_content=ftfy.fix_text(doc.page_content), metadata=doc.metadata
-            )
-            for doc in docs
-        ]
+        return [Document(page_content=ftfy.fix_text(doc.page_content), metadata=doc.metadata) for doc in docs]
 
     def _get_loader(self, filename: str, file_content_type: str, file_path: str):
         file_ext = filename.split(".")[-1].lower()
 
         if self.engine == "tika" and self.kwargs.get("TIKA_SERVER_URL"):
-            if file_ext in known_source_ext or (
-                file_content_type and file_content_type.find("text/") >= 0
-            ):
+            if file_ext in known_source_ext or (file_content_type and file_content_type.find("text/") >= 0):
                 loader = TextLoader(file_path, autodetect_encoding=True)
             else:
                 loader = TikaLoader(
@@ -149,9 +139,7 @@ class Loader:
                 )
         else:
             if file_ext == "pdf":
-                loader = PyPDFLoader(
-                    file_path, extract_images=self.kwargs.get("PDF_EXTRACT_IMAGES")
-                )
+                loader = PyPDFLoader(file_path, extract_images=self.kwargs.get("PDF_EXTRACT_IMAGES"))
             elif file_ext == "csv":
                 loader = CSVLoader(file_path)
             elif file_ext == "rst":
@@ -165,8 +153,7 @@ class Loader:
             elif file_content_type == "application/epub+zip":
                 loader = UnstructuredEPubLoader(file_path)
             elif (
-                file_content_type
-                == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                file_content_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                 or file_ext == "docx"
             ):
                 loader = Docx2txtLoader(file_path)
@@ -182,9 +169,7 @@ class Loader:
                 loader = UnstructuredPowerPointLoader(file_path)
             elif file_ext == "msg":
                 loader = OutlookMessageLoader(file_path)
-            elif file_ext in known_source_ext or (
-                file_content_type and file_content_type.find("text/") >= 0
-            ):
+            elif file_ext in known_source_ext or (file_content_type and file_content_type.find("text/") >= 0):
                 loader = TextLoader(file_path, autodetect_encoding=True)
             else:
                 loader = TextLoader(file_path, autodetect_encoding=True)

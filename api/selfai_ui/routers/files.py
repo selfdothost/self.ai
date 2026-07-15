@@ -3,32 +3,25 @@ import os
 import uuid
 from pathlib import Path
 from typing import Optional
-from pydantic import BaseModel
-import mimetypes
 from urllib.parse import quote
 
-from selfai_ui.storage.provider import Storage
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
+from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel
 
+from selfai_ui.config import (
+    FILE_UPLOAD_BLOCKED_MIME_PREFIXES,
+)
+from selfai_ui.constants import ERROR_MESSAGES
+from selfai_ui.env import SRC_LOG_LEVELS
 from selfai_ui.models.files import (
     FileForm,
     FileModel,
     FileModelResponse,
     Files,
 )
-from selfai_ui.routers.retrieval import process_file, ProcessFileForm
-
-from selfai_ui.config import (
-    UPLOAD_DIR,
-    FILE_UPLOAD_BLOCKED_MIME_PREFIXES,
-)
-from selfai_ui.env import SRC_LOG_LEVELS
-from selfai_ui.constants import ERROR_MESSAGES
-
-
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status, Request
-from fastapi.responses import FileResponse, StreamingResponse
-
-
+from selfai_ui.routers.retrieval import ProcessFileForm, process_file
+from selfai_ui.storage.provider import Storage
 from selfai_ui.utils.auth import get_admin_user, get_verified_user
 
 log = logging.getLogger(__name__)
@@ -43,9 +36,7 @@ router = APIRouter()
 
 
 @router.post("/", response_model=FileModelResponse)
-def upload_file(
-    request: Request, file: UploadFile = File(...), user=Depends(get_verified_user)
-):
+def upload_file(request: Request, file: UploadFile = File(...), user=Depends(get_verified_user)):
     log.info(f"file.content_type: {file.content_type}")
     try:
         # Enforce server-side file size limit
@@ -80,12 +71,7 @@ def upload_file(
         unsanitized_filename = file.filename or "unnamed"
         # Strip null bytes and their URL-encoded variants to prevent
         # null-byte injection attacks (e.g. "safe.jpg\x00.php")
-        unsanitized_filename = (
-            unsanitized_filename
-            .replace("\x00", "")
-            .replace("%00", "")
-            .replace("%2500", "")
-        )
+        unsanitized_filename = unsanitized_filename.replace("\x00", "").replace("%00", "").replace("%2500", "")
         filename = os.path.basename(unsanitized_filename)
 
         # replace filename with uuid
@@ -169,7 +155,7 @@ async def delete_all_files(user=Depends(get_admin_user)):
             Storage.delete_all_files()
         except Exception as e:
             log.exception(e)
-            log.error(f"Error deleting files")
+            log.error("Error deleting files")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=ERROR_MESSAGES.DEFAULT("Error deleting files"),
@@ -235,9 +221,7 @@ async def update_file_data_content_by_id(
 
     if file and (file.user_id == user.id or user.role == "admin"):
         try:
-            process_file(
-                request, ProcessFileForm(file_id=id, content=form_data.content)
-            )
+            process_file(request, ProcessFileForm(file_id=id, content=form_data.content))
             file = Files.get_file_by_id(id=id)
         except Exception as e:
             log.exception(e)
@@ -289,7 +273,7 @@ async def get_file_content_by_id(id: str, user=Depends(get_verified_user)):
                 )
         except Exception as e:
             log.exception(e)
-            log.error(f"Error getting file content")
+            log.error("Error getting file content")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=ERROR_MESSAGES.DEFAULT("Error getting file content"),
@@ -320,7 +304,7 @@ async def get_html_file_content_by_id(id: str, user=Depends(get_verified_user)):
                 )
         except Exception as e:
             log.exception(e)
-            log.error(f"Error getting file content")
+            log.error("Error getting file content")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=ERROR_MESSAGES.DEFAULT("Error getting file content"),
@@ -333,7 +317,7 @@ async def get_html_file_content_by_id(id: str, user=Depends(get_verified_user)):
 
 
 @router.get("/{id}/content/{file_name}")
-async def get_file_content_by_id(id: str, user=Depends(get_verified_user)):
+async def get_file_content_by_id_and_name(id: str, user=Depends(get_verified_user)):
     file = Files.get_file_by_id(id)
 
     if file and (file.user_id == user.id or user.role == "admin"):
@@ -342,9 +326,7 @@ async def get_file_content_by_id(id: str, user=Depends(get_verified_user)):
         # Handle Unicode filenames
         filename = file.meta.get("name", file.filename)
         encoded_filename = quote(filename)  # RFC5987 encoding
-        headers = {
-            "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"
-        }
+        headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"}
 
         if file_path:
             file_path = Storage.get_file(file_path)
@@ -361,7 +343,6 @@ async def get_file_content_by_id(id: str, user=Depends(get_verified_user)):
         else:
             # File path doesn’t exist, return the content as .txt if possible
             file_content = file.content.get("content", "")
-            file_name = file.filename
 
             # Create a generator that encodes the file content
             def generator():
@@ -394,7 +375,7 @@ async def delete_file_by_id(id: str, user=Depends(get_verified_user)):
                 Storage.delete_file(file.path)
             except Exception as e:
                 log.exception(e)
-                log.error(f"Error deleting files")
+                log.error("Error deleting files")
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=ERROR_MESSAGES.DEFAULT("Error deleting files"),

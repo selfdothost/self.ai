@@ -6,14 +6,14 @@ Create Date: 2026-03-26
 
 """
 
+import logging
 import os
 import shutil
-import logging
 
-from alembic import op
 import sqlalchemy as sa
-from sqlalchemy.sql import table, column
-from sqlalchemy import String, Text, JSON
+from alembic import op
+from sqlalchemy import JSON, String, Text
+from sqlalchemy.sql import column, table
 
 revision = "e5f6a7b8c9d0"
 down_revision = "d4e5f6a7b8c9"
@@ -47,9 +47,7 @@ def upgrade():
 
     # Build knowledge_id -> [file_ids] map
     kb_rows = connection.execute(
-        sa.select(knowledge_table.c.id, knowledge_table.c.data).where(
-            knowledge_table.c.data.isnot(None)
-        )
+        sa.select(knowledge_table.c.id, knowledge_table.c.data).where(knowledge_table.c.data.isnot(None))
     ).fetchall()
 
     # Build reverse map: file_id -> first knowledge_id
@@ -72,9 +70,7 @@ def upgrade():
 
     # Get file paths for all files that need moving
     file_rows = connection.execute(
-        sa.select(file_table.c.id, file_table.c.path).where(
-            file_table.c.id.in_(list(file_to_kb.keys()))
-        )
+        sa.select(file_table.c.id, file_table.c.path).where(file_table.c.id.in_(list(file_to_kb.keys())))
     ).fetchall()
 
     for file_row in file_rows:
@@ -96,9 +92,7 @@ def upgrade():
         # Skip if already in some other subdirectory (shouldn't happen, but be safe)
         parent = os.path.dirname(current_path)
         if parent != upload_dir:
-            log.warning(
-                f"File {file_id} at {current_path} is already in a subdirectory, skipping"
-            )
+            log.warning(f"File {file_id} at {current_path} is already in a subdirectory, skipping")
             continue
 
         # Move the file on disk
@@ -114,11 +108,7 @@ def upgrade():
             continue
 
         # Update path in database
-        connection.execute(
-            file_table.update()
-            .where(file_table.c.id == file_id)
-            .values({"path": new_path})
-        )
+        connection.execute(file_table.update().where(file_table.c.id == file_id).values({"path": new_path}))
         log.info(f"Moved file {file_id} to {new_path}")
 
 
@@ -139,9 +129,7 @@ def downgrade():
     connection = op.get_bind()
 
     file_rows = connection.execute(
-        sa.select(file_table.c.id, file_table.c.path).where(
-            file_table.c.path.isnot(None)
-        )
+        sa.select(file_table.c.id, file_table.c.path).where(file_table.c.path.isnot(None))
     ).fetchall()
 
     for file_row in file_rows:
@@ -166,8 +154,4 @@ def downgrade():
                 log.error(f"Failed to move file {file_row.id} back: {e}")
                 continue
 
-        connection.execute(
-            file_table.update()
-            .where(file_table.c.id == file_row.id)
-            .values({"path": new_path})
-        )
+        connection.execute(file_table.update().where(file_table.c.id == file_row.id).values({"path": new_path}))

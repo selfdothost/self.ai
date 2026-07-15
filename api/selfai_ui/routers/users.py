@@ -1,6 +1,11 @@
 import logging
 from typing import Optional
 
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from pydantic import BaseModel
+
+from selfai_ui.constants import ERROR_MESSAGES
+from selfai_ui.env import SRC_LOG_LEVELS
 from selfai_ui.models.auths import Auths
 from selfai_ui.models.chats import Chats
 from selfai_ui.models.groups import Groups
@@ -11,13 +16,7 @@ from selfai_ui.models.users import (
     UserSettings,
     UserUpdateForm,
 )
-
-
 from selfai_ui.socket.main import get_active_status_by_user_id
-from selfai_ui.constants import ERROR_MESSAGES
-from selfai_ui.env import SRC_LOG_LEVELS
-from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel
 from selfai_ui.utils.auth import get_admin_user, get_password_hash, get_verified_user
 
 log = logging.getLogger(__name__)
@@ -87,9 +86,7 @@ async def get_user_permissions(request: Request, user=Depends(get_admin_user)):
 
 
 @router.post("/default/permissions")
-async def update_user_permissions(
-    request: Request, form_data: UserPermissions, user=Depends(get_admin_user)
-):
+async def update_user_permissions(request: Request, form_data: UserPermissions, user=Depends(get_admin_user)):
     request.app.state.config.USER_PERMISSIONS = form_data.model_dump()
     return request.app.state.config.USER_PERMISSIONS
 
@@ -133,9 +130,7 @@ async def get_user_settings_by_session_user(user=Depends(get_verified_user)):
 
 
 @router.post("/user/settings/update", response_model=UserSettings)
-async def update_user_settings_by_session_user(
-    form_data: UserSettings, user=Depends(get_verified_user)
-):
+async def update_user_settings_by_session_user(form_data: UserSettings, user=Depends(get_verified_user)):
     user = Users.update_user_by_id(user.id, {"settings": form_data.model_dump()})
     if user:
         return user.settings
@@ -169,9 +164,7 @@ async def get_user_info_by_session_user(user=Depends(get_verified_user)):
 
 
 @router.post("/user/info/update", response_model=Optional[dict])
-async def update_user_info_by_session_user(
-    form_data: dict, user=Depends(get_verified_user)
-):
+async def update_user_info_by_session_user(form_data: dict, user=Depends(get_verified_user)):
     user = Users.get_user_by_id(user.id)
     if user:
         if user.info is None:

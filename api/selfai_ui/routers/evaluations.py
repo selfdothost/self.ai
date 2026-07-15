@@ -10,51 +10,44 @@ from pathlib import Path
 from typing import Any, Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from selfai_ui.models.users import Users, UserModel
-from selfai_ui.models.feedbacks import (
-    FeedbackModel,
-    FeedbackResponse,
-    FeedbackForm,
-    Feedbacks,
-)
-
 from selfai_ui.constants import ERROR_MESSAGES
-from selfai_ui.models.models import Models
 from selfai_ui.models.eval_jobs import (
-    EvalJobs,
     EvalJobForm,
     EvalJobModel,
-    EvalJobWithUser,
+    EvalJobs,
     EvalJobStatusUpdate,
+    EvalJobWithUser,
 )
+from selfai_ui.models.feedbacks import (
+    FeedbackForm,
+    FeedbackModel,
+    FeedbackResponse,
+    Feedbacks,
+)
+from selfai_ui.models.models import Models
+from selfai_ui.models.users import UserModel, Users
+from selfai_ui.utils.access_control import has_permission
 from selfai_ui.utils.auth import (
+    create_eval_token,
     get_admin_user,
     get_verified_user,
-    create_eval_token,
     revoke_eval_tokens_for_job,
 )
-from selfai_ui.utils.access_control import has_permission
 
 log = logging.getLogger(__name__)
 
 router = APIRouter()
 
-CODE_EVAL_RESULTS_DIR = Path(
-    os.environ.get("CODE_EVAL_RESULTS_DIR", "/app/backend/data/code-eval-results")
-)
+CODE_EVAL_RESULTS_DIR = Path(os.environ.get("CODE_EVAL_RESULTS_DIR", "/app/backend/data/code-eval-results"))
 
-LANGUAGE_EVAL_RESULTS_DIR = Path(
-    os.environ.get("LANGUAGE_EVAL_RESULTS_DIR", "/workspace/results")
-)
+LANGUAGE_EVAL_RESULTS_DIR = Path(os.environ.get("LANGUAGE_EVAL_RESULTS_DIR", "/workspace/results"))
 
 # URL of the code-eval API container
-CODE_EVAL_API_URL = os.environ.get(
-    "CODE_EVAL_API_URL", "http://self-code-eval:8094"
-)
+CODE_EVAL_API_URL = os.environ.get("CODE_EVAL_API_URL", "http://self-code-eval:8094")
 
 # Test Mode (dry_run) caps every run to a handful of samples so the harness
 # returns quickly regardless of the benchmark's real size.
@@ -65,14 +58,10 @@ DRY_RUN_SAMPLE_LIMIT = 5
 # the UI's auth, model routing, and access control.
 # Use /api/completions (text completion) for code eval — avoids chat formatting
 # and thinking-mode issues. Set to /api/chat/completions if needed.
-CODE_INFERENCE_API_URL = os.environ.get(
-    "CODE_INFERENCE_API_URL", "http://selfai-api:80/api/completions"
-)
+CODE_INFERENCE_API_URL = os.environ.get("CODE_INFERENCE_API_URL", "http://selfai-api:80/api/completions")
 
 # URL of the language-eval API container
-LANGUAGE_EVAL_API_URL = os.environ.get(
-    "LANGUAGE_EVAL_API_URL", "http://self-language-eval:8096"
-)
+LANGUAGE_EVAL_API_URL = os.environ.get("LANGUAGE_EVAL_API_URL", "http://self-language-eval:8096")
 
 # Base URL for language-eval inference (selfUI chat completions endpoint)
 LANGUAGE_EVAL_INFERENCE_BASE_URL = os.environ.get(
@@ -128,9 +117,7 @@ class FeedbackUserResponse(FeedbackResponse):
 async def get_all_feedbacks(user=Depends(get_admin_user)):
     feedbacks = Feedbacks.get_all_feedbacks()
     return [
-        FeedbackUserResponse(
-            **feedback.model_dump(), user=Users.get_user_by_id(feedback.user_id)
-        )
+        FeedbackUserResponse(**feedback.model_dump(), user=Users.get_user_by_id(feedback.user_id))
         for feedback in feedbacks
     ]
 
@@ -142,13 +129,10 @@ async def delete_all_feedbacks(user=Depends(get_admin_user)):
 
 
 @router.get("/feedbacks/all/export", response_model=list[FeedbackModel])
-async def get_all_feedbacks(user=Depends(get_admin_user)):
+async def export_all_feedbacks(user=Depends(get_admin_user)):
     feedbacks = Feedbacks.get_all_feedbacks()
     return [
-        FeedbackModel(
-            **feedback.model_dump(), user=Users.get_user_by_id(feedback.user_id)
-        )
-        for feedback in feedbacks
+        FeedbackModel(**feedback.model_dump(), user=Users.get_user_by_id(feedback.user_id)) for feedback in feedbacks
     ]
 
 
@@ -185,25 +169,17 @@ async def get_feedback_by_id(id: str, user=Depends(get_verified_user)):
     feedback = Feedbacks.get_feedback_by_id_and_user_id(id=id, user_id=user.id)
 
     if not feedback:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
 
     return feedback
 
 
 @router.post("/feedback/{id}", response_model=FeedbackModel)
-async def update_feedback_by_id(
-    id: str, form_data: FeedbackForm, user=Depends(get_verified_user)
-):
-    feedback = Feedbacks.update_feedback_by_id_and_user_id(
-        id=id, user_id=user.id, form_data=form_data
-    )
+async def update_feedback_by_id(id: str, form_data: FeedbackForm, user=Depends(get_verified_user)):
+    feedback = Feedbacks.update_feedback_by_id_and_user_id(id=id, user_id=user.id, form_data=form_data)
 
     if not feedback:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
 
     return feedback
 
@@ -216,9 +192,7 @@ async def delete_feedback_by_id(id: str, user=Depends(get_verified_user)):
         success = Feedbacks.delete_feedback_by_id_and_user_id(id=id, user_id=user.id)
 
     if not success:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
 
     return success
 
@@ -266,7 +240,7 @@ def _extract_base_id(results_filename: str) -> str:
     """Extract the base id from a results filename stem (remove '-results' suffix)."""
     stem = Path(results_filename).stem if results_filename.endswith(".json") else results_filename
     if stem.endswith("-results"):
-        return stem[:-len("-results")]
+        return stem[: -len("-results")]
     return stem
 
 
@@ -297,17 +271,19 @@ def _list_result_files() -> list[dict]:
 
             # Build a summary entry
             scores = {k: v for k, v in data.items() if k != "config"}
-            results.append(_sanitize_value(
-                {
-                    "id": base_id,
-                    "filename": path.name,
-                    "model": model_name,
-                    "tasks": tasks,
-                    "scores": scores,
-                    "config": config,
-                    "created_at": created_at,
-                }
-            ))
+            results.append(
+                _sanitize_value(
+                    {
+                        "id": base_id,
+                        "filename": path.name,
+                        "model": model_name,
+                        "tasks": tasks,
+                        "scores": scores,
+                        "config": config,
+                        "created_at": created_at,
+                    }
+                )
+            )
         except Exception as e:
             log.warning(f"Failed to parse {path}: {e}")
 
@@ -440,12 +416,14 @@ async def get_code_tests_summary(user=Depends(get_admin_user)):
         benchmarks = data["benchmarks"]
         scores_list = list(benchmarks.values())
         avg = round(sum(scores_list) / len(scores_list), 1) if scores_list else 0
-        summary.append({
-            "model": model_name,
-            "benchmarks": benchmarks,
-            "average": avg,
-            "runs": data["runs"],
-        })
+        summary.append(
+            {
+                "model": model_name,
+                "benchmarks": benchmarks,
+                "average": avg,
+                "runs": data["runs"],
+            }
+        )
 
     return {
         "models": summary,
@@ -485,13 +463,21 @@ async def get_code_tests_benchmark(benchmark_name: str, user=Depends(get_admin_u
             for _k, metrics in result["scores"].items():
                 if isinstance(metrics, dict) and "pass@1" in metrics:
                     score = round(metrics["pass@1"] * 100, 1)
-            quartiles = {"q1": score, "q2": score, "q3": score, "q4": score, "total": score}
+            quartiles = {
+                "q1": score,
+                "q2": score,
+                "q3": score,
+                "q4": score,
+                "total": score,
+            }
 
-        rows.append({
-            "model": model_name,
-            "result_id": result["id"],
-            **quartiles,
-        })
+        rows.append(
+            {
+                "model": model_name,
+                "result_id": result["id"],
+                **quartiles,
+            }
+        )
 
     return {"benchmark": benchmark_name, "rows": rows}
 
@@ -526,9 +512,7 @@ async def get_code_test_details(result_id: str, user=Depends(get_verified_user))
         # Fallback: fetch from code-eval API directly (results not yet synced)
         try:
             async with httpx.AsyncClient(timeout=60.0) as client:
-                resp = await client.get(
-                    f"{CODE_EVAL_API_URL}/api/results/{result_id}/details"
-                )
+                resp = await client.get(f"{CODE_EVAL_API_URL}/api/results/{result_id}/details")
                 if resp.status_code == 200:
                     details = _sanitize_value(resp.json())
                     # Persist locally so next request hits disk
@@ -539,7 +523,7 @@ async def get_code_test_details(result_id: str, user=Depends(get_verified_user))
                         details_path.write_text(json.dumps(details))
         except Exception as e:
             log.warning(f"Failed to fetch details from code-eval for {result_id}: {e}")
-    
+
     if details is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -553,22 +537,20 @@ async def get_code_test_details(result_id: str, user=Depends(get_verified_user))
 ############################
 
 
-def _list_language_eval_results() -> list[dict]:
-    """Scan the language-eval results directory for results_*.json files.
+async def _list_language_eval_results() -> list[dict]:
+    """List language-eval results.
 
-    Structure: {LANGUAGE_EVAL_RESULTS_DIR}/{job_id}/{model_name}/results_*.json
+    Primary source is a live fetch from language-eval's own control-plane API
+    (GET /api/results) -- LANGUAGE_EVAL_RESULTS_DIR is never actually mounted
+    on this pod (no shared PVC wired into manifests/api/10-deployment.yaml, see
+    self.ai#33), so the disk-glob path below is dead in production today. It's
+    kept as a first-choice source in case that ever changes, and as a fallback
+    if the language-eval pod itself is briefly unreachable.
+
+    Structure (disk path): {LANGUAGE_EVAL_RESULTS_DIR}/{job_id}/{model_name}/results_*.json
     """
     results = []
-    if not LANGUAGE_EVAL_RESULTS_DIR.is_dir():
-        return results
-
-    jobs_file = LANGUAGE_EVAL_RESULTS_DIR / ".jobs.json"
-    jobs_meta = {}
-    if jobs_file.is_file():
-        try:
-            jobs_meta = json.loads(jobs_file.read_text())
-        except Exception:
-            pass
+    seen_language_eval_ids: set[str] = set()
 
     # Build reverse map: language_eval_job_id -> ui_job_id
     # so results can be linked back to the UI's EvalJob records.
@@ -582,47 +564,94 @@ def _list_language_eval_results() -> list[dict]:
     except Exception:
         pass
 
-    for results_file in sorted(LANGUAGE_EVAL_RESULTS_DIR.glob("*/*/results_*.json")):
-        try:
-            data = json.loads(results_file.read_text())
-            language_eval_job_id = results_file.parent.parent.name
-            # Prefer the UI job ID if we have a mapping
-            job_id = language_eval_to_ui.get(language_eval_job_id, language_eval_job_id)
-            model_name = data.get("model_name", results_file.parent.name)
-            task_results = data.get("results", {})
+    if LANGUAGE_EVAL_RESULTS_DIR.is_dir():
+        jobs_file = LANGUAGE_EVAL_RESULTS_DIR / ".jobs.json"
+        jobs_meta = {}
+        if jobs_file.is_file():
+            try:
+                jobs_meta = json.loads(jobs_file.read_text())
+            except Exception:
+                pass
 
-            # Extract benchmark names and scores
-            benchmarks = {}
-            for task_name, metrics in task_results.items():
-                # Pick the primary metric for each benchmark
-                score = _extract_language_eval_primary_metric(task_name, metrics)
-                if score is not None:
-                    benchmarks[task_name] = round(score * 100, 1)
+        for results_file in sorted(LANGUAGE_EVAL_RESULTS_DIR.glob("*/*/results_*.json")):
+            try:
+                data = json.loads(results_file.read_text())
+                language_eval_job_id = results_file.parent.parent.name
+                # Prefer the UI job ID if we have a mapping
+                job_id = language_eval_to_ui.get(language_eval_job_id, language_eval_job_id)
+                model_name = data.get("model_name", results_file.parent.name)
+                task_results = data.get("results", {})
 
-            created_at = None
-            if job_id in jobs_meta:
-                created_at = jobs_meta[job_id].get("created_at")
+                # Extract benchmark names and scores
+                benchmarks = {}
+                for task_name, metrics in task_results.items():
+                    # Pick the primary metric for each benchmark
+                    score = _extract_language_eval_primary_metric(task_name, metrics)
+                    if score is not None:
+                        benchmarks[task_name] = round(score * 100, 1)
 
-            n_samples = data.get("n-samples", {})
-            total_samples = sum(
-                v.get("effective", v.get("original", 0))
-                for v in n_samples.values()
-                if isinstance(v, dict)
-            )
+                created_at = None
+                if job_id in jobs_meta:
+                    created_at = jobs_meta[job_id].get("created_at")
 
-            results.append(_sanitize_value({
-                "id": job_id,
-                "language_eval_job_id": language_eval_job_id,
-                "model": model_name,
-                "benchmarks": benchmarks,
-                "total_samples": total_samples,
-                "eval_time": data.get("total_evaluation_time_seconds"),
-                "created_at": created_at,
-                "config": data.get("config", {}),
-                "results_file": str(results_file.relative_to(LANGUAGE_EVAL_RESULTS_DIR)),
-            }))
-        except Exception as e:
-            log.warning(f"Failed to parse language-eval result {results_file}: {e}")
+                n_samples = data.get("n-samples", {})
+                total_samples = sum(
+                    v.get("effective", v.get("original", 0)) for v in n_samples.values() if isinstance(v, dict)
+                )
+
+                results.append(
+                    _sanitize_value(
+                        {
+                            "id": job_id,
+                            "language_eval_job_id": language_eval_job_id,
+                            "model": model_name,
+                            "benchmarks": benchmarks,
+                            "total_samples": total_samples,
+                            "eval_time": data.get("total_evaluation_time_seconds"),
+                            "created_at": created_at,
+                            "config": data.get("config", {}),
+                            "results_file": str(results_file.relative_to(LANGUAGE_EVAL_RESULTS_DIR)),
+                        }
+                    )
+                )
+                seen_language_eval_ids.add(language_eval_job_id)
+            except Exception as e:
+                log.warning(f"Failed to parse language-eval result {results_file}: {e}")
+
+    # Live fallback: language-eval's own control plane always has these, since
+    # it writes results to its own PVC regardless of what this pod can see.
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(f"{LANGUAGE_EVAL_API_URL}/api/results")
+            resp.raise_for_status()
+            for item in resp.json():
+                language_eval_job_id = item.get("id") or item.get("job_id")
+                if not language_eval_job_id or language_eval_job_id in seen_language_eval_ids:
+                    continue
+                job_id = language_eval_to_ui.get(language_eval_job_id, language_eval_job_id)
+                benchmarks = {}
+                for task_name, metrics in (item.get("scores") or {}).items():
+                    score = _extract_language_eval_primary_metric(task_name, metrics)
+                    if score is not None:
+                        benchmarks[task_name] = round(score * 100, 1)
+
+                results.append(
+                    _sanitize_value(
+                        {
+                            "id": job_id,
+                            "language_eval_job_id": language_eval_job_id,
+                            "model": item.get("model"),
+                            "benchmarks": benchmarks,
+                            "total_samples": None,
+                            "eval_time": None,
+                            "created_at": item.get("created_at"),
+                            "config": item.get("config", {}),
+                            "results_file": None,
+                        }
+                    )
+                )
+    except Exception as e:
+        log.warning(f"Failed to fetch results from language-eval API: {e}")
 
     return results
 
@@ -654,28 +683,34 @@ def _extract_language_eval_primary_metric(task_name: str, metrics: dict) -> floa
     return None
 
 
-def _load_language_eval_samples(job_id: str, model_name: str) -> list[dict] | None:
-    """Load per-sample details from a samples_*.jsonl file."""
-    if not LANGUAGE_EVAL_RESULTS_DIR.is_dir():
-        return None
+async def _load_language_eval_samples(job_id: str, model_name: str) -> list[dict] | None:
+    """Load per-sample details from a samples_*.jsonl file.
 
-    # Find the samples file
-    job_dir = LANGUAGE_EVAL_RESULTS_DIR / job_id
-    if not job_dir.is_dir():
-        return None
+    Same disk-primary / live-fallback split as _list_language_eval_results --
+    see that function's docstring for why the disk path is normally empty.
+    """
+    if LANGUAGE_EVAL_RESULTS_DIR.is_dir():
+        job_dir = LANGUAGE_EVAL_RESULTS_DIR / job_id
+        if job_dir.is_dir():
+            for samples_file in job_dir.glob("*/samples_*.jsonl"):
+                try:
+                    samples = []
+                    with open(samples_file) as f:
+                        for line in f:
+                            line = line.strip()
+                            if line:
+                                samples.append(json.loads(line))
+                    return _sanitize_value(samples)
+                except Exception as e:
+                    log.warning(f"Failed to parse samples {samples_file}: {e}")
 
-    # Search across model subdirs
-    for samples_file in job_dir.glob("*/samples_*.jsonl"):
-        try:
-            samples = []
-            with open(samples_file) as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        samples.append(json.loads(line))
-            return _sanitize_value(samples)
-        except Exception as e:
-            log.warning(f"Failed to parse samples {samples_file}: {e}")
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.get(f"{LANGUAGE_EVAL_API_URL}/api/results/{job_id}/samples")
+            if resp.status_code == 200:
+                return _sanitize_value(resp.json())
+    except Exception as e:
+        log.warning(f"Failed to fetch samples from language-eval for {job_id}: {e}")
 
     return None
 
@@ -683,7 +718,7 @@ def _load_language_eval_samples(job_id: str, model_name: str) -> list[dict] | No
 @router.get("/langtests/summary")
 async def get_lang_tests_summary(user=Depends(get_admin_user)):
     """Aggregate language-eval results by model across all benchmarks."""
-    all_results = _list_language_eval_results()
+    all_results = await _list_language_eval_results()
 
     model_data: dict[str, dict] = defaultdict(lambda: {"benchmarks": {}, "runs": 0})
     benchmarks_seen: set[str] = set()
@@ -702,12 +737,14 @@ async def get_lang_tests_summary(user=Depends(get_admin_user)):
         benchmarks = data["benchmarks"]
         scores_list = list(benchmarks.values())
         avg = round(sum(scores_list) / len(scores_list), 1) if scores_list else 0
-        summary.append({
-            "model": model_name,
-            "benchmarks": benchmarks,
-            "average": avg,
-            "runs": data["runs"],
-        })
+        summary.append(
+            {
+                "model": model_name,
+                "benchmarks": benchmarks,
+                "average": avg,
+                "runs": data["runs"],
+            }
+        )
 
     return {
         "models": summary,
@@ -718,7 +755,7 @@ async def get_lang_tests_summary(user=Depends(get_admin_user)):
 @router.get("/langtests/model-runs/{model_name:path}")
 async def get_lang_model_runs(model_name: str, user=Depends(get_admin_user)):
     """List all language-eval runs for a specific model."""
-    all_results = _list_language_eval_results()
+    all_results = await _list_language_eval_results()
     runs = [r for r in all_results if r["model"] == model_name]
     runs.sort(key=lambda r: r.get("created_at") or r["id"], reverse=True)
     return runs
@@ -730,7 +767,7 @@ async def get_lang_test_details(job_id: str, user=Depends(get_admin_user)):
     _validate_result_id(job_id)
 
     # Find the result to get model name
-    all_results = _list_language_eval_results()
+    all_results = await _list_language_eval_results()
     result = next((r for r in all_results if r["id"] == job_id), None)
     if not result:
         raise HTTPException(
@@ -740,7 +777,7 @@ async def get_lang_test_details(job_id: str, user=Depends(get_admin_user)):
 
     # Use language_eval_job_id for disk path (directory is named by language-eval ID)
     disk_id = result.get("language_eval_job_id", job_id)
-    samples = _load_language_eval_samples(disk_id, result["model"])
+    samples = await _load_language_eval_samples(disk_id, result["model"])
     if samples is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -830,13 +867,8 @@ async def cancel_eval_job(
         if remote_job_id and remote_url:
             try:
                 async with httpx.AsyncClient(timeout=15.0) as client:
-                    resp = await client.delete(
-                        f"{remote_url}/api/jobs/{remote_job_id}"
-                    )
-                    log.info(
-                        f"Cancelled remote {job.eval_type} job {remote_job_id}: "
-                        f"{resp.status_code}"
-                    )
+                    resp = await client.delete(f"{remote_url}/api/jobs/{remote_job_id}")
+                    log.info(f"Cancelled remote {job.eval_type} job {remote_job_id}: " f"{resp.status_code}")
             except Exception as e:
                 log.warning(f"Failed to cancel remote job {remote_job_id}: {e}")
 
@@ -1024,28 +1056,24 @@ async def _fetch_code_eval_results(job: EvalJobModel, code_eval_job_id: str) -> 
         # slow to answer while a run is in flight.
         async with httpx.AsyncClient(timeout=60.0) as client:
             # Fetch results summary
-            summary_resp = await client.get(
-                f"{CODE_EVAL_API_URL}/api/results/{code_eval_job_id}"
-            )
+            summary_resp = await client.get(f"{CODE_EVAL_API_URL}/api/results/{code_eval_job_id}")
             summary_resp.raise_for_status()
             summary = summary_resp.json()
-            
+
             # Save results summary
             summary_path = CODE_EVAL_RESULTS_DIR / f"{code_eval_job_id}-results.json"
             summary_path.write_text(json.dumps(summary))
             log.info(f"Saved code-eval results summary: {summary_path}")
-            
+
             # Fetch per-task details
-            details_resp = await client.get(
-                f"{CODE_EVAL_API_URL}/api/results/{code_eval_job_id}/details"
-            )
+            details_resp = await client.get(f"{CODE_EVAL_API_URL}/api/results/{code_eval_job_id}/details")
             if details_resp.status_code == 200:
                 details = details_resp.json()
                 timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
                 details_path = CODE_EVAL_RESULTS_DIR / f"{code_eval_job_id}-details_{timestamp}.json"
                 details_path.write_text(json.dumps(details))
                 log.info(f"Saved code-eval results details: {details_path}")
-                
+
     except Exception as e:
         log.error(f"Failed to fetch code-eval results for job {code_eval_job_id}: {e}")
 
@@ -1128,11 +1156,11 @@ async def _sync_running_jobs() -> None:
             remote_status = code_eval_job.get("status", "")
             if remote_status in ("completed", "failed", "cancelled"):
                 error_msg = code_eval_job.get("error_message")
-                
+
                 # Fetch and persist results on success
                 if remote_status == "completed":
                     await _fetch_code_eval_results(job, code_eval_job_id)
-                
+
                 revoke_eval_tokens_for_job(job.id)
                 EvalJobs.update_job_status(
                     id=job.id,
@@ -1300,9 +1328,7 @@ async def schedule_eval_job(
             detail="Scheduled time must be in the future",
         )
 
-    return EvalJobs.update_job_scheduled_for(
-        id=id, scheduled_for=form_data.scheduled_for
-    )
+    return EvalJobs.update_job_scheduled_for(id=id, scheduled_for=form_data.scheduled_for)
 
 
 @router.post("/jobs/{id}/unschedule", response_model=Optional[EvalJobModel])
@@ -1372,12 +1398,12 @@ async def get_eval_job_events(id: str, user=Depends(get_verified_user)):
     result_benchmarks = {}
     if job.eval_type == "language-eval" and job.status in ("completed", "failed"):
         try:
-            all_results = _list_language_eval_results()
+            all_results = await _list_language_eval_results()
             result = next((r for r in all_results if r["id"] == id), None)
             if result:
                 result_benchmarks = result.get("benchmarks", {})
                 disk_id = result.get("language_eval_job_id", id)
-                samples = _load_language_eval_samples(disk_id, result["model"])
+                samples = await _load_language_eval_samples(disk_id, result["model"])
                 if samples and events:
                     for i, event in enumerate(events):
                         if i < len(samples):
@@ -1410,14 +1436,19 @@ async def get_eval_job_events(id: str, user=Depends(get_verified_user)):
         except Exception as e:
             log.warning(f"Failed to enrich events with language-eval results: {e}")
 
-    return {"events": events, "status": job.status, "benchmarks": result_benchmarks, "job": {
-        "id": job.id,
-        "eval_type": job.eval_type,
-        "benchmark": job.benchmark,
-        "model_id": job.model_id,
+    return {
+        "events": events,
         "status": job.status,
-        "meta": job.meta,
-    }}
+        "benchmarks": result_benchmarks,
+        "job": {
+            "id": job.id,
+            "eval_type": job.eval_type,
+            "benchmark": job.benchmark,
+            "model_id": job.model_id,
+            "status": job.status,
+            "meta": job.meta,
+        },
+    }
 
 
 @router.get("/jobs/{id}/live")
@@ -1428,6 +1459,7 @@ async def stream_eval_job_live(id: str, user=Depends(get_verified_user)):
     completions handler when requests arrive with a JIT eval token.
     """
     import asyncio
+
     from selfai_ui.env import DATA_DIR
 
     job = EvalJobs.get_job_by_id(id=id)
@@ -1450,6 +1482,7 @@ async def stream_eval_job_live(id: str, user=Depends(get_verified_user)):
     language_eval_job_id = (job.meta or {}).get("language_eval_job_id") if is_dry_run else None
 
     if language_eval_job_id:
+
         async def generate_proxy():
             try:
                 async with httpx.AsyncClient(timeout=None) as client:
@@ -1464,7 +1497,7 @@ async def stream_eval_job_live(id: str, user=Depends(get_verified_user)):
                                 yield "\n"
             except Exception as e:
                 log.warning(f"Proxy stream error for dry-run job {id}: {e}")
-                yield f"event: error\ndata: {{\"error\": \"Stream proxy failed\"}}\n\n"
+                yield 'event: error\ndata: {"error": "Stream proxy failed"}\n\n'
 
         return StreamingResponse(generate_proxy(), media_type="text/event-stream")
 
@@ -1487,7 +1520,11 @@ async def stream_eval_job_live(id: str, user=Depends(get_verified_user)):
 
             # Check if job is done
             current_job = EvalJobs.get_job_by_id(id=id)
-            if current_job and current_job.status not in ("pending", "queued", "running"):
+            if current_job and current_job.status not in (
+                "pending",
+                "queued",
+                "running",
+            ):
                 # Flush any remaining lines
                 if events_file.exists():
                     try:
@@ -1499,7 +1536,7 @@ async def stream_eval_job_live(id: str, user=Depends(get_verified_user)):
                                 yield f"data: {line}\n\n"
                     except Exception:
                         pass
-                yield f"event: done\ndata: {{\"status\": \"{current_job.status}\"}}\n\n"
+                yield f'event: done\ndata: {{"status": "{current_job.status}"}}\n\n'
                 break
 
             await asyncio.sleep(1)

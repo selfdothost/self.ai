@@ -1,13 +1,13 @@
-from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
 import logging
 from typing import Optional
 
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel
+
+from selfai_ui.env import SRC_LOG_LEVELS
 from selfai_ui.models.memories import Memories, MemoryModel
 from selfai_ui.retrieval.vector.connector import VECTOR_DB_CLIENT
 from selfai_ui.utils.auth import get_verified_user
-from selfai_ui.env import SRC_LOG_LEVELS
-
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MODELS"])
@@ -72,9 +72,7 @@ class QueryMemoryForm(BaseModel):
 
 
 @router.post("/query")
-async def query_memory(
-    request: Request, form_data: QueryMemoryForm, user=Depends(get_verified_user)
-):
+async def query_memory(request: Request, form_data: QueryMemoryForm, user=Depends(get_verified_user)):
     results = VECTOR_DB_CLIENT.search(
         collection_name=f"user-memory-{user.id}",
         vectors=[request.app.state.EMBEDDING_FUNCTION(form_data.content)],
@@ -88,9 +86,7 @@ async def query_memory(
 # ResetMemoryFromVectorDB
 ############################
 @router.post("/reset", response_model=bool)
-async def reset_memory_from_vector_db(
-    request: Request, user=Depends(get_verified_user)
-):
+async def reset_memory_from_vector_db(request: Request, user=Depends(get_verified_user)):
     VECTOR_DB_CLIENT.delete_collection(f"user-memory-{user.id}")
 
     memories = Memories.get_memories_by_user_id(user.id)
@@ -177,9 +173,7 @@ async def delete_memory_by_id(memory_id: str, user=Depends(get_verified_user)):
     result = Memories.delete_memory_by_id_and_user_id(memory_id, user.id)
 
     if result:
-        VECTOR_DB_CLIENT.delete(
-            collection_name=f"user-memory-{user.id}", ids=[memory_id]
-        )
+        VECTOR_DB_CLIENT.delete(collection_name=f"user-memory-{user.id}", ids=[memory_id])
         return True
 
     return False

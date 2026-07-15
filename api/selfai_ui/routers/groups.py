@@ -1,17 +1,14 @@
-import os
-from pathlib import Path
 from typing import Optional
 
-from selfai_ui.models.groups import (
-    Groups,
-    GroupForm,
-    GroupUpdateForm,
-    GroupResponse,
-)
+from fastapi import APIRouter, Depends, HTTPException, status
 
-from selfai_ui.config import CACHE_DIR
 from selfai_ui.constants import ERROR_MESSAGES
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from selfai_ui.models.groups import (
+    GroupForm,
+    GroupResponse,
+    Groups,
+    GroupUpdateForm,
+)
 from selfai_ui.utils.auth import get_admin_user, get_verified_user
 
 router = APIRouter()
@@ -76,9 +73,7 @@ async def get_group_by_id(id: str, user=Depends(get_admin_user)):
 
 
 @router.post("/id/{id}/update", response_model=Optional[GroupResponse])
-async def update_group_by_id(
-    id: str, form_data: GroupUpdateForm, user=Depends(get_admin_user)
-):
+async def update_group_by_id(id: str, form_data: GroupUpdateForm, user=Depends(get_admin_user)):
     try:
         group = Groups.update_group_by_id(id, form_data)
         if group:

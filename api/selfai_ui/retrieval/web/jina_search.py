@@ -1,9 +1,10 @@
 import logging
 
 import requests
-from selfai_ui.retrieval.web.main import SearchResult
-from selfai_ui.env import SRC_LOG_LEVELS
 from yarl import URL
+
+from selfai_ui.env import SRC_LOG_LEVELS
+from selfai_ui.retrieval.web.main import SearchResult
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["RAG"])

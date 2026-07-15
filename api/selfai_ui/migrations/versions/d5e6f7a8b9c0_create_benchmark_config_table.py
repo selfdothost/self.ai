@@ -9,10 +9,10 @@ Create Date: 2026-04-05 00:00:00.000000
 import time
 import uuid
 
-from alembic import op
 import sqlalchemy as sa
-from sqlalchemy.sql import table, column
-from sqlalchemy import Text, Integer, BigInteger
+from alembic import op
+from sqlalchemy import BigInteger, Integer, Text
+from sqlalchemy.sql import column, table
 
 revision = "d5e6f7a8b9c0"
 down_revision = "c4d5e6f7a8b9"
@@ -23,29 +23,29 @@ depends_on = None
 # Admins can adjust max_duration_minutes per benchmark after running real evals.
 SEED_BENCHMARKS = [
     # language-eval benchmarks
-    ("hellaswag",       "language-eval"),
-    ("mmlu",            "language-eval"),
-    ("arc_easy",        "language-eval"),
-    ("arc_challenge",   "language-eval"),
-    ("winogrande",      "language-eval"),
-    ("truthfulqa_mc",   "language-eval"),
-    ("gsm8k",           "language-eval"),
-    ("boolq",           "language-eval"),
-    ("piqa",            "language-eval"),
-    ("openbookqa",      "language-eval"),
-    ("sciq",            "language-eval"),
-    ("logiqa",          "language-eval"),
-    ("mathqa",          "language-eval"),
-    ("copa",            "language-eval"),
+    ("hellaswag", "language-eval"),
+    ("mmlu", "language-eval"),
+    ("arc_easy", "language-eval"),
+    ("arc_challenge", "language-eval"),
+    ("winogrande", "language-eval"),
+    ("truthfulqa_mc", "language-eval"),
+    ("gsm8k", "language-eval"),
+    ("boolq", "language-eval"),
+    ("piqa", "language-eval"),
+    ("openbookqa", "language-eval"),
+    ("sciq", "language-eval"),
+    ("logiqa", "language-eval"),
+    ("mathqa", "language-eval"),
+    ("copa", "language-eval"),
     # code-eval benchmarks
-    ("humaneval",       "code-eval"),
-    ("mbpp",            "code-eval"),
-    ("apps",            "code-eval"),
-    ("multiple_e",      "code-eval"),
-    ("ds1000",          "code-eval"),
-    ("humanevalpack",   "code-eval"),
-    ("mbpp_plus",       "code-eval"),
-    ("humaneval_plus",  "code-eval"),
+    ("humaneval", "code-eval"),
+    ("mbpp", "code-eval"),
+    ("apps", "code-eval"),
+    ("multiple_e", "code-eval"),
+    ("ds1000", "code-eval"),
+    ("humanevalpack", "code-eval"),
+    ("mbpp_plus", "code-eval"),
+    ("humaneval_plus", "code-eval"),
 ]
 
 
@@ -76,26 +76,24 @@ def upgrade():
 
     # Check which (benchmark, eval_type) pairs already exist (idempotent)
     conn = op.get_bind()
-    existing = set(
-        conn.execute(
-            sa.text("SELECT benchmark || '|' || eval_type FROM benchmark_config")
-        ).scalars()
-    )
+    existing = set(conn.execute(sa.text("SELECT benchmark || '|' || eval_type FROM benchmark_config")).scalars())
 
     now = int(time.time())
     rows = []
     for benchmark, eval_type in SEED_BENCHMARKS:
         key = f"{benchmark}|{eval_type}"
         if key not in existing:
-            rows.append({
-                "id": str(uuid.uuid4()),
-                "benchmark": benchmark,
-                "eval_type": eval_type,
-                "max_duration_minutes": 120,
-                "notes": None,
-                "created_at": now,
-                "updated_at": now,
-            })
+            rows.append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "benchmark": benchmark,
+                    "eval_type": eval_type,
+                    "max_duration_minutes": 120,
+                    "notes": None,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
 
     if rows:
         op.bulk_insert(bc, rows)

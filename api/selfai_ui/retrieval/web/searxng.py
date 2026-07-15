@@ -2,8 +2,9 @@ import logging
 from typing import Optional
 
 import requests
-from selfai_ui.retrieval.web.main import SearchResult, get_filtered_results
+
 from selfai_ui.env import SRC_LOG_LEVELS
+from selfai_ui.retrieval.web.main import SearchResult, get_filtered_results
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["RAG"])
@@ -27,10 +28,15 @@ def search_searxng(
         count (int): The maximum number of results to retrieve from the search.
 
     Keyword Args:
-        language (str): Language filter for the search results; e.g., "en-US". Defaults to an empty string.
-        safesearch (int): Safe search filter for safer web results; 0 = off, 1 = moderate, 2 = strict. Defaults to 1 (moderate).
-        time_range (str): Time range for filtering results by date; e.g., "2023-04-05..today" or "all-time". Defaults to ''.
-        categories: (Optional[list[str]]): Specific categories within which the search should be performed, defaulting to an empty string if not provided.
+        language (str): Language filter for the search results; e.g., "en-US".
+            Defaults to an empty string.
+        safesearch (int): Safe search filter for safer web results; 0 = off,
+            1 = moderate, 2 = strict. Defaults to 1 (moderate).
+        time_range (str): Time range for filtering results by date; e.g.,
+            "2023-04-05..today" or "all-time". Defaults to ''.
+        categories: (Optional[list[str]]): Specific categories within which the
+            search should be performed, defaulting to an empty string if not
+            provided.
 
     Returns:
         list[SearchResult]: A list of SearchResults sorted by relevance score in descending order.
@@ -84,8 +90,6 @@ def search_searxng(
     if filter_list:
         sorted_results = get_filtered_results(sorted_results, filter_list)
     return [
-        SearchResult(
-            link=result["url"], title=result.get("title"), snippet=result.get("content")
-        )
+        SearchResult(link=result["url"], title=result.get("title"), snippet=result.get("content"))
         for result in sorted_results[:count]
     ]

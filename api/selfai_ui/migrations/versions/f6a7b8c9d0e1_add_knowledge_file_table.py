@@ -6,13 +6,13 @@ Create Date: 2026-03-26
 
 """
 
-import time
 import logging
+import time
 
-from alembic import op
 import sqlalchemy as sa
-from sqlalchemy.sql import table, column
-from sqlalchemy import String, Text, JSON, BigInteger
+from alembic import op
+from sqlalchemy import JSON, BigInteger, String, Text
+from sqlalchemy.sql import column, table
 
 revision = "f6a7b8c9d0e1"
 down_revision = "e5f6a7b8c9d0"
@@ -26,8 +26,18 @@ def upgrade():
     # 1. Create the knowledge_file join table
     op.create_table(
         "knowledge_file",
-        sa.Column("knowledge_id", sa.Text(), sa.ForeignKey("knowledge.id", ondelete="CASCADE"), primary_key=True),
-        sa.Column("file_id", sa.String(), sa.ForeignKey("file.id", ondelete="CASCADE"), primary_key=True),
+        sa.Column(
+            "knowledge_id",
+            sa.Text(),
+            sa.ForeignKey("knowledge.id", ondelete="CASCADE"),
+            primary_key=True,
+        ),
+        sa.Column(
+            "file_id",
+            sa.String(),
+            sa.ForeignKey("file.id", ondelete="CASCADE"),
+            primary_key=True,
+        ),
         sa.Column("created_at", sa.BigInteger()),
     )
 
@@ -51,9 +61,7 @@ def upgrade():
     now = int(time.time())
 
     kb_rows = connection.execute(
-        sa.select(knowledge_table.c.id, knowledge_table.c.data).where(
-            knowledge_table.c.data.isnot(None)
-        )
+        sa.select(knowledge_table.c.id, knowledge_table.c.data).where(knowledge_table.c.data.isnot(None))
     ).fetchall()
 
     for row in kb_rows:

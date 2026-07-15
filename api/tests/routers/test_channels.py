@@ -56,9 +56,7 @@ def test_delete_channel(authenticated_admin):
         "/api/v1/channels/create",
         json={"name": "to-delete", "description": ""},
     ).json()
-    resp = authenticated_admin.delete(
-        f"/api/v1/channels/{created['id']}/delete"
-    )
+    resp = authenticated_admin.delete(f"/api/v1/channels/{created['id']}/delete")
     assert resp.status_code == 200
 
 
@@ -105,6 +103,7 @@ def test_list_channel_messages(authenticated_admin):
 # Kit: cavekit-ui-router-tests-core-data.md R2 new-AC1..4 (kit AC14-17)
 # ---------------------------------------------------------------------------
 
+
 def _create_channel_with_two_members(authenticated_admin, authenticated_user):
     """Admin creates a public channel (no access_control → all users can read)."""
     return authenticated_admin.post(
@@ -122,9 +121,7 @@ def _post_message(client, channel_id, content="hello"):
 
 def _get_reactions(client, channel_id, message_id):
     """Read message and return its reactions list."""
-    resp = client.get(
-        f"/api/v1/channels/{channel_id}/messages/{message_id}"
-    )
+    resp = client.get(f"/api/v1/channels/{channel_id}/messages/{message_id}")
     return resp.json().get("reactions", [])
 
 
@@ -158,15 +155,11 @@ def test_reaction_idempotency_same_user_same_name(authenticated_admin):
     reactions = _get_reactions(authenticated_admin, ch["id"], msg["id"])
     thumbs = [r for r in reactions if r["name"] == "👍"]
     assert len(thumbs) == 1
-    assert thumbs[0]["count"] == 1, (
-        f"Expected count=1 after duplicate add (idempotent), got {thumbs[0]}"
-    )
+    assert thumbs[0]["count"] == 1, f"Expected count=1 after duplicate add (idempotent), got {thumbs[0]}"
 
 
 @pytest.mark.tier1
-def test_reaction_caller_scoped_removal(
-    client, test_admin, test_user
-):
+def test_reaction_caller_scoped_removal(client, test_admin, test_user):
     """R2 new-AC2: removing caller's reaction leaves others' intact.
 
     NOTE: admin and user share the same underlying client; we swap bearer
@@ -174,7 +167,7 @@ def test_reaction_caller_scoped_removal(
     Use plain  + manual bearer swap to avoid fixture-ordering races.
     """
     # Admin creates channel + message
-    client.headers['Authorization'] = f"Bearer {test_admin['token']}"
+    client.headers["Authorization"] = f"Bearer {test_admin['token']}"
     ch = client.post(
         "/api/v1/channels/create",
         json={"name": "r-scope", "description": ""},
@@ -210,15 +203,12 @@ def test_reaction_caller_scoped_removal(
     assert len(thumbs) == 1
     assert thumbs[0]["count"] == 1
     assert thumbs[0]["user_ids"] == [test_user["id"]], (
-        f"Expected only user B ({test_user['id']}) remaining, "
-        f"got {thumbs[0]['user_ids']}"
+        f"Expected only user B ({test_user['id']}) remaining, " f"got {thumbs[0]['user_ids']}"
     )
 
 
 @pytest.mark.tier1
-def test_reaction_aggregated_shape(
-    authenticated_admin, test_admin, test_user
-):
+def test_reaction_aggregated_shape(authenticated_admin, test_admin, test_user):
     """R2 new-AC3: aggregated response has one entry per name with user_ids + count.
 
     Skips the duplicate-same-user case (covered by T-519 idempotency xfail).
@@ -302,13 +292,12 @@ def test_reply_parent_id_points_to_root(authenticated_admin):
         json={"name": "t-root", "description": ""},
     ).json()
     root = _post_message(authenticated_admin, ch["id"], "root-msg")
-    assert root.get("parent_id") in (None, ""), (
-        f"Root message should have null parent_id, got {root.get('parent_id')!r}"
-    )
+    assert root.get("parent_id") in (
+        None,
+        "",
+    ), f"Root message should have null parent_id, got {root.get('parent_id')!r}"
     reply = _post_reply(authenticated_admin, ch["id"], root["id"]).json()
-    assert reply["parent_id"] == root["id"], (
-        f"Reply parent_id should be {root['id']}, got {reply['parent_id']!r}"
-    )
+    assert reply["parent_id"] == root["id"], f"Reply parent_id should be {root['id']}, got {reply['parent_id']!r}"
 
 
 @pytest.mark.tier1
@@ -328,19 +317,15 @@ def test_grandchild_reply_rejected(authenticated_admin):
     reply = _post_reply(authenticated_admin, ch["id"], root["id"], "reply-1").json()
     # Attempt to reply to the reply (grandchild)
     resp = _post_reply(authenticated_admin, ch["id"], reply["id"], "grandchild")
-    assert 400 <= resp.status_code < 500, (
-        f"Expected 4xx for grandchild reply, got {resp.status_code}: {resp.text[:200]}"
-    )
+    assert (
+        400 <= resp.status_code < 500
+    ), f"Expected 4xx for grandchild reply, got {resp.status_code}: {resp.text[:200]}"
     # Verify no grandchild row — listing replies for `reply` must be empty
-    thread = authenticated_admin.get(
-        f"/api/v1/channels/{ch['id']}/messages/{reply['id']}/thread"
-    ).json()
+    thread = authenticated_admin.get(f"/api/v1/channels/{ch['id']}/messages/{reply['id']}/thread").json()
     # Router includes parent at end of thread list if under limit — so
     # accept either [] or [reply] but never include a grandchild
     grandchildren = [m for m in thread if m.get("parent_id") == reply["id"]]
-    assert len(grandchildren) == 0, (
-        f"Expected no grandchildren, got {len(grandchildren)}: {grandchildren}"
-    )
+    assert len(grandchildren) == 0, f"Expected no grandchildren, got {len(grandchildren)}: {grandchildren}"
 
 
 @pytest.mark.tier1
@@ -358,20 +343,19 @@ def test_reply_listing_children_only_chronological(authenticated_admin):
     ).json()
     root = _post_message(authenticated_admin, ch["id"], "root-msg")
     import time as _t
+
     r1 = _post_reply(authenticated_admin, ch["id"], root["id"], "r1").json()
     _t.sleep(0.001)
     r2 = _post_reply(authenticated_admin, ch["id"], root["id"], "r2").json()
     _t.sleep(0.001)
     r3 = _post_reply(authenticated_admin, ch["id"], root["id"], "r3").json()
 
-    thread = authenticated_admin.get(
-        f"/api/v1/channels/{ch['id']}/messages/{root['id']}/thread"
-    ).json()
+    thread = authenticated_admin.get(f"/api/v1/channels/{ch['id']}/messages/{root['id']}/thread").json()
     # AC: exclude parent, include children only
     ids_in_thread = [m["id"] for m in thread]
-    assert root["id"] not in ids_in_thread, (
-        f"Thread listing must exclude the parent (root) message; got {ids_in_thread}"
-    )
+    assert (
+        root["id"] not in ids_in_thread
+    ), f"Thread listing must exclude the parent (root) message; got {ids_in_thread}"
     assert set(ids_in_thread) == {r1["id"], r2["id"], r3["id"]}
 
 
@@ -393,19 +377,13 @@ def test_cascade_delete_parent_removes_replies(authenticated_admin):
     r2 = _post_reply(authenticated_admin, ch["id"], root["id"], "r2").json()
 
     # Delete the parent
-    del_resp = authenticated_admin.delete(
-        f"/api/v1/channels/{ch['id']}/messages/{root['id']}/delete"
-    )
+    del_resp = authenticated_admin.delete(f"/api/v1/channels/{ch['id']}/messages/{root['id']}/delete")
     assert del_resp.status_code == 200
 
     # Each reply should now be 404 on direct read
     for reply in (r1, r2):
-        resp = authenticated_admin.get(
-            f"/api/v1/channels/{ch['id']}/messages/{reply['id']}"
-        )
-        assert resp.status_code == 404, (
-            f"Expected 404 for deleted reply {reply['id']}, got {resp.status_code}"
-        )
+        resp = authenticated_admin.get(f"/api/v1/channels/{ch['id']}/messages/{reply['id']}")
+        assert resp.status_code == 404, f"Expected 404 for deleted reply {reply['id']}, got {resp.status_code}"
 
 
 @pytest.mark.tier1
@@ -421,21 +399,13 @@ def test_single_reply_delete_leaves_parent_and_siblings(authenticated_admin):
     r3 = _post_reply(authenticated_admin, ch["id"], root["id"], "r3").json()
 
     # Delete only r2
-    del_resp = authenticated_admin.delete(
-        f"/api/v1/channels/{ch['id']}/messages/{r2['id']}/delete"
-    )
+    del_resp = authenticated_admin.delete(f"/api/v1/channels/{ch['id']}/messages/{r2['id']}/delete")
     assert del_resp.status_code == 200
 
     # r2 is gone
-    assert authenticated_admin.get(
-        f"/api/v1/channels/{ch['id']}/messages/{r2['id']}"
-    ).status_code == 404
+    assert authenticated_admin.get(f"/api/v1/channels/{ch['id']}/messages/{r2['id']}").status_code == 404
 
     # Parent and siblings remain readable
     for surviving in (root, r1, r3):
-        resp = authenticated_admin.get(
-            f"/api/v1/channels/{ch['id']}/messages/{surviving['id']}"
-        )
-        assert resp.status_code == 200, (
-            f"Expected 200 for surviving {surviving['id']}, got {resp.status_code}"
-        )
+        resp = authenticated_admin.get(f"/api/v1/channels/{ch['id']}/messages/{surviving['id']}")
+        assert resp.status_code == 200, f"Expected 200 for surviving {surviving['id']}, got {resp.status_code}"

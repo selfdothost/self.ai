@@ -6,8 +6,8 @@ from typing import Optional
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import BigInteger, Boolean, Column, Integer, Text
 
-from selfai_ui.internal.db import Base, get_db
 from selfai_ui.env import SRC_LOG_LEVELS
+from selfai_ui.internal.db import Base, get_db
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MODELS"])
@@ -128,13 +128,15 @@ class JobWindowTable:
                 db.add(window)
                 db.flush()
                 for slot_form in form_data.slots:
-                    db.add(JobWindowSlot(
-                        id=slot_form.id or str(uuid.uuid4()),
-                        window_id=window_id,
-                        job_type=slot_form.job_type,
-                        max_concurrent=slot_form.max_concurrent,
-                        min_remaining_minutes=slot_form.min_remaining_minutes,
-                    ))
+                    db.add(
+                        JobWindowSlot(
+                            id=slot_form.id or str(uuid.uuid4()),
+                            window_id=window_id,
+                            job_type=slot_form.job_type,
+                            max_concurrent=slot_form.max_concurrent,
+                            min_remaining_minutes=slot_form.min_remaining_minutes,
+                        )
+                    )
                 db.commit()
                 db.refresh(window)
                 slots = db.query(JobWindowSlot).filter_by(window_id=window_id).all()
@@ -153,11 +155,13 @@ class JobWindowTable:
             result = []
             for w in windows:
                 slots = db.query(JobWindowSlot).filter_by(window_id=w.id).all()
-                result.append(JobWindowWithSlots(
-                    **JobWindowModel.model_validate(w).model_dump(),
-                    slots=[JobWindowSlotModel.model_validate(s) for s in slots],
-                    status=_window_status(w),
-                ))
+                result.append(
+                    JobWindowWithSlots(
+                        **JobWindowModel.model_validate(w).model_dump(),
+                        slots=[JobWindowSlotModel.model_validate(s) for s in slots],
+                        status=_window_status(w),
+                    )
+                )
             return result
 
     def get_window_by_id(self, id: str) -> Optional[JobWindowWithSlots]:
@@ -181,20 +185,29 @@ class JobWindowTable:
                 window = db.query(JobWindow).filter_by(id=id).first()
                 if not window:
                     return None
-                for key in ("name", "notes", "start_at", "end_at", "preferred_job_type", "enabled"):
+                for key in (
+                    "name",
+                    "notes",
+                    "start_at",
+                    "end_at",
+                    "preferred_job_type",
+                    "enabled",
+                ):
                     if key in form_data:
                         setattr(window, key, form_data[key])
                 window.updated_at = int(time.time())
                 if "slots" in form_data:
                     db.query(JobWindowSlot).filter_by(window_id=id).delete()
                     for slot in form_data["slots"]:
-                        db.add(JobWindowSlot(
-                            id=slot.get("id") or str(uuid.uuid4()),
-                            window_id=id,
-                            job_type=slot["job_type"],
-                            max_concurrent=slot.get("max_concurrent", 1),
-                            min_remaining_minutes=slot.get("min_remaining_minutes", 0),
-                        ))
+                        db.add(
+                            JobWindowSlot(
+                                id=slot.get("id") or str(uuid.uuid4()),
+                                window_id=id,
+                                job_type=slot["job_type"],
+                                max_concurrent=slot.get("max_concurrent", 1),
+                                min_remaining_minutes=slot.get("min_remaining_minutes", 0),
+                            )
+                        )
                 db.commit()
                 db.refresh(window)
                 slots = db.query(JobWindowSlot).filter_by(window_id=id).all()

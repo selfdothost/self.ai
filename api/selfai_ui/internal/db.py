@@ -1,26 +1,23 @@
 import json
 import logging
-import os
 from contextlib import contextmanager
 from typing import Any, Optional
 
-from selfai_ui.internal.wrappers import register_connection
+from sqlalchemy import Dialect, create_engine, types
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import scoped_session, sessionmaker
+from sqlalchemy.pool import NullPool, QueuePool
+from sqlalchemy.sql.type_api import _T
+from typing_extensions import Self
+
 from selfai_ui.env import (
-    SELFAI_UI_DIR,
-    DATABASE_URL,
-    SRC_LOG_LEVELS,
     DATABASE_POOL_MAX_OVERFLOW,
     DATABASE_POOL_RECYCLE,
     DATABASE_POOL_SIZE,
     DATABASE_POOL_TIMEOUT,
+    DATABASE_URL,
+    SRC_LOG_LEVELS,
 )
-from peewee_migrate import Router
-from sqlalchemy import Dialect, create_engine, types
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import scoped_session, sessionmaker
-from sqlalchemy.pool import QueuePool, NullPool
-from sqlalchemy.sql.type_api import _T
-from typing_extensions import Self
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["DB"])
@@ -48,39 +45,9 @@ class JSONField(types.TypeDecorator):
             return json.loads(value)
 
 
-# Workaround to handle the peewee migration
-# This is required to ensure the peewee migration is handled before the alembic migration
-def handle_peewee_migration(DATABASE_URL):
-    # db = None
-    try:
-        # Replace the postgresql:// with postgres:// to handle the peewee migration
-        db = register_connection(DATABASE_URL.replace("postgresql://", "postgres://"))
-        migrate_dir = SELFAI_UI_DIR / "internal" / "migrations"
-        router = Router(db, logger=log, migrate_dir=migrate_dir)
-        router.run()
-        db.close()
-
-    except Exception as e:
-        log.error(f"Failed to initialize the database connection: {e}")
-        raise
-    finally:
-        # Properly closing the database connection
-        if db and not db.is_closed():
-            db.close()
-
-        # Assert if db connection has been closed
-        assert db.is_closed(), "Database connection is still open."
-
-
-if os.environ.get("SKIP_PEEWEE_MIGRATION", "").lower() != "true":
-    handle_peewee_migration(DATABASE_URL)
-
-
 SQLALCHEMY_DATABASE_URL = DATABASE_URL
 if "sqlite" in SQLALCHEMY_DATABASE_URL:
-    engine = create_engine(
-        SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
-    )
+    engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
 else:
     if DATABASE_POOL_SIZE > 0:
         engine = create_engine(
@@ -93,14 +60,10 @@ else:
             poolclass=QueuePool,
         )
     else:
-        engine = create_engine(
-            SQLALCHEMY_DATABASE_URL, pool_pre_ping=True, poolclass=NullPool
-        )
+        engine = create_engine(SQLALCHEMY_DATABASE_URL, pool_pre_ping=True, poolclass=NullPool)
 
 
-SessionLocal = sessionmaker(
-    autocommit=False, autoflush=False, bind=engine, expire_on_commit=False
-)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine, expire_on_commit=False)
 Base = declarative_base()
 Session = scoped_session(SessionLocal)
 

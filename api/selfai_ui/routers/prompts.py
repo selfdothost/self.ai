@@ -1,15 +1,16 @@
 from typing import Optional
 
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+
+from selfai_ui.constants import ERROR_MESSAGES
 from selfai_ui.models.prompts import (
     PromptForm,
-    PromptUserResponse,
     PromptModel,
     Prompts,
+    PromptUserResponse,
 )
-from selfai_ui.constants import ERROR_MESSAGES
-from fastapi import APIRouter, Depends, HTTPException, status, Request
-from selfai_ui.utils.auth import get_admin_user, get_verified_user
 from selfai_ui.utils.access_control import has_access, has_permission
+from selfai_ui.utils.auth import get_verified_user
 
 router = APIRouter()
 
@@ -44,9 +45,7 @@ async def get_prompt_list(user=Depends(get_verified_user)):
 
 
 @router.post("/create", response_model=Optional[PromptModel])
-async def create_new_prompt(
-    request: Request, form_data: PromptForm, user=Depends(get_verified_user)
-):
+async def create_new_prompt(request: Request, form_data: PromptForm, user=Depends(get_verified_user)):
     if user.role != "admin" and not has_permission(
         user.id, "workspace.prompts", request.app.state.config.USER_PERMISSIONS
     ):
@@ -81,11 +80,7 @@ async def get_prompt_by_command(command: str, user=Depends(get_verified_user)):
     prompt = Prompts.get_prompt_by_command(f"/{command}")
 
     if prompt:
-        if (
-            user.role == "admin"
-            or prompt.user_id == user.id
-            or has_access(user.id, "read", prompt.access_control)
-        ):
+        if user.role == "admin" or prompt.user_id == user.id or has_access(user.id, "read", prompt.access_control):
             return prompt
     else:
         raise HTTPException(

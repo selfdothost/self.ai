@@ -11,12 +11,13 @@ Validates that security-relevant configuration defaults are correctly enforced:
 import os
 import subprocess
 import sys
-import pytest
 
+import pytest
 
 # ---------------------------------------------------------------------------
 # T-232: Default JWT secret blocked on startup
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.tier0
 @pytest.mark.security
@@ -34,12 +35,8 @@ def test_default_jwt_secret_blocked_on_startup():
         text=True,
         timeout=30,
     )
-    assert result.returncode != 0, (
-        "Import should fail when WEBUI_SECRET_KEY is the default 't0p-s3cr3t'"
-    )
-    assert "t0p-s3cr3t" in (result.stderr + result.stdout), (
-        "Error message should mention the default secret"
-    )
+    assert result.returncode != 0, "Import should fail when WEBUI_SECRET_KEY is the default 't0p-s3cr3t'"
+    assert "t0p-s3cr3t" in (result.stderr + result.stdout), "Error message should mention the default secret"
 
 
 @pytest.mark.tier0
@@ -65,6 +62,7 @@ def test_empty_jwt_secret_blocked_on_startup():
 # T-233: Security headers, CORS, cookie flags
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.tier0
 @pytest.mark.security
 def test_security_headers_present_in_responses(client):
@@ -82,10 +80,11 @@ def test_security_headers_present_in_responses(client):
 def test_cors_default_is_not_wildcard():
     """CORS default must not be wildcard when no env var is set."""
     from selfai_ui.config import CORS_ALLOW_ORIGIN
+
     # Default should be empty list (same-origin only), not wildcard
-    assert "*" not in CORS_ALLOW_ORIGIN or CORS_ALLOW_ORIGIN == [], (
-        f"CORS default should not include '*' by default. Got: {CORS_ALLOW_ORIGIN}"
-    )
+    assert (
+        "*" not in CORS_ALLOW_ORIGIN or CORS_ALLOW_ORIGIN == []
+    ), f"CORS default should not include '*' by default. Got: {CORS_ALLOW_ORIGIN}"
 
 
 @pytest.mark.tier0
@@ -99,18 +98,20 @@ def test_cookie_secure_default_in_non_dev():
     env.pop("WEBUI_SESSION_COOKIE_SECURE", None)
 
     result = subprocess.run(
-        [sys.executable, "-c",
-         "import selfai_ui.env; "
-         "print('COOKIE_SECURE=' + str(selfai_ui.env.WEBUI_SESSION_COOKIE_SECURE))"],
+        [
+            sys.executable,
+            "-c",
+            "import selfai_ui.env; " "print('COOKIE_SECURE=' + str(selfai_ui.env.WEBUI_SESSION_COOKIE_SECURE))",
+        ],
         env=env,
         capture_output=True,
         text=True,
         timeout=30,
     )
     assert result.returncode == 0, f"Import failed: {result.stderr}"
-    assert "COOKIE_SECURE=True" in result.stdout, (
-        f"Cookie secure should default to True in non-dev. Got: {result.stdout[-500:]}"
-    )
+    assert (
+        "COOKIE_SECURE=True" in result.stdout
+    ), f"Cookie secure should default to True in non-dev. Got: {result.stdout[-500:]}"
 
 
 @pytest.mark.tier0
@@ -124,15 +125,17 @@ def test_cookie_secure_default_in_dev():
     env.pop("WEBUI_SESSION_COOKIE_SECURE", None)
 
     result = subprocess.run(
-        [sys.executable, "-c",
-         "import selfai_ui.env; "
-         "print('COOKIE_SECURE=' + str(selfai_ui.env.WEBUI_SESSION_COOKIE_SECURE))"],
+        [
+            sys.executable,
+            "-c",
+            "import selfai_ui.env; " "print('COOKIE_SECURE=' + str(selfai_ui.env.WEBUI_SESSION_COOKIE_SECURE))",
+        ],
         env=env,
         capture_output=True,
         text=True,
         timeout=30,
     )
     assert result.returncode == 0
-    assert "COOKIE_SECURE=False" in result.stdout, (
-        f"Cookie secure should default to False in dev. Got: {result.stdout[-500:]}"
-    )
+    assert (
+        "COOKIE_SECURE=False" in result.stdout
+    ), f"Cookie secure should default to False in dev. Got: {result.stdout[-500:]}"

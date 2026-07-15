@@ -2,12 +2,21 @@
 #
 # Architecture:
 #   - Uses app.dependency_overrides (not monkey-patching) for DI
-#   - Truncation-based teardown (dual Peewee+SQLAlchemy sessions make
-#     transaction rollback unworkable)
+#   - Truncation-based teardown (transaction rollback doesn't compose with
+#     the app's own session-scoped engine)
 #   - Session-scoped DB engine; function-scoped truncation
-#   - Both Peewee and SQLAlchemy (Alembic) migrations run at session start
+#   - Alembic migrations run at session start
 #
 import os
+
+# ---------------------------------------------------------------------------
+# Override env BEFORE importing any selfai_ui modules.
+# Use direct assignment (not setdefault) because container env may have
+# empty values that would block setdefault but still fail validation.
+# ---------------------------------------------------------------------------
+# Use a file-backed SQLite DB so all connections (alembic, test engine,
+# app engine) see the same database. In-memory DBs are per-connection.
+import tempfile as _tempfile  # noqa: E402
 import time
 import uuid
 from contextlib import contextmanager
@@ -18,66 +27,44 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
-# ---------------------------------------------------------------------------
-# Override env BEFORE importing any selfai_ui modules.
-# Use direct assignment (not setdefault) because container env may have
-# empty values that would block setdefault but still fail validation.
-# ---------------------------------------------------------------------------
-# Use a file-backed SQLite DB so all connections (alembic, test engine,
-# app engine) see the same database. In-memory DBs are per-connection.
-import tempfile as _tempfile  # noqa: E402
-
-_test_db_file = _tempfile.NamedTemporaryFile(
-    prefix="selfai_test_", suffix=".db", delete=False
-)
+_test_db_file = _tempfile.NamedTemporaryFile(prefix="selfai_test_", suffix=".db", delete=False)
 _test_db_file.close()
-os.environ["DATABASE_URL"] = os.environ.get(
-    "TEST_DATABASE_URL", f"sqlite:///{_test_db_file.name}"
-)
+os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", f"sqlite:///{_test_db_file.name}")
 os.environ["WEBUI_SECRET_KEY"] = "test-secret-key-not-for-production"
 os.environ["ENV"] = "test"
 os.environ["WEBUI_AUTH"] = "True"
-os.environ["SKIP_PEEWEE_MIGRATION"] = "true"
+# service_auth.py (self.ai#25) raises ServiceAuthNotConfigured if this is
+# unset, which any test exercising a real llamolotl-calling code path (job
+# cancel/sync, model pull, etc.) will hit even though the actual HTTP call is
+# mocked (aioresponses/respx) -- minting happens before the request is made.
+# Downstream ticket *validation* is self.llamolotl's own test suite's concern,
+# not this one's, so any non-empty value is fine here.
+os.environ["SERVICE_AUTH_SECRET"] = "test-service-auth-secret-not-for-production"
 
-from selfai_ui.internal.db import Base, engine as _real_engine, get_db, get_session  # noqa: E402
-from selfai_ui.utils.auth import create_token  # noqa: E402
+from pathlib import Path as _Path  # noqa: E402
+
+from alembic import command as _alembic_command  # noqa: E402
 
 # Run Alembic migrations against the test DB BEFORE importing selfai_ui.config.
 # This is necessary because selfai_ui.config runs get_config() at module load
 # time, which queries the config table.
 from alembic.config import Config as _AlembicConfig  # noqa: E402
-from alembic import command as _alembic_command  # noqa: E402
-from pathlib import Path as _Path  # noqa: E402
+
+from selfai_ui.internal.db import get_session  # noqa: E402
+from selfai_ui.utils.auth import create_token  # noqa: E402
 
 _alembic_ini = _Path("/app/backend/selfai_ui/alembic.ini")
 if not _alembic_ini.exists():
     _alembic_ini = _Path(__file__).parent.parent / "selfai_ui" / "alembic.ini"
 
+_alembic_migrations = _Path("/app/backend/selfai_ui/migrations")
+if not _alembic_migrations.exists():
+    _alembic_migrations = _Path(__file__).parent.parent / "selfai_ui" / "migrations"
+
 _alembic_cfg = _AlembicConfig(str(_alembic_ini))
 _alembic_cfg.set_main_option("sqlalchemy.url", os.environ["DATABASE_URL"])
-_alembic_cfg.set_main_option(
-    "script_location",
-    str(_Path("/app/backend/selfai_ui/migrations")),
-)
+_alembic_cfg.set_main_option("script_location", str(_alembic_migrations))
 _alembic_command.upgrade(_alembic_cfg, "head")
-
-# Apply the Peewee-only schema additions (migration 019 on curator_job).
-# This documents the hybrid migration gap — the columns exist in the
-# SQLAlchemy model but only in a Peewee migration file.
-from sqlalchemy import create_engine as _ce, text as _t  # noqa: E402
-
-_patch_engine = _ce(os.environ["DATABASE_URL"])
-with _patch_engine.connect() as _conn:
-    try:
-        _conn.execute(_t("ALTER TABLE curator_job ADD COLUMN dataset_name TEXT"))
-    except Exception:
-        pass  # Column may already exist
-    try:
-        _conn.execute(_t("ALTER TABLE curator_job ADD COLUMN created_knowledge_id TEXT"))
-    except Exception:
-        pass
-    _conn.commit()
-_patch_engine.dispose()
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +95,7 @@ _SEED_BENCHMARKS = [
 def _reseed_benchmarks(engine):
     """Re-seed benchmark_config after truncation."""
     import uuid as _uuid
+
     now = int(time.time())
     with engine.connect() as conn:
         for benchmark, eval_type in _SEED_BENCHMARKS:
@@ -155,6 +143,7 @@ TRUNCATION_ORDER = [
 # Session-scoped: engine + schema
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(scope="session")
 def test_engine():
     """Create a test database engine pointing at the same file-backed SQLite
@@ -171,14 +160,13 @@ def test_engine():
 @pytest.fixture(scope="session")
 def test_session_factory(test_engine):
     """SessionLocal replacement bound to the test engine."""
-    return sessionmaker(
-        autocommit=False, autoflush=False, bind=test_engine, expire_on_commit=False
-    )
+    return sessionmaker(autocommit=False, autoflush=False, bind=test_engine, expire_on_commit=False)
 
 
 # ---------------------------------------------------------------------------
 # Function-scoped: session + truncation
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 def seeded_benchmarks(test_engine):
@@ -207,6 +195,7 @@ def db_session(test_session_factory, test_engine):
 
     # Patch get_db in modules that import it directly (bypass DI)
     import selfai_ui.internal.db as db_module
+
     patched_modules = [db_module]
     for mod_name in [
         "selfai_ui.models.job_windows",
@@ -256,9 +245,11 @@ def db_session(test_session_factory, test_engine):
 # Override get_db to use test session
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def _override_db(test_session_factory):
     """Override the app's get_db dependency to use our test session factory."""
+
     @contextmanager
     def _test_get_db():
         session = test_session_factory()
@@ -268,11 +259,13 @@ def _override_db(test_session_factory):
             session.close()
 
     from selfai_ui.main import app
+
     original_override = app.dependency_overrides.copy()
     app.dependency_overrides[get_session] = lambda: _test_get_db()
 
     # Also patch module-level get_db for model classes that call it directly
     import selfai_ui.internal.db as db_module
+
     original_get_db = db_module.get_db
     db_module.get_db = _test_get_db
 
@@ -286,6 +279,7 @@ def _override_db(test_session_factory):
 # Startup task isolation (T-219)
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def _isolate_startup_tasks():
     """Prevent fire-and-forget startup tasks from running during tests.
@@ -293,10 +287,11 @@ def _isolate_startup_tasks():
     NOT autouse — only applies when test_app fixture is requested.
     Existing model-only tests don't import main.py and don't need this.
     """
-    with patch("selfai_ui.main.periodic_usage_pool_cleanup", new_callable=AsyncMock), \
-         patch("selfai_ui.main._resume_crawl_jobs", new_callable=AsyncMock), \
-         patch("selfai_ui.main._run_gpu_queue", new_callable=AsyncMock), \
-         patch("selfai_ui.main._ensure_curator_classifier_models", new_callable=AsyncMock):
+    with patch("selfai_ui.main.periodic_usage_pool_cleanup", new_callable=AsyncMock), patch(
+        "selfai_ui.main._resume_crawl_jobs", new_callable=AsyncMock
+    ), patch("selfai_ui.main._run_gpu_queue", new_callable=AsyncMock), patch(
+        "selfai_ui.main._ensure_curator_classifier_models", new_callable=AsyncMock
+    ):
         yield
 
 
@@ -304,10 +299,12 @@ def _isolate_startup_tasks():
 # Test app / client fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def test_app(_override_db, _isolate_startup_tasks):
     """Provide the FastAPI app with test overrides applied."""
     from selfai_ui.main import app
+
     return app
 
 
@@ -321,6 +318,7 @@ def client(test_app):
 # ---------------------------------------------------------------------------
 # Auth helper fixtures
 # ---------------------------------------------------------------------------
+
 
 def _create_test_user(db_session, role="user"):
     """Insert a test user + auth record, return (user_model, jwt_token)."""
@@ -345,10 +343,7 @@ def _create_test_user(db_session, role="user"):
         },
     )
     db_session.execute(
-        text(
-            "INSERT INTO [auth] (id, email, password, active) "
-            "VALUES (:id, :email, :password, :active)"
-        ),
+        text("INSERT INTO [auth] (id, email, password, active) " "VALUES (:id, :email, :password, :active)"),
         {"id": user_id, "email": email, "password": "unused-in-tests", "active": True},
     )
     db_session.commit()

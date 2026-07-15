@@ -1,27 +1,23 @@
 import asyncio
-import socketio
 import logging
 import sys
 import time
 
-from selfai_ui.models.users import Users, UserNameResponse
-from selfai_ui.models.channels import Channels
-from selfai_ui.models.chats import Chats
+import socketio
 
 from selfai_ui.env import (
     ENABLE_WEBSOCKET_SUPPORT,
+    GLOBAL_LOG_LEVEL,
+    REDIS_KEY_PREFIX,
+    SRC_LOG_LEVELS,
     WEBSOCKET_MANAGER,
     WEBSOCKET_REDIS_URL,
-    REDIS_KEY_PREFIX,
 )
-from selfai_ui.utils.auth import decode_token
+from selfai_ui.models.channels import Channels
+from selfai_ui.models.chats import Chats
+from selfai_ui.models.users import UserNameResponse, Users
 from selfai_ui.socket.utils import RedisDict, RedisLock
-
-from selfai_ui.env import (
-    GLOBAL_LOG_LEVEL,
-    SRC_LOG_LEVELS,
-)
-
+from selfai_ui.utils.auth import decode_token
 
 logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
 log = logging.getLogger(__name__)
@@ -55,15 +51,9 @@ TIMEOUT_DURATION = 3
 
 if WEBSOCKET_MANAGER == "redis":
     log.debug("Using Redis to manage websockets.")
-    SESSION_POOL = RedisDict(
-        f"{REDIS_KEY_PREFIX}:session_pool", redis_url=WEBSOCKET_REDIS_URL
-    )
-    USER_POOL = RedisDict(
-        f"{REDIS_KEY_PREFIX}:user_pool", redis_url=WEBSOCKET_REDIS_URL
-    )
-    USAGE_POOL = RedisDict(
-        f"{REDIS_KEY_PREFIX}:usage_pool", redis_url=WEBSOCKET_REDIS_URL
-    )
+    SESSION_POOL = RedisDict(f"{REDIS_KEY_PREFIX}:session_pool", redis_url=WEBSOCKET_REDIS_URL)
+    USER_POOL = RedisDict(f"{REDIS_KEY_PREFIX}:user_pool", redis_url=WEBSOCKET_REDIS_URL)
+    USAGE_POOL = RedisDict(f"{REDIS_KEY_PREFIX}:usage_pool", redis_url=WEBSOCKET_REDIS_URL)
 
     clean_up_lock = RedisLock(
         redis_url=WEBSOCKET_REDIS_URL,
@@ -88,7 +78,7 @@ async def periodic_usage_pool_cleanup():
     try:
         while True:
             if not renew_func():
-                log.error(f"Unable to renew cleanup lock. Exiting usage pool cleanup.")
+                log.error("Unable to renew cleanup lock. Exiting usage pool cleanup.")
                 raise Exception("Unable to renew usage pool cleanup lock.")
 
             now = int(time.time())
@@ -96,9 +86,7 @@ async def periodic_usage_pool_cleanup():
             for model_id, connections in list(USAGE_POOL.items()):
                 # Creating a list of sids to remove if they have timed out
                 expired_sids = [
-                    sid
-                    for sid, details in connections.items()
-                    if now - details["updated_at"] > TIMEOUT_DURATION
+                    sid for sid, details in connections.items() if now - details["updated_at"] > TIMEOUT_DURATION
                 ]
 
                 for sid in expired_sids:
@@ -278,9 +266,7 @@ async def disconnect(sid):
 def get_event_emitter(request_info):
     async def __event_emitter__(event_data):
         user_id = request_info["user_id"]
-        session_ids = list(
-            set(USER_POOL.get(user_id, []) + [request_info["session_id"]])
-        )
+        session_ids = list(set(USER_POOL.get(user_id, []) + [request_info["session_id"]]))
 
         for session_id in session_ids:
             await sio.emit(
@@ -360,11 +346,7 @@ def get_user_ids_from_room(room):
         room=room,
     )
 
-    active_user_ids = list(
-        set(
-            [SESSION_POOL.get(session_id[0])["id"] for session_id in active_session_ids]
-        )
-    )
+    active_user_ids = list(set([SESSION_POOL.get(session_id[0])["id"] for session_id in active_session_ids]))
     return active_user_ids
 
 

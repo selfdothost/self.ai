@@ -1,9 +1,34 @@
-from fastapi import APIRouter, Depends, HTTPException, Response, status, Request
-from fastapi.responses import JSONResponse, RedirectResponse
-
-from pydantic import BaseModel, ConfigDict
-from typing import Any, Optional
 import logging
+from typing import Any, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict
+
+from selfai_ui.config import (
+    DEFAULT_AUTOCOMPLETE_GENERATION_PROMPT_TEMPLATE,
+    DEFAULT_EMOJI_GENERATION_PROMPT_TEMPLATE,
+    DEFAULT_MOA_GENERATION_PROMPT_TEMPLATE,
+    DEFAULT_QUERY_GENERATION_PROMPT_TEMPLATE,
+    DEFAULT_TAGS_GENERATION_PROMPT_TEMPLATE,
+    DEFAULT_TITLE_GENERATION_PROMPT_TEMPLATE,
+)
+from selfai_ui.constants import TASKS
+from selfai_ui.env import SRC_LOG_LEVELS
+from selfai_ui.utils.auth import get_admin_user, get_verified_user
+from selfai_ui.utils.chat import generate_chat_completion
+from selfai_ui.utils.task import (
+    autocomplete_generation_template,
+    emoji_generation_template,
+    get_task_model_id,
+    moa_response_generation_template,
+    query_generation_template,
+    tags_generation_template,
+    title_generation_template,
+)
+
+log = logging.getLogger(__name__)
+log.setLevel(SRC_LOG_LEVELS["MODELS"])
 
 
 class TaskFormData(BaseModel):
@@ -12,6 +37,7 @@ class TaskFormData(BaseModel):
     All task endpoints require `model`; other fields are endpoint-specific
     and validated at the handler level.
     """
+
     model_config = ConfigDict(extra="ignore")
 
     model: str
@@ -22,34 +48,6 @@ class TaskFormData(BaseModel):
     type: Optional[str] = None
     stream: Optional[bool] = False
 
-from selfai_ui.utils.chat import generate_chat_completion
-from selfai_ui.utils.task import (
-    title_generation_template,
-    query_generation_template,
-    autocomplete_generation_template,
-    tags_generation_template,
-    emoji_generation_template,
-    moa_response_generation_template,
-)
-from selfai_ui.utils.auth import get_admin_user, get_verified_user
-from selfai_ui.constants import TASKS
-
-from selfai_ui.routers.pipelines import process_pipeline_inlet_filter
-from selfai_ui.utils.task import get_task_model_id
-
-from selfai_ui.config import (
-    DEFAULT_TITLE_GENERATION_PROMPT_TEMPLATE,
-    DEFAULT_TAGS_GENERATION_PROMPT_TEMPLATE,
-    DEFAULT_QUERY_GENERATION_PROMPT_TEMPLATE,
-    DEFAULT_AUTOCOMPLETE_GENERATION_PROMPT_TEMPLATE,
-    DEFAULT_EMOJI_GENERATION_PROMPT_TEMPLATE,
-    DEFAULT_MOA_GENERATION_PROMPT_TEMPLATE,
-)
-from selfai_ui.env import SRC_LOG_LEVELS
-
-
-log = logging.getLogger(__name__)
-log.setLevel(SRC_LOG_LEVELS["MODELS"])
 
 router = APIRouter()
 
@@ -93,39 +91,23 @@ class TaskConfigForm(BaseModel):
 
 
 @router.post("/config/update")
-async def update_task_config(
-    request: Request, form_data: TaskConfigForm, user=Depends(get_admin_user)
-):
+async def update_task_config(request: Request, form_data: TaskConfigForm, user=Depends(get_admin_user)):
     request.app.state.config.TASK_MODEL = form_data.TASK_MODEL
     request.app.state.config.TASK_MODEL_EXTERNAL = form_data.TASK_MODEL_EXTERNAL
-    request.app.state.config.TITLE_GENERATION_PROMPT_TEMPLATE = (
-        form_data.TITLE_GENERATION_PROMPT_TEMPLATE
-    )
+    request.app.state.config.TITLE_GENERATION_PROMPT_TEMPLATE = form_data.TITLE_GENERATION_PROMPT_TEMPLATE
 
-    request.app.state.config.ENABLE_AUTOCOMPLETE_GENERATION = (
-        form_data.ENABLE_AUTOCOMPLETE_GENERATION
-    )
+    request.app.state.config.ENABLE_AUTOCOMPLETE_GENERATION = form_data.ENABLE_AUTOCOMPLETE_GENERATION
     request.app.state.config.AUTOCOMPLETE_GENERATION_INPUT_MAX_LENGTH = (
         form_data.AUTOCOMPLETE_GENERATION_INPUT_MAX_LENGTH
     )
 
-    request.app.state.config.TAGS_GENERATION_PROMPT_TEMPLATE = (
-        form_data.TAGS_GENERATION_PROMPT_TEMPLATE
-    )
+    request.app.state.config.TAGS_GENERATION_PROMPT_TEMPLATE = form_data.TAGS_GENERATION_PROMPT_TEMPLATE
     request.app.state.config.ENABLE_TAGS_GENERATION = form_data.ENABLE_TAGS_GENERATION
-    request.app.state.config.ENABLE_SEARCH_QUERY_GENERATION = (
-        form_data.ENABLE_SEARCH_QUERY_GENERATION
-    )
-    request.app.state.config.ENABLE_RETRIEVAL_QUERY_GENERATION = (
-        form_data.ENABLE_RETRIEVAL_QUERY_GENERATION
-    )
+    request.app.state.config.ENABLE_SEARCH_QUERY_GENERATION = form_data.ENABLE_SEARCH_QUERY_GENERATION
+    request.app.state.config.ENABLE_RETRIEVAL_QUERY_GENERATION = form_data.ENABLE_RETRIEVAL_QUERY_GENERATION
 
-    request.app.state.config.QUERY_GENERATION_PROMPT_TEMPLATE = (
-        form_data.QUERY_GENERATION_PROMPT_TEMPLATE
-    )
-    request.app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE = (
-        form_data.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE
-    )
+    request.app.state.config.QUERY_GENERATION_PROMPT_TEMPLATE = form_data.QUERY_GENERATION_PROMPT_TEMPLATE
+    request.app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE = form_data.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE
 
     return {
         "TASK_MODEL": request.app.state.config.TASK_MODEL,
@@ -143,9 +125,7 @@ async def update_task_config(
 
 
 @router.post("/title/completions")
-async def generate_title(
-    request: Request, form_data: TaskFormData, user=Depends(get_verified_user)
-):
+async def generate_title(request: Request, form_data: TaskFormData, user=Depends(get_verified_user)):
     models = request.app.state.MODELS
 
     model_id = form_data.model
@@ -164,9 +144,7 @@ async def generate_title(
         models,
     )
 
-    log.debug(
-        f"generating chat title using model {task_model_id} for user {user.email} "
-    )
+    log.debug(f"generating chat title using model {task_model_id} for user {user.email} ")
 
     if request.app.state.config.TITLE_GENERATION_PROMPT_TEMPLATE != "":
         template = request.app.state.config.TITLE_GENERATION_PROMPT_TEMPLATE
@@ -202,7 +180,7 @@ async def generate_title(
 
     try:
         return await generate_chat_completion(request, form_data=payload, user=user)
-    except Exception as e:
+    except Exception:
         log.error("Exception occurred", exc_info=True)
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -211,9 +189,7 @@ async def generate_title(
 
 
 @router.post("/tags/completions")
-async def generate_chat_tags(
-    request: Request, form_data: TaskFormData, user=Depends(get_verified_user)
-):
+async def generate_chat_tags(request: Request, form_data: TaskFormData, user=Depends(get_verified_user)):
 
     if not request.app.state.config.ENABLE_TAGS_GENERATION:
         return JSONResponse(
@@ -239,18 +215,14 @@ async def generate_chat_tags(
         models,
     )
 
-    log.debug(
-        f"generating chat tags using model {task_model_id} for user {user.email} "
-    )
+    log.debug(f"generating chat tags using model {task_model_id} for user {user.email} ")
 
     if request.app.state.config.TAGS_GENERATION_PROMPT_TEMPLATE != "":
         template = request.app.state.config.TAGS_GENERATION_PROMPT_TEMPLATE
     else:
         template = DEFAULT_TAGS_GENERATION_PROMPT_TEMPLATE
 
-    content = tags_generation_template(
-        template, form_data.messages, {"name": user.name}
-    )
+    content = tags_generation_template(template, form_data.messages, {"name": user.name})
 
     payload = {
         "model": task_model_id,
@@ -274,22 +246,20 @@ async def generate_chat_tags(
 
 
 @router.post("/queries/completions")
-async def generate_queries(
-    request: Request, form_data: TaskFormData, user=Depends(get_verified_user)
-):
+async def generate_queries(request: Request, form_data: TaskFormData, user=Depends(get_verified_user)):
 
     type = form_data.type
     if type == "web_search":
         if not request.app.state.config.ENABLE_SEARCH_QUERY_GENERATION:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Search query generation is disabled",
+                detail="Search query generation is disabled",
             )
     elif type == "retrieval":
         if not request.app.state.config.ENABLE_RETRIEVAL_QUERY_GENERATION:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Query generation is disabled",
+                detail="Query generation is disabled",
             )
 
     models = request.app.state.MODELS
@@ -310,18 +280,14 @@ async def generate_queries(
         models,
     )
 
-    log.debug(
-        f"generating {type} queries using model {task_model_id} for user {user.email}"
-    )
+    log.debug(f"generating {type} queries using model {task_model_id} for user {user.email}")
 
     if (request.app.state.config.QUERY_GENERATION_PROMPT_TEMPLATE).strip() != "":
         template = request.app.state.config.QUERY_GENERATION_PROMPT_TEMPLATE
     else:
         template = DEFAULT_QUERY_GENERATION_PROMPT_TEMPLATE
 
-    content = query_generation_template(
-        template, form_data.messages, {"name": user.name}
-    )
+    content = query_generation_template(template, form_data.messages, {"name": user.name})
 
     payload = {
         "model": task_model_id,
@@ -344,13 +310,11 @@ async def generate_queries(
 
 
 @router.post("/auto/completions")
-async def generate_autocompletion(
-    request: Request, form_data: TaskFormData, user=Depends(get_verified_user)
-):
+async def generate_autocompletion(request: Request, form_data: TaskFormData, user=Depends(get_verified_user)):
     if not request.app.state.config.ENABLE_AUTOCOMPLETE_GENERATION:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Autocompletion generation is disabled",
+            detail="Autocompletion generation is disabled",
         )
 
     type = form_data.type
@@ -358,13 +322,13 @@ async def generate_autocompletion(
     messages = form_data.messages
 
     if request.app.state.config.AUTOCOMPLETE_GENERATION_INPUT_MAX_LENGTH > 0:
-        if (
-            len(prompt)
-            > request.app.state.config.AUTOCOMPLETE_GENERATION_INPUT_MAX_LENGTH
-        ):
+        if len(prompt) > request.app.state.config.AUTOCOMPLETE_GENERATION_INPUT_MAX_LENGTH:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Input prompt exceeds maximum length of {request.app.state.config.AUTOCOMPLETE_GENERATION_INPUT_MAX_LENGTH}",
+                detail=(
+                    "Input prompt exceeds maximum length of "
+                    f"{request.app.state.config.AUTOCOMPLETE_GENERATION_INPUT_MAX_LENGTH}"
+                ),
             )
 
     models = request.app.state.MODELS
@@ -385,18 +349,14 @@ async def generate_autocompletion(
         models,
     )
 
-    log.debug(
-        f"generating autocompletion using model {task_model_id} for user {user.email}"
-    )
+    log.debug(f"generating autocompletion using model {task_model_id} for user {user.email}")
 
     if (request.app.state.config.AUTOCOMPLETE_GENERATION_PROMPT_TEMPLATE).strip() != "":
         template = request.app.state.config.AUTOCOMPLETE_GENERATION_PROMPT_TEMPLATE
     else:
         template = DEFAULT_AUTOCOMPLETE_GENERATION_PROMPT_TEMPLATE
 
-    content = autocomplete_generation_template(
-        template, prompt, messages, type, {"name": user.name}
-    )
+    content = autocomplete_generation_template(template, prompt, messages, type, {"name": user.name})
 
     payload = {
         "model": task_model_id,
@@ -420,9 +380,7 @@ async def generate_autocompletion(
 
 
 @router.post("/emoji/completions")
-async def generate_emoji(
-    request: Request, form_data: TaskFormData, user=Depends(get_verified_user)
-):
+async def generate_emoji(request: Request, form_data: TaskFormData, user=Depends(get_verified_user)):
 
     models = request.app.state.MODELS
 
@@ -467,7 +425,10 @@ async def generate_emoji(
             }
         ),
         "chat_id": form_data.chat_id,
-        "metadata": {"task": str(TASKS.EMOJI_GENERATION), "task_body": form_data.model_dump()},
+        "metadata": {
+            "task": str(TASKS.EMOJI_GENERATION),
+            "task_body": form_data.model_dump(),
+        },
     }
 
     try:
@@ -480,9 +441,7 @@ async def generate_emoji(
 
 
 @router.post("/moa/completions")
-async def generate_moa_response(
-    request: Request, form_data: TaskFormData, user=Depends(get_verified_user)
-):
+async def generate_moa_response(request: Request, form_data: TaskFormData, user=Depends(get_verified_user)):
 
     models = request.app.state.MODELS
     model_id = form_data.model

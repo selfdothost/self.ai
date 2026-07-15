@@ -24,9 +24,7 @@ def test_create_eval_job_code_eval(authenticated_admin, seeded_benchmarks):
             "model_id": "test-model",
         },
     )
-    assert resp.status_code == 200, (
-        f"Eval create returned {resp.status_code}: {resp.text[:200]}"
-    )
+    assert resp.status_code == 200, f"Eval create returned {resp.status_code}: {resp.text[:200]}"
     body = resp.json()
     assert body["eval_type"] == "code-eval"
     assert body["benchmark"] == "humaneval"
@@ -42,9 +40,7 @@ def test_create_eval_job_language_eval(authenticated_admin, seeded_benchmarks):
             "model_id": "test-model",
         },
     )
-    assert resp.status_code == 200, (
-        f"Eval create returned {resp.status_code}: {resp.text[:200]}"
-    )
+    assert resp.status_code == 200, f"Eval create returned {resp.status_code}: {resp.text[:200]}"
     assert resp.json()["eval_type"] == "language-eval"
 
 
@@ -66,17 +62,13 @@ def test_user_without_permission_cannot_create_eval_job(
 
 @pytest.mark.tier0
 def test_cancel_nonexistent_eval_job(authenticated_admin):
-    resp = authenticated_admin.post(
-        "/api/v1/evaluations/jobs/nonexistent/cancel"
-    )
+    resp = authenticated_admin.post("/api/v1/evaluations/jobs/nonexistent/cancel")
     assert resp.status_code in (400, 404)
 
 
 @pytest.mark.tier0
 def test_delete_nonexistent_eval_job(authenticated_admin):
-    resp = authenticated_admin.delete(
-        "/api/v1/evaluations/jobs/nonexistent/delete"
-    )
+    resp = authenticated_admin.delete("/api/v1/evaluations/jobs/nonexistent/delete")
     assert resp.status_code in (400, 404)
 
 
@@ -89,6 +81,7 @@ def test_get_eval_config(authenticated_admin):
 # ---------------------------------------------------------------------------
 # Feedbacks sub-resource
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.tier0
 def test_get_user_feedbacks(authenticated_user):
@@ -114,6 +107,4 @@ def test_create_feedback(authenticated_user):
             "meta": {},
         },
     )
-    assert resp.status_code == 200, (
-        f"Feedback create returned {resp.status_code}: {resp.text[:200]}"
-    )
+    assert resp.status_code == 200, f"Feedback create returned {resp.status_code}: {resp.text[:200]}"

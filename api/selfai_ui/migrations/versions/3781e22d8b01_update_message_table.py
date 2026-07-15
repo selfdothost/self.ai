@@ -6,8 +6,8 @@ Create Date: 2024-12-30 03:00:00.000000
 
 """
 
-from alembic import op
 import sqlalchemy as sa
+from alembic import op
 
 revision = "3781e22d8b01"
 down_revision = "7826ab40b532"
@@ -34,31 +34,19 @@ def upgrade():
 
     op.create_table(
         "message_reaction",
-        sa.Column(
-            "id", sa.Text(), nullable=False, primary_key=True, unique=True
-        ),  # Unique reaction ID
+        sa.Column("id", sa.Text(), nullable=False, primary_key=True, unique=True),  # Unique reaction ID
         sa.Column("user_id", sa.Text(), nullable=False),  # User who reacted
-        sa.Column(
-            "message_id", sa.Text(), nullable=False
-        ),  # Message that was reacted to
-        sa.Column(
-            "name", sa.Text(), nullable=False
-        ),  # Reaction name (e.g. "thumbs_up")
-        sa.Column(
-            "created_at", sa.BigInteger(), nullable=True
-        ),  # Timestamp of when the reaction was added
+        sa.Column("message_id", sa.Text(), nullable=False),  # Message that was reacted to
+        sa.Column("name", sa.Text(), nullable=False),  # Reaction name (e.g. "thumbs_up")
+        sa.Column("created_at", sa.BigInteger(), nullable=True),  # Timestamp of when the reaction was added
     )
 
     op.create_table(
         "channel_member",
-        sa.Column(
-            "id", sa.Text(), nullable=False, primary_key=True, unique=True
-        ),  # Record ID for the membership row
+        sa.Column("id", sa.Text(), nullable=False, primary_key=True, unique=True),  # Record ID for the membership row
         sa.Column("channel_id", sa.Text(), nullable=False),  # Associated channel
         sa.Column("user_id", sa.Text(), nullable=False),  # Associated user
-        sa.Column(
-            "created_at", sa.BigInteger(), nullable=True
-        ),  # Timestamp of when the user joined the channel
+        sa.Column("created_at", sa.BigInteger(), nullable=True),  # Timestamp of when the user joined the channel
     )
 
 

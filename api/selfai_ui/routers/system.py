@@ -1,7 +1,7 @@
 import os
+import platform
 import re
 import time
-import platform
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -22,20 +22,14 @@ _COMPOSE_PROJECT = None
 try:
     import docker as docker_lib
 
-    _docker_client = docker_lib.DockerClient(
-        base_url="unix:///var/run/docker.sock", timeout=5
-    )
+    _docker_client = docker_lib.DockerClient(base_url="unix:///var/run/docker.sock", timeout=5)
     _docker_client.ping()
     DOCKER_AVAILABLE = True
 
     # Detect our compose project from the selfUI container's label
-    _self_containers = _docker_client.containers.list(
-        filters={"name": "selfUI"}
-    )
+    _self_containers = _docker_client.containers.list(filters={"name": "selfUI"})
     if _self_containers:
-        _COMPOSE_PROJECT = _self_containers[0].labels.get(
-            "com.docker.compose.project"
-        )
+        _COMPOSE_PROJECT = _self_containers[0].labels.get("com.docker.compose.project")
 except Exception:
     _docker_client = None
     DOCKER_AVAILABLE = False
@@ -301,19 +295,9 @@ def _get_docker_processes() -> list[dict]:
                     try:
                         pid = int(row[pid_idx]) if pid_idx is not None else 0
                         name = row[cmd_idx] if cmd_idx is not None else "unknown"
-                        name = (
-                            name.split("/")[-1].split(" ")[0]
-                            if name
-                            else "unknown"
-                        )
-                        cpu_pct = (
-                            float(row[cpu_idx]) if cpu_idx is not None else 0.0
-                        )
-                        memory_mb = (
-                            float(row[rss_idx]) / 1024.0
-                            if rss_idx is not None
-                            else 0.0
-                        )
+                        name = name.split("/")[-1].split(" ")[0] if name else "unknown"
+                        cpu_pct = float(row[cpu_idx]) if cpu_idx is not None else 0.0
+                        memory_mb = float(row[rss_idx]) / 1024.0 if rss_idx is not None else 0.0
 
                         processes.append(
                             {

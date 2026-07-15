@@ -68,9 +68,7 @@ def test_delete_course(authenticated_admin):
         "/api/v1/training/courses/create",
         json={"name": "Del", "description": ""},
     ).json()
-    resp = authenticated_admin.delete(
-        f"/api/v1/training/courses/{created['id']}/delete"
-    )
+    resp = authenticated_admin.delete(f"/api/v1/training/courses/{created['id']}/delete")
     assert resp.status_code == 200
 
 
@@ -94,15 +92,11 @@ def test_create_job_requires_valid_course(authenticated_admin):
 
 @pytest.mark.tier0
 def test_delete_nonexistent_job(authenticated_admin):
-    resp = authenticated_admin.delete(
-        "/api/v1/training/jobs/nonexistent/delete"
-    )
+    resp = authenticated_admin.delete("/api/v1/training/jobs/nonexistent/delete")
     assert resp.status_code in (400, 404)
 
 
 @pytest.mark.tier0
 def test_sync_nonexistent_job(authenticated_admin):
-    resp = authenticated_admin.post(
-        "/api/v1/training/jobs/nonexistent/sync"
-    )
+    resp = authenticated_admin.post("/api/v1/training/jobs/nonexistent/sync")
     assert resp.status_code in (400, 404)

@@ -4,10 +4,10 @@ import uuid
 from typing import Optional
 
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import BigInteger, Column, Text, JSON
+from sqlalchemy import JSON, BigInteger, Column, Text
 
-from selfai_ui.internal.db import Base, get_db
 from selfai_ui.env import SRC_LOG_LEVELS
+from selfai_ui.internal.db import Base, get_db
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MODELS"])
@@ -26,7 +26,8 @@ class CuratorJob(Base):
         id (Text): The unique identifier for the job.
         user_id (Text): The ID of the user who created the job.
         pipeline_id (Text): The ID of the pipeline associated with the job.
-        status (Text): The current status of the job (e.g., pending, scheduled, queued, running, completed, failed, cancelled).
+        status (Text): The current status of the job (e.g., pending, scheduled,
+            queued, running, completed, failed, cancelled).
         priority (Text): The priority level of the job (e.g., run_now, high, normal).
         scheduled_for (BigInteger, optional): The Unix timestamp when the job should be auto-approved.
         curator_job_id (Text, optional): The ID of the curator job.
@@ -38,6 +39,7 @@ class CuratorJob(Base):
         created_at (BigInteger): The Unix timestamp when the job was created.
         updated_at (BigInteger): The Unix timestamp when the job was last updated.
     """
+
     __tablename__ = "curator_job"
 
     id = Column(Text, unique=True, primary_key=True)
@@ -76,6 +78,7 @@ class CuratorJobModel(BaseModel):
         created_at (int): The Unix timestamp when the job was created.
         updated_at (int): The Unix timestamp when the job was last updated.
     """
+
     model_config = ConfigDict(from_attributes=True)
 
     id: str
@@ -104,6 +107,7 @@ class CuratorJobForm(BaseModel):
         priority (str): The priority level of the job.
         dataset_name (Optional[str], optional): The name of the dataset associated with the job.
     """
+
     pipeline_id: str
     scheduled_for: Optional[int] = None
     priority: str = "normal"
@@ -120,6 +124,7 @@ class CuratorJobStatusUpdate(BaseModel):
         curator_url_idx (Optional[int], optional): The new index of the curator URL.
         error_message (Optional[str], optional): A new error message associated with the job.
     """
+
     status: str
     curator_job_id: Optional[str] = None
     curator_url_idx: Optional[int] = None
@@ -132,9 +137,7 @@ class CuratorJobStatusUpdate(BaseModel):
 
 
 class CuratorJobTable:
-    def insert_new_job(
-        self, user_id: str, form_data: CuratorJobForm
-    ) -> Optional[CuratorJobModel]:
+    def insert_new_job(self, user_id: str, form_data: CuratorJobForm) -> Optional[CuratorJobModel]:
         with get_db() as db:
             initial_status = "scheduled" if form_data.scheduled_for else "pending"
             job = CuratorJobModel(
@@ -162,11 +165,7 @@ class CuratorJobTable:
 
     def get_all_jobs(self) -> list[CuratorJobModel]:
         with get_db() as db:
-            jobs = (
-                db.query(CuratorJob)
-                .order_by(CuratorJob.created_at.desc())
-                .all()
-            )
+            jobs = db.query(CuratorJob).order_by(CuratorJob.created_at.desc()).all()
             return [CuratorJobModel.model_validate(j) for j in jobs]
 
     def get_job_by_id(self, id: str) -> Optional[CuratorJobModel]:
@@ -177,9 +176,7 @@ class CuratorJobTable:
         except Exception:
             return None
 
-    def update_job_status(
-        self, id: str, update: CuratorJobStatusUpdate
-    ) -> Optional[CuratorJobModel]:
+    def update_job_status(self, id: str, update: CuratorJobStatusUpdate) -> Optional[CuratorJobModel]:
         """
         Update the status and other fields of a CuratorJob.
 
@@ -207,7 +204,6 @@ class CuratorJobTable:
             log.exception(e)
             raise
 
-
     def update_created_knowledge_id(self, id: str, knowledge_id: str) -> bool:
         """
         Update the created_knowledge_id of a CuratorJob.
@@ -223,14 +219,16 @@ class CuratorJobTable:
             with get_db() as db:
                 # Validate knowledge_id
                 db.query(CuratorJob).filter_by(id=id).update(
-                    {"created_knowledge_id": knowledge_id, "updated_at": int(time.time())}
+                    {
+                        "created_knowledge_id": knowledge_id,
+                        "updated_at": int(time.time()),
+                    }
                 )
                 db.commit()
                 return True
         except Exception as e:
             log.exception(e)
             return False
-
 
     def update_job_meta(self, id: str, meta: dict) -> Optional[CuratorJobModel]:
         try:
@@ -240,15 +238,12 @@ class CuratorJobTable:
                     return None
                 existing = job.meta or {}
                 existing.update(meta)
-                db.query(CuratorJob).filter_by(id=id).update(
-                    {"meta": existing, "updated_at": int(time.time())}
-                )
+                db.query(CuratorJob).filter_by(id=id).update({"meta": existing, "updated_at": int(time.time())})
                 db.commit()
                 return self.get_job_by_id(id=id)
         except Exception as e:
             log.exception(e)
             return None
-
 
     def get_jobs_by_status(self, status: str) -> list[CuratorJobModel]:
         try:
@@ -258,7 +253,6 @@ class CuratorJobTable:
         except Exception:
             return []
 
-
     def get_due_scheduled_jobs(self) -> list[CuratorJobModel]:
         now = int(time.time())
         with get_db() as db:
@@ -266,7 +260,6 @@ class CuratorJobTable:
                 db.query(CuratorJob)
                 .filter(
                     CuratorJob.status == "scheduled",
-
                     CuratorJob.scheduled_for <= now,
                 )
                 .order_by(CuratorJob.scheduled_for.asc())
