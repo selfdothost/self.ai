@@ -308,7 +308,14 @@ async def get_filtered_models(models, user):
     return filtered_models
 
 
-@cached(ttl=3)
+# key_builder ignores `request`: aiocache's default key builder stringifies
+# every positional arg, and Starlette's Request has no stable __repr__ (falls
+# back to object.__repr__, which includes the memory address) — a fresh
+# Request per HTTP call means a guaranteed cache-key miss every time, so the
+# ttl=3 cache never actually hit. The response only depends on global
+# request.app.state.config, not on anything per-request, so a fixed key is
+# correct here, not just a workaround.
+@cached(ttl=3, key_builder=lambda f, *args, **kwargs: "openai:get_all_models")
 async def get_all_models(request: Request) -> dict[str, list]:
     log.info("get_all_models()")
 

@@ -16,6 +16,9 @@ PUBLIC_ALLOWLIST = {
     "/api/version/updates",
     "/api/changelog",
     "/api/config",
+    # Free-tier model listing (self.ai#6) — deliberately public, response
+    # is stripped to a minimal safe subset (see /api/models/public).
+    "/api/models/public",
     "/docs",
     "/redoc",
     "/openapi.json",

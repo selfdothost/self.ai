@@ -10,8 +10,10 @@ from selfai_ui.models.chats import Chats
 from selfai_ui.models.folders import (
     FolderForm,
     FolderModel,
+    FolderPresetModel,
     Folders,
 )
+from selfai_ui.utils import folder_presets
 from selfai_ui.utils.auth import get_verified_user
 
 log = logging.getLogger(__name__)
@@ -93,10 +95,52 @@ async def get_folder_by_id(id: str, user=Depends(get_verified_user)):
 ############################
 
 
+# The three named preset fields (cavekit R1) that this update path persists into
+# the folder's ``meta`` (cavekit R2). Any of them appearing in the request marks
+# the update as carrying a preset; a plain rename (name only) carries none.
+PRESET_FIELDS = {"default_model_id", "tool_ids", "knowledge_ids"}
+
+
 @router.post("/{id}/update")
 async def update_folder_name_by_id(id: str, form_data: FolderForm, user=Depends(get_verified_user)):
     folder = Folders.get_folder_by_id_and_user_id(id, user.id)
-    if folder:
+    if not folder:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+
+    # Preset presence gate — cavekit R2. The three preset fields ride in on this
+    # same pre-existing update path (no new endpoint) as extra fields on the
+    # form. A plain rename-only update carries NONE of them, so ``has_preset`` is
+    # False and the meta-write path below is skipped entirely — the stored
+    # ``meta["preset"]`` is never touched or cleared (R2 AC4: merge-on-omit,
+    # never replace). FolderPresetModel tolerates and round-trips unrecognized
+    # keys (R1 forward-compat).
+    extra = form_data.model_extra or {}
+    has_preset = bool(PRESET_FIELDS & set(extra))
+    preset = None
+
+    if has_preset:
+        # cavekit R3: validate every reference the preset carries (default
+        # model, tools, knowledge) against a real record accessible to the
+        # writer BEFORE any database write happens. A non-empty unresolved list
+        # rejects the WHOLE update atomically (R3 AC4 — nothing persists, not
+        # even a concurrent rename), and the error detail stays generic so it
+        # never reveals which reference failed nor whether an existing record
+        # was merely inaccessible vs. nonexistent (R3 no-existence-leak).
+        preset_model = FolderPresetModel(**extra)
+        if folder_presets.unresolved_preset_references(preset_model, user):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=ERROR_MESSAGES.DEFAULT("Error updating folder"),
+            )
+        preset = preset_model.model_dump()
+
+    # Rename — unchanged behavior. Only run the duplicate-name check and the name
+    # write when the name actually changes; a preset-only update re-submits the
+    # folder's current name, which must not be treated as a self-collision.
+    if form_data.name != folder.name:
         existing_folder = Folders.get_folder_by_parent_id_and_user_id_and_name(
             folder.parent_id, user.id, form_data.name
         )
@@ -108,8 +152,6 @@ async def update_folder_name_by_id(id: str, form_data: FolderForm, user=Depends(
 
         try:
             folder = Folders.update_folder_name_by_id_and_user_id(id, user.id, form_data.name)
-
-            return folder
         except Exception as e:
             log.exception(e)
             log.error(f"Error updating folder: {id}")
@@ -117,11 +159,25 @@ async def update_folder_name_by_id(id: str, form_data: FolderForm, user=Depends(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=ERROR_MESSAGES.DEFAULT("Error updating folder"),
             )
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=ERROR_MESSAGES.NOT_FOUND,
-        )
+
+    # Preset persist — cavekit R2. Only reached once every reference has
+    # resolved. Persist the validated, typed preset into the folder's existing
+    # ``meta`` JSON column (no migration). An update omitting the preset fields
+    # never reaches here, so its stored preset is left untouched.
+    if has_preset:
+        try:
+            updated = Folders.update_folder_meta_by_id_and_user_id(id, user.id, {"preset": preset})
+            if updated is not None:
+                folder = updated
+        except Exception as e:
+            log.exception(e)
+            log.error(f"Error updating folder preset: {id}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=ERROR_MESSAGES.DEFAULT("Error updating folder"),
+            )
+
+    return folder
 
 
 ############################

@@ -4,11 +4,14 @@ service-to-service calls — self.ai#25's proposal: self.ai is the yard's
 internal ticket-granting service for its own backend mesh (Kerberos-shaped,
 not Kerberos-literal).
 
-First backend wired to validate these: self.llamolotl (self.llamolotl#12) —
-see selfai_ui/routers/llamolotl.py and selfai_ui/routers/training.py for the
-call sites. self.curator, self.code-eval, self.language-eval, and
-self.transcribe are explicit follow-up scope once this pattern proves
-out; they are NOT wired in this pass.
+Backends wired to validate these, in rollout order (see
+context/kits/cavekit-service-mesh-ticket-auth.md R3):
+  1. self.llamolotl (self.llamolotl#12) — selfai_ui/routers/llamolotl.py
+     and selfai_ui/routers/training.py.
+  2. self.curator (self.curator#5 / self.ai#25) — selfai_ui/routers/curator.py
+     and selfai_ui/utils/gpu_queue.py's curator dispatch/sync/finalize calls.
+self.code-eval, self.language-eval, and self.transcribe remain explicit
+follow-up scope once this leg proves out; they are NOT wired in this pass.
 
 Ticket shape: a signed HS256 JWT with `iss` (SERVICE_AUTH_ISSUER, "self.ai"),
 `aud` (the target backend, e.g. "self.llamolotl"), `scope` (space-separated
@@ -25,6 +28,12 @@ side in self.llamolotl's api/auth.py — keep both lists in sync):
   system:read, system:write, system:restart,
   jobs:read, jobs:create, jobs:write,
   pipeline:read, pipeline:write
+
+Scope taxonomy for the self.curator audience (mirror of the validating side
+in self.curator's api/auth.py — keep both lists in sync):
+  jobs:read, jobs:create, jobs:write,
+  data:read, data:write,
+  stages:read, stages:write
 """
 
 import logging

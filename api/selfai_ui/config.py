@@ -772,6 +772,25 @@ CODE_EVAL_BASE_URLS = [url.strip() for url in CODE_EVAL_BASE_URLS.split(";")]
 CODE_EVAL_BASE_URLS = PersistentConfig("CODE_EVAL_BASE_URLS", "code_eval.base_urls", CODE_EVAL_BASE_URLS)
 
 ####################################
+# PISTON
+####################################
+# Sandboxed execution backend for Tools/Functions. Off by default: until this
+# is enabled, Tools/Functions still run via in-process exec() with no
+# isolation (see context/treasuremaps/2026-07-20-tools-piston-sandboxing.md).
+
+ENABLE_PISTON_EXECUTION = PersistentConfig(
+    "ENABLE_PISTON_EXECUTION",
+    "piston.enable",
+    os.environ.get("ENABLE_PISTON_EXECUTION", "False").lower() == "true",
+)
+
+PISTON_BASE_URL = PersistentConfig(
+    "PISTON_BASE_URL",
+    "piston.base_url",
+    os.environ.get("PISTON_BASE_URL", "http://self-piston:2000"),
+)
+
+####################################
 # ICEBERG
 ####################################
 

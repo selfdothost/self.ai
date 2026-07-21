@@ -16,7 +16,7 @@ from selfai_ui.env import (
 from selfai_ui.models.channels import Channels
 from selfai_ui.models.chats import Chats
 from selfai_ui.models.users import UserNameResponse, Users
-from selfai_ui.socket.utils import RedisDict, RedisLock
+from selfai_ui.socket.utils import InMemoryDict, NoOpLock, RedisDict, RedisLock
 from selfai_ui.utils.auth import decode_token
 
 logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
@@ -60,30 +60,31 @@ if WEBSOCKET_MANAGER == "redis":
         lock_name=f"{REDIS_KEY_PREFIX}:usage_cleanup_lock",
         timeout_secs=TIMEOUT_DURATION * 2,
     )
-    aquire_func = clean_up_lock.aquire_lock
-    renew_func = clean_up_lock.renew_lock
-    release_func = clean_up_lock.release_lock
 else:
-    SESSION_POOL = {}
-    USER_POOL = {}
-    USAGE_POOL = {}
-    aquire_func = release_func = renew_func = lambda: True
+    SESSION_POOL = InMemoryDict()
+    USER_POOL = InMemoryDict()
+    USAGE_POOL = InMemoryDict()
+    clean_up_lock = NoOpLock()
+
+aquire_func = clean_up_lock.aquire_lock
+renew_func = clean_up_lock.renew_lock
+release_func = clean_up_lock.release_lock
 
 
 async def periodic_usage_pool_cleanup():
-    if not aquire_func():
+    if not await aquire_func():
         log.debug("Usage pool cleanup lock already exists. Not running it.")
         return
     log.debug("Running periodic_usage_pool_cleanup")
     try:
         while True:
-            if not renew_func():
+            if not await renew_func():
                 log.error("Unable to renew cleanup lock. Exiting usage pool cleanup.")
                 raise Exception("Unable to renew usage pool cleanup lock.")
 
             now = int(time.time())
             send_usage = False
-            for model_id, connections in list(USAGE_POOL.items()):
+            for model_id, connections in await USAGE_POOL.aitems():
                 # Creating a list of sids to remove if they have timed out
                 expired_sids = [
                     sid for sid, details in connections.items() if now - details["updated_at"] > TIMEOUT_DURATION
@@ -94,19 +95,19 @@ async def periodic_usage_pool_cleanup():
 
                 if not connections:
                     log.debug(f"Cleaning up model {model_id} from usage pool")
-                    del USAGE_POOL[model_id]
+                    await USAGE_POOL.adelete(model_id)
                 else:
-                    USAGE_POOL[model_id] = connections
+                    await USAGE_POOL.aset(model_id, connections)
 
                 send_usage = True
 
             if send_usage:
                 # Emit updated usage information after cleaning
-                await sio.emit("usage", {"models": get_models_in_use()})
+                await sio.emit("usage", {"models": await get_models_in_use()})
 
             await asyncio.sleep(TIMEOUT_DURATION)
     finally:
-        release_func()
+        await release_func()
 
 
 app = socketio.ASGIApp(
@@ -115,9 +116,9 @@ app = socketio.ASGIApp(
 )
 
 
-def get_models_in_use():
+async def get_models_in_use():
     # List models that are currently in use
-    models_in_use = list(USAGE_POOL.keys())
+    models_in_use = await USAGE_POOL.akeys()
     return models_in_use
 
 
@@ -128,13 +129,17 @@ async def usage(sid, data):
     current_time = int(time.time())
 
     # Store the new usage data and task
-    USAGE_POOL[model_id] = {
-        **(USAGE_POOL[model_id] if model_id in USAGE_POOL else {}),
-        sid: {"updated_at": current_time},
-    }
+    existing = await USAGE_POOL.aget(model_id, {})
+    await USAGE_POOL.aset(
+        model_id,
+        {
+            **existing,
+            sid: {"updated_at": current_time},
+        },
+    )
 
     # Broadcast the usage data to all clients
-    await sio.emit("usage", {"models": get_models_in_use()})
+    await sio.emit("usage", {"models": await get_models_in_use()})
 
 
 @sio.event
@@ -147,15 +152,16 @@ async def connect(sid, environ, auth):
             user = Users.get_user_by_id(data["id"])
 
         if user:
-            SESSION_POOL[sid] = user.model_dump()
-            if user.id in USER_POOL:
-                USER_POOL[user.id] = USER_POOL[user.id] + [sid]
+            await SESSION_POOL.aset(sid, user.model_dump())
+            existing_sids = await USER_POOL.aget(user.id)
+            if existing_sids:
+                await USER_POOL.aset(user.id, existing_sids + [sid])
             else:
-                USER_POOL[user.id] = [sid]
+                await USER_POOL.aset(user.id, [sid])
 
             # print(f"user {user.name}({user.id}) connected with session ID {sid}")
-            await sio.emit("user-list", {"user_ids": list(USER_POOL.keys())})
-            await sio.emit("usage", {"models": get_models_in_use()})
+            await sio.emit("user-list", {"user_ids": await USER_POOL.akeys()})
+            await sio.emit("usage", {"models": await get_models_in_use()})
 
 
 @sio.on("user-join")
@@ -173,11 +179,12 @@ async def user_join(sid, data):
     if not user:
         return
 
-    SESSION_POOL[sid] = user.model_dump()
-    if user.id in USER_POOL:
-        USER_POOL[user.id] = USER_POOL[user.id] + [sid]
+    await SESSION_POOL.aset(sid, user.model_dump())
+    existing_sids = await USER_POOL.aget(user.id)
+    if existing_sids:
+        await USER_POOL.aset(user.id, existing_sids + [sid])
     else:
-        USER_POOL[user.id] = [sid]
+        await USER_POOL.aset(user.id, [sid])
 
     # Join all the channels
     channels = Channels.get_channels_by_user_id(user.id)
@@ -187,7 +194,7 @@ async def user_join(sid, data):
 
     # print(f"user {user.name}({user.id}) connected with session ID {sid}")
 
-    await sio.emit("user-list", {"user_ids": list(USER_POOL.keys())})
+    await sio.emit("user-list", {"user_ids": await USER_POOL.akeys()})
     return {"id": user.id, "name": user.name}
 
 
@@ -228,13 +235,14 @@ async def channel_events(sid, data):
     event_type = event_data["type"]
 
     if event_type == "typing":
+        session_user = await SESSION_POOL.aget(sid)
         await sio.emit(
             "channel-events",
             {
                 "channel_id": data["channel_id"],
                 "message_id": data.get("message_id", None),
                 "data": event_data,
-                "user": UserNameResponse(**SESSION_POOL[sid]).model_dump(),
+                "user": UserNameResponse(**session_user).model_dump(),
             },
             room=room,
         )
@@ -242,22 +250,24 @@ async def channel_events(sid, data):
 
 @sio.on("user-list")
 async def user_list(sid):
-    await sio.emit("user-list", {"user_ids": list(USER_POOL.keys())})
+    await sio.emit("user-list", {"user_ids": await USER_POOL.akeys()})
 
 
 @sio.event
 async def disconnect(sid):
-    if sid in SESSION_POOL:
-        user = SESSION_POOL[sid]
-        del SESSION_POOL[sid]
+    user = await SESSION_POOL.aget(sid)
+    if user is not None:
+        await SESSION_POOL.adelete(sid)
 
         user_id = user["id"]
-        USER_POOL[user_id] = [_sid for _sid in USER_POOL[user_id] if _sid != sid]
+        remaining_sids = [_sid for _sid in await USER_POOL.aget(user_id, []) if _sid != sid]
 
-        if len(USER_POOL[user_id]) == 0:
-            del USER_POOL[user_id]
+        if len(remaining_sids) == 0:
+            await USER_POOL.adelete(user_id)
+        else:
+            await USER_POOL.aset(user_id, remaining_sids)
 
-        await sio.emit("user-list", {"user_ids": list(USER_POOL.keys())})
+        await sio.emit("user-list", {"user_ids": await USER_POOL.akeys()})
     else:
         pass
         # print(f"Unknown session ID {sid} disconnected")
@@ -266,7 +276,8 @@ async def disconnect(sid):
 def get_event_emitter(request_info):
     async def __event_emitter__(event_data):
         user_id = request_info["user_id"]
-        session_ids = list(set(USER_POOL.get(user_id, []) + [request_info["session_id"]]))
+        user_sids = await USER_POOL.aget(user_id, [])
+        session_ids = list(set(user_sids + [request_info["session_id"]]))
 
         for session_id in session_ids:
             await sio.emit(
@@ -333,24 +344,26 @@ def get_event_call(request_info):
     return __event_call__
 
 
-def get_user_id_from_session_pool(sid):
-    user = SESSION_POOL.get(sid)
+async def get_user_id_from_session_pool(sid):
+    user = await SESSION_POOL.aget(sid)
     if user:
         return user["id"]
     return None
 
 
-def get_user_ids_from_room(room):
+async def get_user_ids_from_room(room):
     active_session_ids = sio.manager.get_participants(
         namespace="/",
         room=room,
     )
 
-    active_user_ids = list(set([SESSION_POOL.get(session_id[0])["id"] for session_id in active_session_ids]))
-    return active_user_ids
+    active_user_ids = set()
+    for session_id in active_session_ids:
+        user = await SESSION_POOL.aget(session_id[0])
+        if user:
+            active_user_ids.add(user["id"])
+    return list(active_user_ids)
 
 
-def get_active_status_by_user_id(user_id):
-    if user_id in USER_POOL:
-        return True
-    return False
+async def get_active_status_by_user_id(user_id):
+    return await USER_POOL.acontains(user_id)

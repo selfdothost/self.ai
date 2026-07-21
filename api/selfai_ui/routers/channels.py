@@ -251,7 +251,7 @@ async def post_new_message(
                         to=f"channel:{channel.id}",
                     )
 
-            active_user_ids = get_user_ids_from_room(f"channel:{channel.id}")
+            active_user_ids = await get_user_ids_from_room(f"channel:{channel.id}")
 
             background_tasks.add_task(
                 send_notification,

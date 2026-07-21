@@ -291,7 +291,7 @@ def _isolate_startup_tasks():
         "selfai_ui.main._resume_crawl_jobs", new_callable=AsyncMock
     ), patch("selfai_ui.main._run_gpu_queue", new_callable=AsyncMock), patch(
         "selfai_ui.main._ensure_curator_classifier_models", new_callable=AsyncMock
-    ):
+    ), patch("selfai_ui.main._run_model_integrity_sweep", new_callable=AsyncMock):
         yield
 
 

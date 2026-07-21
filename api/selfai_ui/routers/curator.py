@@ -21,9 +21,16 @@ from selfai_ui.models.curator_jobs import (
     CuratorJobs,
 )
 from selfai_ui.utils.auth import get_admin_user, get_verified_user
+from selfai_ui.utils.service_auth import TICKET_HEADER, mint_service_ticket
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS.get("CURATOR", logging.INFO))
+
+# Audience string self.curator's control API (:8094) validates tickets
+# against — must match SERVICE_AUTH_AUDIENCE on that side (self.curator#5 /
+# self.ai#25). Same constant as gpu_queue.py's CURATOR_AUDIENCE — keep both
+# in sync.
+CURATOR_AUDIENCE = "self.curator"
 
 
 ##########################################
@@ -33,38 +40,13 @@ log.setLevel(SRC_LOG_LEVELS.get("CURATOR", logging.INFO))
 ##########################################
 
 
-async def send_get_request(url, raise_on_error=False):
+async def send_get_request(url, raise_on_error=False, ticket=None):
     timeout = aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT_OPENAI_MODEL_LIST)
     try:
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
-            async with session.get(url) as response:
-                result = await response.json()
-                if raise_on_error and response.status >= 400:
-                    detail = None
-                    if isinstance(result, dict):
-                        detail = result.get("detail") or result.get("error")
-                    raise HTTPException(
-                        status_code=response.status,
-                        detail=detail or "Self.AI UI: Curator Connection Error",
-                    )
-                return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.error(f"Curator connection error: {e}")
-        if raise_on_error:
-            raise HTTPException(status_code=500, detail="Self.AI UI: Curator Connection Error")
-        return None
-
-
-async def send_post_request(url, payload, raise_on_error=False):
-    timeout = aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
-    try:
-        async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
-            async with session.post(
+            async with session.get(
                 url,
-                data=payload,
-                headers={"Content-Type": "application/json"},
+                headers={**({TICKET_HEADER: ticket} if ticket else {})},
             ) as response:
                 result = await response.json()
                 if raise_on_error and response.status >= 400:
@@ -85,11 +67,45 @@ async def send_post_request(url, payload, raise_on_error=False):
         return None
 
 
-async def send_delete_request(url, raise_on_error=False):
+async def send_post_request(url, payload, raise_on_error=False, ticket=None):
     timeout = aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
     try:
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
-            async with session.delete(url) as response:
+            async with session.post(
+                url,
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    **({TICKET_HEADER: ticket} if ticket else {}),
+                },
+            ) as response:
+                result = await response.json()
+                if raise_on_error and response.status >= 400:
+                    detail = None
+                    if isinstance(result, dict):
+                        detail = result.get("detail") or result.get("error")
+                    raise HTTPException(
+                        status_code=response.status,
+                        detail=detail or "Self.AI UI: Curator Connection Error",
+                    )
+                return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"Curator connection error: {e}")
+        if raise_on_error:
+            raise HTTPException(status_code=500, detail="Self.AI UI: Curator Connection Error")
+        return None
+
+
+async def send_delete_request(url, raise_on_error=False, ticket=None):
+    timeout = aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+            async with session.delete(
+                url,
+                headers={**({TICKET_HEADER: ticket} if ticket else {})},
+            ) as response:
                 result = await response.json()
                 if raise_on_error and response.status >= 400:
                     detail = None
@@ -221,21 +237,33 @@ async def update_config(request: Request, form_data: CuratorConfigForm, user=Dep
 @router.get("/api/text")
 async def list_text_categories(request: Request, user=Depends(get_verified_user)):
     url = get_curator_url(request)
-    result = await send_get_request(f"{url}/api/text", raise_on_error=True)
+    result = await send_get_request(
+        f"{url}/api/text",
+        raise_on_error=True,
+        ticket=mint_service_ticket(CURATOR_AUDIENCE, "stages:read"),
+    )
     return result
 
 
 @router.get("/api/text/custom/stages")
 async def list_custom_stages(request: Request, user=Depends(get_verified_user)):
     url = get_curator_url(request)
-    result = await send_get_request(f"{url}/api/text/custom/stages", raise_on_error=True)
+    result = await send_get_request(
+        f"{url}/api/text/custom/stages",
+        raise_on_error=True,
+        ticket=mint_service_ticket(CURATOR_AUDIENCE, "stages:read"),
+    )
     return result
 
 
 @router.get("/api/text/custom/stages/{stage_uuid}")
 async def get_custom_stage(request: Request, stage_uuid: str, user=Depends(get_verified_user)):
     url = get_curator_url(request)
-    result = await send_get_request(f"{url}/api/text/custom/stages/{stage_uuid}", raise_on_error=True)
+    result = await send_get_request(
+        f"{url}/api/text/custom/stages/{stage_uuid}",
+        raise_on_error=True,
+        ticket=mint_service_ticket(CURATOR_AUDIENCE, "stages:read"),
+    )
     return result
 
 
@@ -243,28 +271,45 @@ async def get_custom_stage(request: Request, stage_uuid: str, user=Depends(get_v
 async def create_custom_stage(request: Request, user=Depends(get_admin_user)):
     url = get_curator_url(request)
     body = await request.body()
-    result = await send_post_request(f"{url}/api/text/custom/stages", body.decode(), raise_on_error=True)
+    result = await send_post_request(
+        f"{url}/api/text/custom/stages",
+        body.decode(),
+        raise_on_error=True,
+        ticket=mint_service_ticket(CURATOR_AUDIENCE, "stages:write"),
+    )
     return result
 
 
 @router.delete("/api/text/custom/stages/{stage_uuid}")
 async def delete_custom_stage(request: Request, stage_uuid: str, user=Depends(get_admin_user)):
     url = get_curator_url(request)
-    result = await send_delete_request(f"{url}/api/text/custom/stages/{stage_uuid}", raise_on_error=True)
+    result = await send_delete_request(
+        f"{url}/api/text/custom/stages/{stage_uuid}",
+        raise_on_error=True,
+        ticket=mint_service_ticket(CURATOR_AUDIENCE, "stages:write"),
+    )
     return result
 
 
 @router.get("/api/text/{category}/stages")
 async def list_category_stages(request: Request, category: str, user=Depends(get_verified_user)):
     url = get_curator_url(request)
-    result = await send_get_request(f"{url}/api/text/{category}/stages", raise_on_error=True)
+    result = await send_get_request(
+        f"{url}/api/text/{category}/stages",
+        raise_on_error=True,
+        ticket=mint_service_ticket(CURATOR_AUDIENCE, "stages:read"),
+    )
     return result
 
 
 @router.get("/api/text/{category}/stages/{stage_id}")
 async def get_stage_detail(request: Request, category: str, stage_id: str, user=Depends(get_verified_user)):
     url = get_curator_url(request)
-    result = await send_get_request(f"{url}/api/text/{category}/stages/{stage_id}", raise_on_error=True)
+    result = await send_get_request(
+        f"{url}/api/text/{category}/stages/{stage_id}",
+        raise_on_error=True,
+        ticket=mint_service_ticket(CURATOR_AUDIENCE, "stages:read"),
+    )
     return result
 
 
@@ -318,35 +363,56 @@ async def queue_curator_job(
 async def create_job(request: Request, user=Depends(get_verified_user)):
     url = get_curator_url(request)
     body = await request.body()
-    result = await send_post_request(f"{url}/api/jobs", body.decode(), raise_on_error=True)
+    result = await send_post_request(
+        f"{url}/api/jobs",
+        body.decode(),
+        raise_on_error=True,
+        ticket=mint_service_ticket(CURATOR_AUDIENCE, "jobs:create"),
+    )
     return result
 
 
 @router.get("/api/jobs")
 async def list_jobs(request: Request, user=Depends(get_verified_user)):
     url = get_curator_url(request)
-    result = await send_get_request(f"{url}/api/jobs", raise_on_error=True)
+    result = await send_get_request(
+        f"{url}/api/jobs",
+        raise_on_error=True,
+        ticket=mint_service_ticket(CURATOR_AUDIENCE, "jobs:read"),
+    )
     return result
 
 
 @router.get("/api/jobs/{job_id}")
 async def get_job(request: Request, job_id: str, user=Depends(get_verified_user)):
     url = get_curator_url(request)
-    result = await send_get_request(f"{url}/api/jobs/{job_id}", raise_on_error=True)
+    result = await send_get_request(
+        f"{url}/api/jobs/{job_id}",
+        raise_on_error=True,
+        ticket=mint_service_ticket(CURATOR_AUDIENCE, "jobs:read"),
+    )
     return result
 
 
 @router.get("/api/jobs/{job_id}/logs")
 async def get_job_logs(request: Request, job_id: str, user=Depends(get_verified_user)):
     url = get_curator_url(request)
-    result = await send_get_request(f"{url}/api/jobs/{job_id}/logs", raise_on_error=True)
+    result = await send_get_request(
+        f"{url}/api/jobs/{job_id}/logs",
+        raise_on_error=True,
+        ticket=mint_service_ticket(CURATOR_AUDIENCE, "jobs:read"),
+    )
     return result
 
 
 @router.delete("/api/jobs/{job_id}")
 async def cancel_job(request: Request, job_id: str, user=Depends(get_verified_user)):
     url = get_curator_url(request)
-    result = await send_delete_request(f"{url}/api/jobs/{job_id}", raise_on_error=True)
+    result = await send_delete_request(
+        f"{url}/api/jobs/{job_id}",
+        raise_on_error=True,
+        ticket=mint_service_ticket(CURATOR_AUDIENCE, "jobs:write"),
+    )
     return result
 
 
@@ -354,25 +420,45 @@ async def cancel_job(request: Request, job_id: str, user=Depends(get_verified_us
 async def schedule_job(request: Request, job_id: str, user=Depends(get_verified_user)):
     url = get_curator_url(request)
     body = await request.body()
-    return await send_post_request(f"{url}/api/jobs/{job_id}/schedule", body.decode(), raise_on_error=True)
+    return await send_post_request(
+        f"{url}/api/jobs/{job_id}/schedule",
+        body.decode(),
+        raise_on_error=True,
+        ticket=mint_service_ticket(CURATOR_AUDIENCE, "jobs:write"),
+    )
 
 
 @router.post("/api/jobs/{job_id}/unschedule")
 async def unschedule_job(request: Request, job_id: str, user=Depends(get_verified_user)):
     url = get_curator_url(request)
-    return await send_post_request(f"{url}/api/jobs/{job_id}/unschedule", "{}", raise_on_error=True)
+    return await send_post_request(
+        f"{url}/api/jobs/{job_id}/unschedule",
+        "{}",
+        raise_on_error=True,
+        ticket=mint_service_ticket(CURATOR_AUDIENCE, "jobs:write"),
+    )
 
 
 @router.post("/api/jobs/{job_id}/approve")
 async def approve_job(request: Request, job_id: str, user=Depends(get_verified_user)):
     url = get_curator_url(request)
-    return await send_post_request(f"{url}/api/jobs/{job_id}/approve", "{}", raise_on_error=True)
+    return await send_post_request(
+        f"{url}/api/jobs/{job_id}/approve",
+        "{}",
+        raise_on_error=True,
+        ticket=mint_service_ticket(CURATOR_AUDIENCE, "jobs:write"),
+    )
 
 
 @router.post("/api/jobs/{job_id}/cancel")
 async def cancel_job_post(request: Request, job_id: str, user=Depends(get_verified_user)):
     url = get_curator_url(request)
-    return await send_post_request(f"{url}/api/jobs/{job_id}/cancel", "{}", raise_on_error=True)
+    return await send_post_request(
+        f"{url}/api/jobs/{job_id}/cancel",
+        "{}",
+        raise_on_error=True,
+        ticket=mint_service_ticket(CURATOR_AUDIENCE, "jobs:write"),
+    )
 
 
 ##########################################
@@ -383,5 +469,9 @@ async def cancel_job_post(request: Request, job_id: str, user=Depends(get_verifi
 @router.get("/api/data")
 async def list_data(request: Request, user=Depends(get_verified_user)):
     url = get_curator_url(request)
-    result = await send_get_request(f"{url}/api/data", raise_on_error=True)
+    result = await send_get_request(
+        f"{url}/api/data",
+        raise_on_error=True,
+        ticket=mint_service_ticket(CURATOR_AUDIENCE, "data:read"),
+    )
     return result

@@ -184,8 +184,15 @@ changelog_json = {}
 
 # Iterate over each version
 for version in soup.find_all("h2"):
-    version_number = version.get_text().strip().split(" - ")[0][1:-1]  # Remove brackets
-    date = version.get_text().strip().split(" - ")[1]
+    # Upstream expected every h2 to be "[<version>] - <date>" and crashed at
+    # import on anything else (IndexError on the split) — which took out test
+    # collection and any deploy that bundles CHANGELOG.md the moment the weekly
+    # "## self.ai — <date>" headings landed. This feeds the version modal only;
+    # tolerate any heading shape.
+    heading = version.get_text().strip()
+    parts = heading.split(" - ", 1)
+    version_number = parts[0].strip("[]")
+    date = parts[1] if len(parts) > 1 else ""
 
     version_data = {"date": date}
 

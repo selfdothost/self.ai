@@ -328,7 +328,18 @@ async def update_config(request: Request, form_data: LlamolotlConfigForm, user=D
 ##########################################
 
 
-@cached(ttl=3)
+# key_builder ignores `request`: aiocache's default key builder stringifies
+# every positional arg, and Starlette's Request has no stable __repr__ (falls
+# back to object.__repr__, which includes the memory address) — a fresh
+# Request per HTTP call means a guaranteed cache-key miss every time, so the
+# ttl=3 cache never actually hit (same bug as openai.py/ollama.py's copies of
+# this pattern). Confirmed live 2026-07-15: bulk-toggling ~20 models in the
+# admin UI re-triggers GET /api/models per toggle, and with the cache
+# defeated, each one re-fans-out to every LLAMOLOTL_BASE_URLS entry — root
+# cause of the event-loop freeze/liveness-probe crash loop under normal bulk
+# admin actions. Response only depends on global request.app.state.config,
+# not anything per-request, so a fixed key is correct, not a workaround.
+@cached(ttl=3, key_builder=lambda f, *args, **kwargs: "llamolotl:get_all_models")
 async def get_all_models(request: Request):
     log.info("get_all_models()")
     if request.app.state.config.ENABLE_LLAMOLOTL_API:
@@ -663,31 +674,6 @@ async def inspect_model(
     )
 
 
-@router.post("/api/pull")
-@router.post("/api/pull/{url_idx}")
-async def pull_model(
-    request: Request,
-    form_data: HFModelPullForm,
-    url_idx: int = 0,
-    user=Depends(get_admin_user),
-):
-    control_urls = request.app.state.config.LLAMOLOTL_CONTROL_BASE_URLS
-    if url_idx >= len(control_urls):
-        raise HTTPException(status_code=400, detail="Invalid URL index")
-
-    control_url = control_urls[url_idx]
-    base_url = request.app.state.config.LLAMOLOTL_BASE_URLS[url_idx]
-    key = get_api_key(base_url, request.app.state.config.LLAMOLOTL_API_CONFIGS)
-
-    return await send_post_request(
-        url=f"{control_url}/api/models/pull",
-        payload=json.dumps(form_data.model_dump(exclude_none=True)),
-        stream=True,
-        key=key,
-        ticket=mint_service_ticket(LLAMOLOTL_AUDIENCE, "models:pull"),
-    )
-
-
 @router.post("/api/pull/cancel")
 @router.post("/api/pull/cancel/{url_idx}")
 async def cancel_pull(
@@ -708,6 +694,31 @@ async def cancel_pull(
         url=f"{control_url}/api/models/pull/cancel",
         payload=json.dumps(form_data.model_dump(exclude_none=True)),
         stream=False,
+        key=key,
+        ticket=mint_service_ticket(LLAMOLOTL_AUDIENCE, "models:pull"),
+    )
+
+
+@router.post("/api/pull")
+@router.post("/api/pull/{url_idx}")
+async def pull_model(
+    request: Request,
+    form_data: HFModelPullForm,
+    url_idx: int = 0,
+    user=Depends(get_admin_user),
+):
+    control_urls = request.app.state.config.LLAMOLOTL_CONTROL_BASE_URLS
+    if url_idx >= len(control_urls):
+        raise HTTPException(status_code=400, detail="Invalid URL index")
+
+    control_url = control_urls[url_idx]
+    base_url = request.app.state.config.LLAMOLOTL_BASE_URLS[url_idx]
+    key = get_api_key(base_url, request.app.state.config.LLAMOLOTL_API_CONFIGS)
+
+    return await send_post_request(
+        url=f"{control_url}/api/models/pull",
+        payload=json.dumps(form_data.model_dump(exclude_none=True)),
+        stream=True,
         key=key,
         ticket=mint_service_ticket(LLAMOLOTL_AUDIENCE, "models:pull"),
     )
@@ -736,6 +747,22 @@ async def delete_model(
         key=key,
         ticket=mint_service_ticket(LLAMOLOTL_AUDIENCE, "models:delete"),
     )
+
+
+##########################################
+#
+# Model integrity sweep (self.ai/self.ai#38)
+#
+##########################################
+
+
+@router.get("/api/integrity")
+async def get_model_integrity_warnings(request: Request, user=Depends(get_admin_user)):
+    """Findings from the periodic /models integrity sweep
+    (utils/model_integrity.run_periodic_sweep), keyed by LLAMOLOTL_BASE_URLS
+    entry. Empty until the first sweep cycle completes, or if the sweep is
+    disabled via ENABLE_MODEL_INTEGRITY_SWEEP=false."""
+    return {"warnings": getattr(request.app.state, "MODEL_INTEGRITY_WARNINGS", {})}
 
 
 @router.get("/api/available-models")

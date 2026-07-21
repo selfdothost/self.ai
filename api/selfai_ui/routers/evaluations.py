@@ -37,6 +37,7 @@ from selfai_ui.utils.auth import (
     get_verified_user,
     revoke_eval_tokens_for_job,
 )
+from selfai_ui.utils.service_auth import TICKET_HEADER, mint_service_ticket
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +49,13 @@ LANGUAGE_EVAL_RESULTS_DIR = Path(os.environ.get("LANGUAGE_EVAL_RESULTS_DIR", "/w
 
 # URL of the code-eval API container
 CODE_EVAL_API_URL = os.environ.get("CODE_EVAL_API_URL", "http://self-code-eval:8094")
+
+# Audience strings self.code-eval's/self.language-eval's control APIs
+# validate tickets against — must match SERVICE_AUTH_AUDIENCE on each side
+# (self.ai#25, the last leg of the service-mesh ticket-auth rollout after
+# self.llamolotl, self.curator, and self.transcribe/self.speak).
+CODE_EVAL_AUDIENCE = "self.code-eval"
+LANGUAGE_EVAL_AUDIENCE = "self.language-eval"
 
 # Test Mode (dry_run) caps every run to a handful of samples so the harness
 # returns quickly regardless of the benchmark's real size.
@@ -512,7 +520,10 @@ async def get_code_test_details(result_id: str, user=Depends(get_verified_user))
         # Fallback: fetch from code-eval API directly (results not yet synced)
         try:
             async with httpx.AsyncClient(timeout=60.0) as client:
-                resp = await client.get(f"{CODE_EVAL_API_URL}/api/results/{result_id}/details")
+                resp = await client.get(
+                    f"{CODE_EVAL_API_URL}/api/results/{result_id}/details",
+                    headers={TICKET_HEADER: mint_service_ticket(CODE_EVAL_AUDIENCE, "jobs:read")},
+                )
                 if resp.status_code == 200:
                     details = _sanitize_value(resp.json())
                     # Persist locally so next request hits disk
@@ -622,7 +633,10 @@ async def _list_language_eval_results() -> list[dict]:
     # it writes results to its own PVC regardless of what this pod can see.
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.get(f"{LANGUAGE_EVAL_API_URL}/api/results")
+            resp = await client.get(
+                f"{LANGUAGE_EVAL_API_URL}/api/results",
+                headers={TICKET_HEADER: mint_service_ticket(LANGUAGE_EVAL_AUDIENCE, "jobs:read")},
+            )
             resp.raise_for_status()
             for item in resp.json():
                 language_eval_job_id = item.get("id") or item.get("job_id")
@@ -706,7 +720,10 @@ async def _load_language_eval_samples(job_id: str, model_name: str) -> list[dict
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.get(f"{LANGUAGE_EVAL_API_URL}/api/results/{job_id}/samples")
+            resp = await client.get(
+                f"{LANGUAGE_EVAL_API_URL}/api/results/{job_id}/samples",
+                headers={TICKET_HEADER: mint_service_ticket(LANGUAGE_EVAL_AUDIENCE, "jobs:read")},
+            )
             if resp.status_code == 200:
                 return _sanitize_value(resp.json())
     except Exception as e:
@@ -857,17 +874,23 @@ async def cancel_eval_job(
     if job.status == "running" and job.meta:
         remote_job_id = None
         remote_url = None
+        remote_audience = None
         if job.eval_type == "language-eval" and job.meta.get("language_eval_job_id"):
             remote_job_id = job.meta["language_eval_job_id"]
             remote_url = LANGUAGE_EVAL_API_URL
+            remote_audience = LANGUAGE_EVAL_AUDIENCE
         elif job.eval_type == "code-eval" and job.meta.get("code_eval_job_id"):
             remote_job_id = job.meta["code_eval_job_id"]
             remote_url = CODE_EVAL_API_URL
+            remote_audience = CODE_EVAL_AUDIENCE
 
         if remote_job_id and remote_url:
             try:
                 async with httpx.AsyncClient(timeout=15.0) as client:
-                    resp = await client.delete(f"{remote_url}/api/jobs/{remote_job_id}")
+                    resp = await client.delete(
+                        f"{remote_url}/api/jobs/{remote_job_id}",
+                        headers={TICKET_HEADER: mint_service_ticket(remote_audience, "jobs:write")},
+                    )
                     log.info(f"Cancelled remote {job.eval_type} job {remote_job_id}: " f"{resp.status_code}")
             except Exception as e:
                 log.warning(f"Failed to cancel remote job {remote_job_id}: {e}")
@@ -917,6 +940,7 @@ async def _dispatch_eval_job(job: EvalJobModel) -> None:
             resp = await client.post(
                 f"{CODE_EVAL_API_URL}/api/jobs",
                 json=code_eval_payload,
+                headers={TICKET_HEADER: mint_service_ticket(CODE_EVAL_AUDIENCE, "jobs:create")},
             )
             resp.raise_for_status()
             code_eval_job = resp.json()
@@ -990,6 +1014,7 @@ async def _dispatch_language_eval_job(job: EvalJobModel) -> None:
             resp = await client.post(
                 f"{LANGUAGE_EVAL_API_URL}/api/jobs",
                 json=language_eval_payload,
+                headers={TICKET_HEADER: mint_service_ticket(LANGUAGE_EVAL_AUDIENCE, "jobs:create")},
             )
             resp.raise_for_status()
             language_eval_job = resp.json()
@@ -1056,7 +1081,10 @@ async def _fetch_code_eval_results(job: EvalJobModel, code_eval_job_id: str) -> 
         # slow to answer while a run is in flight.
         async with httpx.AsyncClient(timeout=60.0) as client:
             # Fetch results summary
-            summary_resp = await client.get(f"{CODE_EVAL_API_URL}/api/results/{code_eval_job_id}")
+            summary_resp = await client.get(
+                f"{CODE_EVAL_API_URL}/api/results/{code_eval_job_id}",
+                headers={TICKET_HEADER: mint_service_ticket(CODE_EVAL_AUDIENCE, "jobs:read")},
+            )
             summary_resp.raise_for_status()
             summary = summary_resp.json()
 
@@ -1066,7 +1094,10 @@ async def _fetch_code_eval_results(job: EvalJobModel, code_eval_job_id: str) -> 
             log.info(f"Saved code-eval results summary: {summary_path}")
 
             # Fetch per-task details
-            details_resp = await client.get(f"{CODE_EVAL_API_URL}/api/results/{code_eval_job_id}/details")
+            details_resp = await client.get(
+                f"{CODE_EVAL_API_URL}/api/results/{code_eval_job_id}/details",
+                headers={TICKET_HEADER: mint_service_ticket(CODE_EVAL_AUDIENCE, "jobs:read")},
+            )
             if details_resp.status_code == 200:
                 details = details_resp.json()
                 timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1095,6 +1126,7 @@ async def _sync_running_jobs() -> None:
                 async with httpx.AsyncClient(timeout=10.0) as client:
                     resp = await client.get(
                         f"{LANGUAGE_EVAL_API_URL}/api/jobs/{language_eval_job_id}",
+                        headers={TICKET_HEADER: mint_service_ticket(LANGUAGE_EVAL_AUDIENCE, "jobs:read")},
                     )
                     if resp.status_code == 404:
                         log.warning(f"language-eval job {language_eval_job_id} not found — marking failed")
@@ -1135,6 +1167,7 @@ async def _sync_running_jobs() -> None:
                 async with httpx.AsyncClient(timeout=10.0) as client:
                     resp = await client.get(
                         f"{CODE_EVAL_API_URL}/api/jobs/{code_eval_job_id}",
+                        headers={TICKET_HEADER: mint_service_ticket(CODE_EVAL_AUDIENCE, "jobs:read")},
                     )
                     if resp.status_code == 404:
                         log.warning(f"code-eval job {code_eval_job_id} not found — marking failed")
@@ -1489,6 +1522,7 @@ async def stream_eval_job_live(id: str, user=Depends(get_verified_user)):
                     async with client.stream(
                         "GET",
                         f"{LANGUAGE_EVAL_API_URL}/api/jobs/{language_eval_job_id}/live",
+                        headers={TICKET_HEADER: mint_service_ticket(LANGUAGE_EVAL_AUDIENCE, "jobs:read")},
                     ) as resp:
                         async for line in resp.aiter_lines():
                             if line:

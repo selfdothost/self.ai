@@ -57,6 +57,8 @@ from selfai_ui.config import (
     BING_SEARCH_V7_ENDPOINT,
     BING_SEARCH_V7_SUBSCRIPTION_KEY,
     BRAVE_SEARCH_API_KEY,
+    BROWSE_PLAYWRIGHT_API_KEY,
+    BROWSE_PLAYWRIGHT_SERVICE_URL,
     CACHE_DIR,
     CHUNK_OVERLAP,
     CHUNK_SIZE,
@@ -102,6 +104,8 @@ from selfai_ui.config import (
     ENABLE_OLLAMA_API,
     # OpenAI
     ENABLE_OPENAI_API,
+    # Piston
+    ENABLE_PISTON_EXECUTION,
     ENABLE_RAG_HYBRID_SEARCH,
     ENABLE_RAG_WEB_LOADER_SSL_VERIFICATION,
     ENABLE_RAG_WEB_SEARCH,
@@ -163,6 +167,8 @@ from selfai_ui.config import (
     OPENAI_API_CONFIGS,
     OPENAI_API_KEYS,
     PDF_EXTRACT_IMAGES,
+    # Piston
+    PISTON_BASE_URL,
     QUERY_GENERATION_PROMPT_TEMPLATE,
     RAG_EMBEDDING_BATCH_SIZE,
     RAG_EMBEDDING_ENGINE,
@@ -366,6 +372,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_run_gpu_queue(app.state))
     asyncio.create_task(_ensure_curator_classifier_models(app.state))
     asyncio.create_task(_backfill_self_corpus_repos(app.state))
+    asyncio.create_task(_run_model_integrity_sweep(app.state))
     yield
 
 
@@ -406,6 +413,16 @@ async def _run_gpu_queue(app_state) -> None:
     gpu_queue._app_state = app_state
     training_mod._app_state = app_state
     await gpu_queue.process_gpu_queue_v2()
+
+
+async def _run_model_integrity_sweep(app_state) -> None:
+    """Periodic /models integrity sweep -- self.ai/self.ai#38. Checks
+    models llama-server reports as known against what self.llamolotl's
+    control server reports as actually present on disk, logging a
+    warning for anything missing or undersized (truncated/corrupt)."""
+    from selfai_ui.utils.model_integrity import run_periodic_sweep
+
+    await run_periodic_sweep(app_state)
 
 
 # Same audience string as routers/llamolotl.py, routers/training.py, and
@@ -547,6 +564,16 @@ app.state.config.CODE_EVAL_BASE_URLS = CODE_EVAL_BASE_URLS
 
 ########################################
 #
+# PISTON
+#
+########################################
+
+
+app.state.config.ENABLE_PISTON_EXECUTION = ENABLE_PISTON_EXECUTION
+app.state.config.PISTON_BASE_URL = PISTON_BASE_URL
+
+########################################
+#
 # ICEBERG
 #
 ########################################
@@ -567,6 +594,8 @@ app.state.config.LLAMOLOTL_CONTROL_BASE_URLS = LLAMOLOTL_CONTROL_BASE_URLS
 app.state.config.LLAMOLOTL_API_CONFIGS = LLAMOLOTL_API_CONFIGS
 
 app.state.LLAMOLOTL_MODELS = {}
+# Populated by utils/model_integrity.run_periodic_sweep() -- self.ai/self.ai#38.
+app.state.MODEL_INTEGRITY_WARNINGS = {}
 
 ########################################
 #
@@ -728,6 +757,8 @@ app.state.config.BING_SEARCH_V7_ENDPOINT = BING_SEARCH_V7_ENDPOINT
 app.state.config.BING_SEARCH_V7_SUBSCRIPTION_KEY = BING_SEARCH_V7_SUBSCRIPTION_KEY
 app.state.config.FIRECRAWL_API_BASE_URL = FIRECRAWL_API_BASE_URL
 app.state.config.FIRECRAWL_API_KEY = FIRECRAWL_API_KEY
+app.state.config.BROWSE_PLAYWRIGHT_SERVICE_URL = BROWSE_PLAYWRIGHT_SERVICE_URL
+app.state.config.BROWSE_PLAYWRIGHT_API_KEY = BROWSE_PLAYWRIGHT_API_KEY
 
 app.state.config.RAG_WEB_SEARCH_RESULT_COUNT = RAG_WEB_SEARCH_RESULT_COUNT
 app.state.config.RAG_WEB_SEARCH_CONCURRENT_REQUESTS = RAG_WEB_SEARCH_CONCURRENT_REQUESTS
@@ -1025,6 +1056,48 @@ async def get_models(request: Request, user=Depends(get_verified_user)):
 async def get_base_models(request: Request, user=Depends(get_admin_user)):
     models = await get_all_base_models(request)
     return {"data": models}
+
+
+@app.get("/api/models/public")
+async def get_public_models(request: Request):
+    """Unauthenticated free-tier model listing (GitLab issue #6).
+
+    Returns the subset of models that are public — i.e. carry no
+    `access_control` restriction, the same "visible to any 'user' role"
+    semantics already used by `/api/models` (see `has_access`). Arena
+    models are excluded since they don't represent a single, nameable
+    model. The response is deliberately minimal: no `info` (params/meta
+    lineage such as `hf_repo`, connection details), no per-backend raw
+    payload (`openai`/`ollama`/`llamolotl`), no user/ownership data —
+    just enough to populate a free-tier model picker.
+    """
+    models = await get_all_models(request)
+
+    # Filter out filter pipelines, same as /api/models.
+    models = [model for model in models if "pipeline" not in model or model["pipeline"].get("type", None) != "filter"]
+
+    public_models = []
+    for model in models:
+        if model.get("arena"):
+            continue
+
+        model_info = Models.get_model_by_id(model["id"])
+        access_control = model_info.access_control if model_info else None
+        if access_control is not None:
+            # Restricted to specific users/groups; not part of the free tier.
+            continue
+
+        public_models.append(
+            {
+                "id": model["id"],
+                "name": model.get("name", model["id"]),
+                "object": model.get("object", "model"),
+                "created": model.get("created"),
+                "owned_by": model.get("owned_by"),
+            }
+        )
+
+    return {"data": public_models}
 
 
 ############################
@@ -1357,6 +1430,7 @@ async def get_app_config(request: Request):
                     "enable_admin_export": ENABLE_ADMIN_EXPORT,
                     "enable_admin_chat_access": ENABLE_ADMIN_CHAT_ACCESS,
                     "enable_curator": app.state.config.ENABLE_CURATOR_API,
+                    "enable_piston_execution": app.state.config.ENABLE_PISTON_EXECUTION,
                 }
                 if user is not None
                 else {}

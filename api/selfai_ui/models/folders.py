@@ -32,6 +32,33 @@ class Folder(Base):
     updated_at = Column(BigInteger)
 
 
+class FolderPresetModel(BaseModel):
+    """Typed shape of a chat folder's preset configuration.
+
+    A folder's preset carries retrieval defaults that a chat created inside the
+    folder is seeded from (by a separate, future consumer). All three fields are
+    optional: a folder with none of them set carries no preset.
+
+    ``extra="allow"`` provides forward compatibility — future preset attributes
+    can be carried without a breaking schema change, and unrecognized keys are
+    round-tripped intact rather than being dropped or rejected. Mirrors the
+    ``ModelMeta`` pattern in ``models/models.py``.
+    """
+
+    default_model_id: Optional[str] = None
+    """Reference (id) to the folder's default model, if any."""
+
+    tool_ids: Optional[list[str]] = None
+    """References (ids) to the folder's default tools, if any."""
+
+    knowledge_ids: Optional[list[str]] = None
+    """References (ids) to the folder's attached knowledge — a single list
+    covering both knowledge bases and datasets (a dataset is a knowledge
+    record), not two separate lists."""
+
+    model_config = ConfigDict(extra="allow")
+
+
 class FolderModel(BaseModel):
     id: str
     parent_id: Optional[str] = None
@@ -214,6 +241,40 @@ class FolderTable:
         except Exception as e:
             log.error(f"update_folder: {e}")
             return
+
+    def update_folder_meta_by_id_and_user_id(
+        self, id: str, user_id: str, meta: dict
+    ) -> Optional[FolderModel]:
+        """Persist folder metadata (e.g. the preset) into the folder's existing
+        ``meta`` JSON column — cavekit-chat-folders-rag-config.md R2.
+
+        The provided ``meta`` mapping is shallow-merged into the folder's
+        existing ``meta`` at the top level: keys present in ``meta`` are set (or
+        replaced), keys absent from ``meta`` are left untouched. This is the
+        generic top-level primitive; field-level merge *within* the preset (an
+        update that omits some preset fields) is a separate concern (T-004).
+
+        ``meta`` is already a JSON column on the ``folder`` table, so no schema
+        migration is required (R2 AC3). Reassigning ``folder.meta`` to a new dict
+        (rather than mutating in place) is what makes SQLAlchemy detect the
+        change on a plain ``JSON`` column.
+        """
+        try:
+            with get_db() as db:
+                folder = db.query(Folder).filter_by(id=id, user_id=user_id).first()
+
+                if not folder:
+                    return None
+
+                folder.meta = {**(folder.meta or {}), **(meta or {})}
+                folder.updated_at = int(time.time())
+
+                db.commit()
+
+                return FolderModel.model_validate(folder)
+        except Exception as e:
+            log.error(f"update_folder_meta: {e}")
+            return None
 
     def delete_folder_by_id_and_user_id(self, id: str, user_id: str) -> bool:
         try:

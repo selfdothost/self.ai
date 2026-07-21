@@ -254,17 +254,29 @@ async def get_file_content_by_id(id: str, user=Depends(get_verified_user)):
                 filename = file.meta.get("name", file.filename)
                 encoded_filename = quote(filename)  # RFC5987 encoding
 
-                headers = {}
-                if file.meta.get("content_type") not in [
-                    "application/pdf",
-                    "text/plain",
-                ]:
-                    headers = {
-                        **headers,
-                        "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}",
-                    }
+                # Decide inline-vs-download from the file's actual on-disk
+                # extension, never from the client-supplied meta.content_type
+                # -- that field is unverified attacker input at upload time
+                # and previously let a ".html" file claiming "text/plain"
+                # pass the inline allowlist while Starlette/FastAPI still
+                # served it as real text/html (guessed from the extension),
+                # producing a stored XSS (self.ai#55). Content-Security-Policy:
+                # sandbox is set unconditionally as a second layer -- it
+                # neutralizes script execution even for a file this logic
+                # misjudges, and (unlike Content-Disposition alone) also
+                # covers a browser tab navigated directly to this URL.
+                safe_inline_media_types = {
+                    ".pdf": "application/pdf",
+                    ".txt": "text/plain",
+                }
+                media_type = safe_inline_media_types.get(file_path.suffix.lower())
+                headers = {"Content-Security-Policy": "sandbox"}
 
-                return FileResponse(file_path, headers=headers)
+                if media_type is None:
+                    headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{encoded_filename}"
+                    media_type = "application/octet-stream"
+
+                return FileResponse(file_path, media_type=media_type, headers=headers)
 
             else:
                 raise HTTPException(
@@ -295,8 +307,19 @@ async def get_html_file_content_by_id(id: str, user=Depends(get_verified_user)):
 
             # Check if the file already exists in the cache
             if file_path.is_file():
-                print(f"file_path: {file_path}")
-                return FileResponse(file_path)
+                # This route is deliberately used by self.chat to inline-render
+                # an uploaded HTML file in an iframe (see htmlIdToken handling
+                # in self.chat's src/lib/utils/index.ts), so unlike /content
+                # above this can't just force a download. Content-Security-
+                # Policy: sandbox (no allow-scripts) disables script execution
+                # entirely for the served document -- it can't run the exact
+                # payload self.ai#55 demonstrated, whether loaded in that
+                # iframe or navigated to directly in a browser tab.
+                return FileResponse(
+                    file_path,
+                    media_type="text/html",
+                    headers={"Content-Security-Policy": "sandbox"},
+                )
             else:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
@@ -326,7 +349,13 @@ async def get_file_content_by_id_and_name(id: str, user=Depends(get_verified_use
         # Handle Unicode filenames
         filename = file.meta.get("name", file.filename)
         encoded_filename = quote(filename)  # RFC5987 encoding
-        headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"}
+        # Already forces attachment unconditionally (safe); media_type +
+        # Content-Security-Policy added for defense-in-depth consistency
+        # with the /content fix for self.ai#55.
+        headers = {
+            "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}",
+            "Content-Security-Policy": "sandbox",
+        }
 
         if file_path:
             file_path = Storage.get_file(file_path)
@@ -334,7 +363,7 @@ async def get_file_content_by_id_and_name(id: str, user=Depends(get_verified_use
 
             # Check if the file already exists in the cache
             if file_path.is_file():
-                return FileResponse(file_path, headers=headers)
+                return FileResponse(file_path, media_type="application/octet-stream", headers=headers)
             else:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,

@@ -234,7 +234,10 @@ async def update_config(request: Request, form_data: OllamaConfigForm, user=Depe
     }
 
 
-@cached(ttl=3)
+# key_builder ignores `request` — see openai.py/llamolotl.py's copies of this
+# same fix for why: aiocache's default key builder can't produce a stable
+# key from a Starlette Request, so the ttl=3 cache never hit.
+@cached(ttl=3, key_builder=lambda f, *args, **kwargs: "ollama:get_all_models")
 async def get_all_models(request: Request):
     log.info("get_all_models()")
     if request.app.state.config.ENABLE_OLLAMA_API:

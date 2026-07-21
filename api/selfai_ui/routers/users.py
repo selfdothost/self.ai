@@ -218,7 +218,7 @@ async def get_user_by_id(user_id: str, user=Depends(get_verified_user)):
             **{
                 "name": user.name,
                 "profile_image_url": user.profile_image_url,
-                "active": get_active_status_by_user_id(user_id),
+                "active": await get_active_status_by_user_id(user_id),
             }
         )
     else:

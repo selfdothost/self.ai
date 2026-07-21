@@ -64,6 +64,40 @@ class StorageProvider:
         )
         self.bucket_name = S3_BUCKET_NAME
 
+    def _commit_corpus_branch(self, repo_id: str, message: str) -> None:
+        """Best-effort commit of whatever is currently staged on SELF_CORPUS_BRANCH.
+
+        The S3 gateway used by _upload_to_corpus/_delete_from_corpus/
+        _delete_all_from_corpus only *stages* changes on the branch — same
+        distinction as `git add` vs `git commit`. LakeFS's S3 gateway never
+        auto-commits, so without this every KB write/delete sits as an
+        uncommitted diff indefinitely: no audit trail, invisible to anything
+        reading self.corpus via a commit/tag/ref, and silently losable if the
+        branch gets reset. Commit isn't exposed through the S3 gateway, so
+        this goes through the native `lakefs` client instead — same
+        SELF_CORPUS_LAKEFS_* endpoint/credentials as the boto3 gateway
+        client, different protocol (mirrors self.curator's api/corpus.py
+        commit_job_output, the working reference for this pattern).
+
+        Never raises, including the "nothing to commit" case (e.g. deleting
+        a key that was never staged, or a partially-failed caller) — same
+        best-effort posture as the stage/delete step it follows.
+        """
+        try:
+            import lakefs
+            from lakefs.client import Client as LakeFSClient
+
+            client = LakeFSClient(
+                host=SELF_CORPUS_LAKEFS_ENDPOINT.value,
+                username=SELF_CORPUS_LAKEFS_ACCESS_KEY_ID.value,
+                password=SELF_CORPUS_LAKEFS_SECRET_ACCESS_KEY.value,
+            )
+            branch = lakefs.Repository(repo_id, client=client).branch(SELF_CORPUS_BRANCH)
+            ref = branch.commit(message=message)
+            log.info(f"self.corpus commit for repo {repo_id}: {ref.id}")
+        except Exception as e:
+            log.warning(f"self.corpus commit skipped for repo {repo_id}: {e}")
+
     def _upload_to_corpus(self, file_path: str, kb_id: str, filename: str) -> None:
         """Best-effort push of a KB-scoped file into its self.corpus repo.
 
@@ -78,6 +112,8 @@ class StorageProvider:
             self.corpus_client.upload_file(file_path, repo_id, f"{SELF_CORPUS_BRANCH}/{filename}")
         except Exception as e:
             log.warning(f"self.corpus upload skipped for repo {repo_id}: {e}")
+        else:
+            self._commit_corpus_branch(repo_id, f"Add {filename} to knowledge base {kb_id}")
 
     def _delete_from_corpus(self, kb_id: str, filename: str) -> None:
         """Best-effort delete of a KB-scoped file's object in self.corpus."""
@@ -88,6 +124,8 @@ class StorageProvider:
             self.corpus_client.delete_object(Bucket=repo_id, Key=f"{SELF_CORPUS_BRANCH}/{filename}")
         except Exception as e:
             log.warning(f"self.corpus delete skipped for repo {repo_id}: {e}")
+        else:
+            self._commit_corpus_branch(repo_id, f"Remove {filename} from knowledge base {kb_id}")
 
     def _delete_all_from_corpus(self, kb_id: str) -> None:
         """Best-effort delete of every object in a KB's self.corpus repo."""
@@ -100,6 +138,8 @@ class StorageProvider:
                 self.corpus_client.delete_object(Bucket=repo_id, Key=content["Key"])
         except Exception as e:
             log.warning(f"self.corpus subdirectory cleanup skipped for repo {repo_id}: {e}")
+        else:
+            self._commit_corpus_branch(repo_id, f"Clear knowledge base {kb_id}")
 
     def _upload_to_s3(self, file_path: str, filename: str) -> Tuple[bytes, str]:
         """Handles uploading of the file to S3 storage."""

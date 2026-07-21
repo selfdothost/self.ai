@@ -185,6 +185,15 @@ async def browse_fetch(request: Request, url: str, profile: BrowseProfile) -> Br
     timeout_seconds = profile.timeout_seconds if profile and profile.timeout_seconds else DEFAULT_TIMEOUT_SECONDS
     retry_count = profile.retry_count if profile else 0
 
+    # The Playwright service's own page-load timeout defaults to 15s
+    # (selftools/playwright) unless told otherwise. Without this, a
+    # profile's timeout_seconds only bounds our client wait — it never
+    # actually controls how long Playwright itself spends navigating,
+    # so a longer client timeout couldn't help a page that Playwright's
+    # own default would already give up on first. Leave a margin below
+    # our own client timeout for the response to actually come back.
+    playwright_timeout_ms = max(1000, int((timeout_seconds - 3) * 1000))
+
     headers = {"Content-Type": "application/json"}
     if api_key:
         # R1: credentials sourced from configuration, never a literal in
@@ -198,7 +207,7 @@ async def browse_fetch(request: Request, url: str, profile: BrowseProfile) -> Br
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_seconds)) as session:
                 async with session.post(
                     f"{service_url.rstrip('/')}/scrape",
-                    json={"url": url},
+                    json={"url": url, "timeout": playwright_timeout_ms},
                     headers=headers,
                 ) as response:
                     if response.status in (401, 403):

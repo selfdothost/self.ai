@@ -16,7 +16,13 @@ GENERAL_SEARCH_PROFILE = BrowseProfile(
     name="general-search",
     allowlist=[],  # broad/arbitrary search — no allowlist restriction
     blocklist=[],
-    timeout_seconds=10.0,
+    # Playwright's own page.goto navigation timeout defaults to 15s
+    # (selftools/playwright, not configurable from here — browse_fetch's
+    # request body doesn't pass a `timeout` override). A client-side
+    # timeout shorter than that always wins the race on a slow page,
+    # discarding Playwright's real result (success or a specific error)
+    # in favor of a bare, uninformative asyncio.TimeoutError.
+    timeout_seconds=20.0,
     retry_count=0,
 )
 
@@ -29,7 +35,9 @@ WEATHER_SEARCH_PROFILE = BrowseProfile(
         "accuweather.com",
     ],
     blocklist=[],
-    timeout_seconds=8.0,
+    # Same reasoning as GENERAL_SEARCH_PROFILE — must clear Playwright's own
+    # ~15s page-load timeout, or the client preempts it every time.
+    timeout_seconds=20.0,
     retry_count=1,
     extra={"location_based": True},
 )

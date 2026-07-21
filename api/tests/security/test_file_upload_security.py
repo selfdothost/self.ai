@@ -149,3 +149,109 @@ def test_upload_allowlist_blocks_non_allowed(authenticated_user, test_app):
         )
     finally:
         test_app.state.config.FILE_UPLOAD_MIME_ALLOWLIST = []
+
+
+# ---------------------------------------------------------------------------
+# self.ai#55: served Content-Disposition/Content-Type must come from the
+# file's actual extension, never the client-supplied upload content_type --
+# a .html file lying about its content-type at upload previously slipped
+# past the inline-serving allowlist and was served (and executed) as real
+# text/html.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.tier0
+@pytest.mark.security
+def test_html_file_served_with_attachment_disposition(authenticated_user, test_app):
+    """A .html file claiming text/plain at upload must still download, not render."""
+    test_app.state.config.FILE_MAX_SIZE = None
+    resp = authenticated_user.post(
+        UPLOAD_PATH,
+        files={
+            "file": (
+                "test.html",
+                b"<html><body><script>alert(1)</script></body></html>",
+                "text/plain",
+            )
+        },
+    )
+    if resp.status_code != 200:
+        pytest.xfail(f"Upload failed (likely retrieval backend not mocked): {resp.status_code}")
+    file_id = resp.json()["id"]
+
+    content_resp = authenticated_user.get(f"/api/v1/files/{file_id}/content")
+    assert content_resp.status_code == 200
+    assert "attachment" in content_resp.headers.get("content-disposition", ""), (
+        f"Expected Content-Disposition: attachment for a .html file, "
+        f"got: {content_resp.headers.get('content-disposition')!r}"
+    )
+    assert content_resp.headers.get("content-security-policy") == "sandbox"
+
+
+@pytest.mark.tier0
+@pytest.mark.security
+def test_svg_file_served_with_attachment_disposition(authenticated_user, test_app):
+    """Same as above for .svg (classic SVG-script XSS vector)."""
+    test_app.state.config.FILE_MAX_SIZE = None
+    resp = authenticated_user.post(
+        UPLOAD_PATH,
+        files={
+            "file": (
+                "test.svg",
+                b"<svg xmlns='http://www.w3.org/2000/svg'><script>alert(1)</script></svg>",
+                "text/plain",
+            )
+        },
+    )
+    if resp.status_code != 200:
+        pytest.xfail(f"Upload failed (likely retrieval backend not mocked): {resp.status_code}")
+    file_id = resp.json()["id"]
+
+    content_resp = authenticated_user.get(f"/api/v1/files/{file_id}/content")
+    assert content_resp.status_code == 200
+    assert "attachment" in content_resp.headers.get("content-disposition", "")
+
+
+@pytest.mark.tier0
+@pytest.mark.security
+def test_txt_file_still_served_inline(authenticated_user, test_app):
+    """A genuine .txt file keeps its existing inline-serving UX (no regression)."""
+    test_app.state.config.FILE_MAX_SIZE = None
+    resp = authenticated_user.post(
+        UPLOAD_PATH,
+        files={"file": ("notes.txt", b"just some notes", "text/plain")},
+    )
+    if resp.status_code != 200:
+        pytest.xfail(f"Upload failed (likely retrieval backend not mocked): {resp.status_code}")
+    file_id = resp.json()["id"]
+
+    content_resp = authenticated_user.get(f"/api/v1/files/{file_id}/content")
+    assert content_resp.status_code == 200
+    assert "attachment" not in content_resp.headers.get("content-disposition", "")
+    assert content_resp.headers.get("content-security-policy") == "sandbox"
+
+
+@pytest.mark.tier0
+@pytest.mark.security
+def test_html_content_html_route_served_sandboxed(authenticated_user, test_app):
+    """The /content/html route intentionally serves HTML inline (self.chat
+    iframes it for citation rendering) -- it must carry a sandbox CSP that
+    disables script execution rather than force a download."""
+    test_app.state.config.FILE_MAX_SIZE = None
+    resp = authenticated_user.post(
+        UPLOAD_PATH,
+        files={
+            "file": (
+                "citation.html",
+                b"<html><body><script>alert(1)</script>hello</body></html>",
+                "text/plain",
+            )
+        },
+    )
+    if resp.status_code != 200:
+        pytest.xfail(f"Upload failed (likely retrieval backend not mocked): {resp.status_code}")
+    file_id = resp.json()["id"]
+
+    content_resp = authenticated_user.get(f"/api/v1/files/{file_id}/content/html")
+    assert content_resp.status_code == 200
+    assert content_resp.headers.get("content-security-policy") == "sandbox"

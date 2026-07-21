@@ -57,6 +57,10 @@ log.setLevel(SRC_LOG_LEVELS.get("MAIN", logging.INFO))
 # match self.llamolotl's SERVICE_AUTH_AUDIENCE (self.llamolotl#12).
 LLAMOLOTL_AUDIENCE = "self.llamolotl"
 
+# Same audience string as routers/curator.py — must match self.curator's
+# SERVICE_AUTH_AUDIENCE (self.curator#5 / self.ai#25).
+CURATOR_AUDIENCE = "self.curator"
+
 # Set by main.py lifespan handler so the dispatcher can access app config.
 _app_state = None
 
@@ -124,6 +128,65 @@ def _resolve_worker_url(job_type: str) -> Optional[str]:
         return None
 
     return None
+
+
+####################################
+# llamolotl model residency coordination
+####################################
+
+
+async def _ensure_llamolotl_model_ready(model_id: str) -> None:
+    """Unload any other model llamolotl has loaded before dispatching to model_id.
+
+    llamolotl's router evicts by slot count (MODELS_MAX), not by available
+    VRAM (self.llamolotl#22) -- requesting a second large model while one is
+    already resident can OOM the new load outright, crash that child
+    process, and leave the router stuck reporting status "loading" forever
+    until someone manually restarts the pod. Hit this repeatedly running
+    eval sweeps across GLM-4.5-Air/Qwen3-Coder-Next/Gemma 4 back to back.
+
+    This is a best-effort mitigation, not a fix -- self.llamolotl#22 is the
+    real one (VRAM-aware eviction in the router itself). If model_id isn't
+    something llamolotl actually serves (a cloud/remote model config), the
+    /v1/models lookup just won't find it and this is a no-op.
+    """
+    if _app_state is None:
+        return
+
+    base_urls = list(_app_state.config.LLAMOLOTL_BASE_URLS or [])
+    if not base_urls:
+        return
+
+    for url in base_urls:
+        base = url.rstrip("/")
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(f"{base}/v1/models")
+                resp.raise_for_status()
+                models = resp.json().get("data", [])
+        except Exception as e:
+            log.debug(f"llamolotl model-residency check skipped for {base}: {e}")
+            continue
+
+        known_ids = {m.get("id") for m in models}
+        if model_id not in known_ids:
+            # Not a model this llamolotl instance serves at all -- nothing to do.
+            continue
+
+        for m in models:
+            other_id = m.get("id")
+            status = (m.get("status") or {}).get("value")
+            if other_id == model_id or status not in ("loaded", "loading"):
+                continue
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    unload_resp = await client.post(f"{base}/models/unload", json={"model": other_id})
+                log.info(
+                    f"llamolotl: unloaded {other_id!r} to make room for {model_id!r} "
+                    f"(status={unload_resp.status_code})"
+                )
+            except Exception as e:
+                log.warning(f"llamolotl: failed to unload {other_id!r} before loading {model_id!r}: {e}")
 
 
 ####################################
@@ -280,13 +343,19 @@ async def _finalize_curator_job(job: CuratorJobModel, curator_url: str) -> bool:
         downloaded = 0
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
-                listing = await client.get(f"{curator_url}/api/jobs/{job.curator_job_id}/output")
+                listing = await client.get(
+                    f"{curator_url}/api/jobs/{job.curator_job_id}/output",
+                    headers={TICKET_HEADER: mint_service_ticket(CURATOR_AUDIENCE, "jobs:read")},
+                )
                 files = listing.json().get("files", []) if listing.status_code == 200 else []
                 for f in files:
                     fn = f.get("filename")
                     if not fn:
                         continue
-                    r = await client.get(f"{curator_url}/api/jobs/{job.curator_job_id}/output/{fn}")
+                    r = await client.get(
+                        f"{curator_url}/api/jobs/{job.curator_job_id}/output/{fn}",
+                        headers={TICKET_HEADER: mint_service_ticket(CURATOR_AUDIENCE, "jobs:read")},
+                    )
                     if r.status_code != 200:
                         continue
                     dest = os.path.join(local_out, fn)
@@ -344,7 +413,10 @@ async def _sync_running_curator_jobs() -> None:
 
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(f"{curator_url}/api/jobs/{job.curator_job_id}")
+                resp = await client.get(
+                    f"{curator_url}/api/jobs/{job.curator_job_id}",
+                    headers={TICKET_HEADER: mint_service_ticket(CURATOR_AUDIENCE, "jobs:read")},
+                )
                 if resp.status_code == 404:
                     log.warning(f"Curator job {job.curator_job_id} not found -- marking failed")
                     CuratorJobs.update_job_status(
@@ -451,6 +523,11 @@ async def _dispatch_eval_job_by_type(job: EvalJobModel) -> None:
         _dispatch_language_eval_job as _language_eval_dispatch,
     )
 
+    # Best-effort: free up any other resident model before this one tries to
+    # load. See _ensure_llamolotl_model_ready's docstring / self.llamolotl#22
+    # for why this is needed and what it doesn't fix.
+    await _ensure_llamolotl_model_ready(job.model_id)
+
     eval_type = getattr(job, "eval_type", "code-eval") or "code-eval"
     if eval_type == "language-eval":
         await _language_eval_dispatch(job)
@@ -518,6 +595,7 @@ async def _dispatch_curator_job(job: CuratorJobModel) -> None:
                     f"{curator_url}/api/data/upload",
                     data={"name": str(job.id)},
                     files={"file": ("input.jsonl", content, "application/jsonl")},
+                    headers={TICKET_HEADER: mint_service_ticket(CURATOR_AUDIENCE, "data:write")},
                 )
                 up.raise_for_status()
                 paths = up.json()
@@ -527,12 +605,19 @@ async def _dispatch_curator_job(job: CuratorJobModel) -> None:
                 log.warning(
                     f"Curator job {job.id}: input {api_input!r} not on the API volume; " "dispatching config as-is"
                 )
-            resp = await client.post(f"{curator_url}/api/jobs", json=pipeline_config)
+            resp = await client.post(
+                f"{curator_url}/api/jobs",
+                json=pipeline_config,
+                headers={TICKET_HEADER: mint_service_ticket(CURATOR_AUDIENCE, "jobs:create")},
+            )
             resp.raise_for_status()
             remote_job = resp.json()
             # Curator jobs start PENDING — approve starts execution immediately.
             # Curator is a pure executor; the daemon owns all dispatch decisions.
-            await client.post(f"{curator_url}/api/jobs/{remote_job['job_id']}/approve")
+            await client.post(
+                f"{curator_url}/api/jobs/{remote_job['job_id']}/approve",
+                headers={TICKET_HEADER: mint_service_ticket(CURATOR_AUDIENCE, "jobs:write")},
+            )
     except Exception as e:
         log.error(f"Curator dispatch failed for job {job.id}: {e}")
         CuratorJobs.update_job_status(
@@ -812,7 +897,7 @@ async def process_gpu_queue_v2() -> None:
         lock_acquired = False
         try:
             try:
-                lock_acquired = bool(lock.aquire_lock())
+                lock_acquired = bool(await lock.aquire_lock())
             except redis.exceptions.ConnectionError as e:
                 log.warning(f"GPU queue: Redis unavailable, running without lock: {e}")
                 lock = _make_lock()
@@ -836,7 +921,7 @@ async def process_gpu_queue_v2() -> None:
                 log.error(f"GPU queue dispatch error: {e}", exc_info=True)
             finally:
                 try:
-                    lock.release_lock()
+                    await lock.release_lock()
                 except Exception as e:
                     # Lock expires naturally after LOCK_TIMEOUT seconds, but log
                     # in case release is failing for a different reason.
