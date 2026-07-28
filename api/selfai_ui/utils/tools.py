@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, create_model
 from selfai_ui.models.tools import Tools
 from selfai_ui.models.users import UserModel
 from selfai_ui.utils.plugin import load_tools_module_by_id
+from selfai_ui.utils.toolspec import ToolSpec
 
 log = logging.getLogger(__name__)
 
@@ -32,7 +33,10 @@ def apply_extra_params_to_tool_function(function: Callable, extra_params: dict) 
 
 # Mutation on extra_params
 def get_tools(request: Request, tool_ids: list[str], user: UserModel, extra_params: dict) -> dict[str, dict]:
-    tools_dict = {}
+    # Collected as (name, tool) pairs rather than a dict so that two toolkits
+    # declaring a tool of the same name both survive to resolve_collisions,
+    # which qualifies each by owner. A dict here would silently overwrite.
+    collected: list[tuple[str, dict]] = []
 
     for tool_id in tool_ids:
         tools = Tools.get_tool_by_id(tool_id)
@@ -54,18 +58,19 @@ def get_tools(request: Request, tool_ids: list[str], user: UserModel, extra_para
                 **Tools.get_user_valves_by_id_and_user_id(tool_id, user.id)
             )
 
-        for spec in tools.specs:
-            # Remove internal parameters
-            spec["parameters"]["properties"] = {
-                key: val for key, val in spec["parameters"]["properties"].items() if not key.startswith("__")
-            }
+        for stored_spec in tools.specs:
+            # `tools.specs` is read off a cached `Tools` DB model, so its dicts are
+            # shared structure. The internal-parameter strip used to be an in-place
+            # write into that structure, which leaked the stripped schema into every
+            # later reader of the row. Building a ToolSpec and asking it for a
+            # stripped copy leaves the cached object untouched.
+            spec = ToolSpec.from_openai(stored_spec).without_internal_params()
 
-            function_name = spec["name"]
+            function_name = spec.name
 
             # convert to function that takes only model params and inserts custom params
             original_func = getattr(module, function_name)
             callable = apply_extra_params_to_tool_function(original_func, extra_params)
-            # TODO: This needs to be a pydantic model
             tool_dict = {
                 "toolkit_id": tool_id,
                 "callable": callable,
@@ -75,15 +80,18 @@ def get_tools(request: Request, tool_ids: list[str], user: UserModel, extra_para
                 "citation": hasattr(module, "citation") and module.citation,
             }
 
-            # TODO: if collision, prepend toolkit name
-            if function_name in tools_dict:
-                log.warning(f"Tool {function_name} already exists in another tools!")
-                log.warning(f"Collision between {tools} and {tool_id}.")
-                log.warning(f"Discarding {tools}.{function_name}")
-            else:
-                tools_dict[function_name] = tool_dict
+            # Collisions are collected, not discarded. Every holder of a shared
+            # name is qualified with its toolkit id by resolve_collisions below,
+            # so the resulting set of names is independent of load order. The old
+            # behaviour logged a warning and silently dropped the entry.
+            collected.append((function_name, tool_dict))
 
-    return tools_dict
+    # Resolve any collisions deterministically (qualify shared names by owner).
+    # This keeps every tool and is order-independent, replacing the silent
+    # discard that used to lose the colliding entry.
+    from selfai_ui.mods.tools import resolve_collisions
+
+    return resolve_collisions(collected)
 
 
 def parse_description(docstring: str | None) -> str:

@@ -1,7 +1,7 @@
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 
 from selfai_ui.constants import ERROR_MESSAGES
@@ -102,7 +102,9 @@ PRESET_FIELDS = {"default_model_id", "tool_ids", "knowledge_ids"}
 
 
 @router.post("/{id}/update")
-async def update_folder_name_by_id(id: str, form_data: FolderForm, user=Depends(get_verified_user)):
+async def update_folder_name_by_id(
+    id: str, form_data: FolderForm, request: Request, user=Depends(get_verified_user)
+):
     folder = Folders.get_folder_by_id_and_user_id(id, user.id)
     if not folder:
         raise HTTPException(
@@ -130,7 +132,10 @@ async def update_folder_name_by_id(id: str, form_data: FolderForm, user=Depends(
         # never reveals which reference failed nor whether an existing record
         # was merely inaccessible vs. nonexistent (R3 no-existence-leak).
         preset_model = FolderPresetModel(**extra)
-        if folder_presets.unresolved_preset_references(preset_model, user):
+        web_search_enabled = bool(request.app.state.config.ENABLE_RAG_WEB_SEARCH)
+        if folder_presets.unresolved_preset_references(
+            preset_model, user, web_search_enabled=web_search_enabled
+        ):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=ERROR_MESSAGES.DEFAULT("Error updating folder"),

@@ -1,0 +1,6 @@
+{
+  "name": "selfai-api",
+  "version": "0.5.0",
+  "description": "self.ai API server (selfai_ui) — the version core reports as its capability level. A mod's mod.yaml `min_core_version` is compared against this. Bump the minor when the mods facade or another mod-facing surface gains a capability a mod may require; the patch for fixes.",
+  "private": true
+}

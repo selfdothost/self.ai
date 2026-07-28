@@ -35,6 +35,11 @@ from selfai_ui.env import (
     SRC_LOG_LEVELS,
 )
 from selfai_ui.utils.auth import get_admin_user, get_verified_user
+from selfai_ui.utils.service_auth import (
+    TICKET_HEADER,
+    ServiceAuthNotConfigured,
+    mint_service_ticket,
+)
 
 router = APIRouter()
 
@@ -44,6 +49,39 @@ MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024  # Convert MB to bytes
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["AUDIO"])
+
+
+def _service_ticket_header(control_base_url: str, audience: str, scope: str) -> dict:
+    """Mint the X-Selfai-Ticket header for a self-hosted audio backend, or {}.
+
+    self.speak (audio:synthesize) and self.transcribe (audio:transcribe) now
+    validate a short-lived scoped ticket on their serving endpoints
+    (self.speak b37f016 / self.transcribe 85d30b6, self.ai#25 follow-up). Without
+    it they fail-closed with 401 — which is why TTS synthesis was broken. Mint one
+    per request and attach it here.
+
+    Gated on the self-hosted CONTROL base URL being configured: that env is the
+    marker of a self-hosted self.ai engine (it's what the catalog/model control
+    ports use). When TTS/STT is a real external provider (OpenAI/ElevenLabs/Azure)
+    the control URL is unset, so no internal ticket is minted or leaked outward.
+
+    Never fails the request: if the secret is unconfigured or minting errors, log
+    and return {} so the call proceeds exactly as before (and the backend's own
+    401, if any, surfaces normally) rather than 500-ing the user's audio.
+    """
+    if not (control_base_url or "").strip():
+        return {}
+    try:
+        return {TICKET_HEADER: mint_service_ticket(audience, scope)}
+    except ServiceAuthNotConfigured:
+        log.warning(
+            "SERVICE_AUTH_SECRET unset; forwarding to %s without a service ticket",
+            audience,
+        )
+        return {}
+    except Exception as e:  # noqa: BLE001 — minting must never break serving
+        log.warning("failed to mint %s service ticket: %s", audience, e)
+        return {}
 
 SPEECH_CACHE_DIR = Path(CACHE_DIR).joinpath("./audio/speech/")
 SPEECH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -271,6 +309,11 @@ async def speech(request: Request, user=Depends(get_verified_user)):
                     headers={
                         "Content-Type": "application/json",
                         "Authorization": f"Bearer {request.app.state.config.TTS_OPENAI_API_KEY}",
+                        **_service_ticket_header(
+                            getattr(request.app.state.config, "TTS_CONTROL_BASE_URL", ""),
+                            "self.speak",
+                            "audio:synthesize",
+                        ),
                         **(
                             {
                                 "X-OpenWebUI-User-Name": user.name,
@@ -504,7 +547,14 @@ def transcribe(request: Request, file_path):
         try:
             r = requests.post(
                 url=f"{request.app.state.config.STT_OPENAI_API_BASE_URL}/audio/transcriptions",
-                headers={"Authorization": f"Bearer {request.app.state.config.STT_OPENAI_API_KEY}"},
+                headers={
+                    "Authorization": f"Bearer {request.app.state.config.STT_OPENAI_API_KEY}",
+                    **_service_ticket_header(
+                        getattr(request.app.state.config, "STT_CONTROL_BASE_URL", ""),
+                        "self.transcribe",
+                        "audio:transcribe",
+                    ),
+                },
                 files={"file": (filename, open(file_path, "rb"))},
                 data={"model": request.app.state.config.STT_MODEL},
             )

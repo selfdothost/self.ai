@@ -2,7 +2,7 @@ import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from selfai_ui.constants import ERROR_MESSAGES
 from selfai_ui.env import SRC_LOG_LEVELS
@@ -62,6 +62,15 @@ async def get_user_permissisions(user=Depends(get_verified_user)):
 # User Default Permissions
 ############################
 class WorkspacePermissions(BaseModel):
+    # extra="allow" throughout: the configured defaults carry keys these models
+    # do not declare (`workspace.training`, the whole `features` block), and
+    # mod scopes will add a `mods.<id>.*` namespace no model can ever declare
+    # ahead of time. Forbidding extras made `model_dump()` drop them, and the
+    # endpoint then wrote the truncated result back over the config -- an admin
+    # who opened the permissions page and saved it, changing nothing, destroyed
+    # settings they never touched.
+    model_config = ConfigDict(extra="allow")
+
     models: bool
     knowledge: bool
     prompts: bool
@@ -69,6 +78,8 @@ class WorkspacePermissions(BaseModel):
 
 
 class ChatPermissions(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     file_upload: bool
     delete: bool
     edit: bool
@@ -76,8 +87,54 @@ class ChatPermissions(BaseModel):
 
 
 class UserPermissions(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     workspace: WorkspacePermissions
     chat: ChatPermissions
+
+
+def _assert_permission_shape(node: object, path: str = "") -> None:
+    """Every branch is a mapping and every leaf is a boolean.
+
+    `extra="allow"` accepts undeclared keys but does not type them, so this is
+    what keeps "preserve what you don't model" from becoming "accept anything".
+    A permission is a yes/no; `has_permission()` walks nested dicts and reads a
+    leaf as a flag, so a string leaf would be silently truthy and grant access
+    nobody intended.
+    """
+    if isinstance(node, bool):
+        return
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if not isinstance(key, str):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"permission key at '{path or 'root'}' must be a string",
+                )
+            _assert_permission_shape(value, f"{path}.{key}" if path else key)
+        return
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=f"permission '{path}' must be a boolean or a group of permissions",
+    )
+
+
+def _merge_permissions(current: dict, incoming: dict) -> dict:
+    """Overlay `incoming` onto `current`, keeping keys `incoming` omits.
+
+    Replacement semantics are what made a partial payload destructive. Merging
+    means an older client, or one built against a model that predates a new
+    permission, cannot erase what it does not know about. Values the caller
+    does send always win, including `False` -- an admin revoking a permission
+    must still be able to revoke it.
+    """
+    merged = dict(current)
+    for key, value in incoming.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_permissions(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
 
 
 @router.get("/default/permissions")
@@ -87,7 +144,11 @@ async def get_user_permissions(request: Request, user=Depends(get_admin_user)):
 
 @router.post("/default/permissions")
 async def update_user_permissions(request: Request, form_data: UserPermissions, user=Depends(get_admin_user)):
-    request.app.state.config.USER_PERMISSIONS = form_data.model_dump()
+    incoming = form_data.model_dump()
+    _assert_permission_shape(incoming)
+
+    current = request.app.state.config.USER_PERMISSIONS or {}
+    request.app.state.config.USER_PERMISSIONS = _merge_permissions(current, incoming)
     return request.app.state.config.USER_PERMISSIONS
 
 

@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from sqlalchemy import JSON, Column, DateTime, Integer, func
 
 from selfai_ui.env import (
+    BACKEND_DIR,
     DATA_DIR,
     DATABASE_URL,
     ENV,
@@ -791,6 +792,35 @@ PISTON_BASE_URL = PersistentConfig(
 )
 
 ####################################
+# MODS
+####################################
+# Operator-installed extensions. A mod is trusted code running in this process
+# with this process's privileges -- enabling one is a decision of the same
+# weight as deploying any other service into your stack. Scopes bound what
+# *users* reach through a mod; they do not bound the mod itself.
+#
+# Discovery is the intersection of installed and enabled. Present-but-not-
+# enabled contributes nothing and reports nothing (somebody meant it);
+# enabled-but-not-installed is always an error (it is always a mistake) but
+# never fatal. Enablement takes effect at boot -- there is no hot reload.
+
+MODS_DIR = Path(os.environ.get("MODS_DIR", BACKEND_DIR / "mods"))
+
+# Extra install locations beyond MODS_DIR. Semicolon-separated, matching the
+# convention already used by OPENAI_API_BASE_URLS and CODE_EVAL_BASE_URLS.
+MODS_EXTRA_DIRS = [d.strip() for d in os.environ.get("MODS_EXTRA_DIRS", "").split(";") if d.strip()]
+
+MODS_INSTALL_DIRS = [MODS_DIR, *[Path(d) for d in MODS_EXTRA_DIRS]]
+
+# The enabled list. Empty by default -- installing a mod does not enable it,
+# and an instance nobody has configured runs no mod code at all.
+ENABLED_MODS = PersistentConfig(
+    "ENABLED_MODS",
+    "mods.enabled",
+    [m.strip() for m in os.environ.get("ENABLED_MODS", "").split(",") if m.strip()],
+)
+
+####################################
 # ICEBERG
 ####################################
 
@@ -852,6 +882,39 @@ try:
 except Exception:
     pass
 OPENAI_API_BASE_URL = "https://api.openai.com/v1"
+
+####################################
+# ANTHROPIC
+####################################
+
+ENABLE_ANTHROPIC_API = PersistentConfig(
+    "ENABLE_ANTHROPIC_API",
+    "anthropic.enable",
+    os.environ.get("ENABLE_ANTHROPIC_API", "False").lower() == "true",
+)
+
+ANTHROPIC_BASE_URLS = os.environ.get("ANTHROPIC_BASE_URLS", "")
+if ANTHROPIC_BASE_URLS == "":
+    ANTHROPIC_BASE_URLS = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+
+ANTHROPIC_BASE_URLS = [url.strip() for url in ANTHROPIC_BASE_URLS.split(";")]
+ANTHROPIC_BASE_URLS = PersistentConfig("ANTHROPIC_BASE_URLS", "anthropic.base_urls", ANTHROPIC_BASE_URLS)
+
+# Unlike OPENAI_API_KEYS, the Anthropic key lives *inside* the per-URL config bag
+# (as ollama/llamolotl already do). Anthropic authenticates with x-api-key, and the
+# parallel URLs/keys arrays on the OpenAI side force a pad/truncate dance in both
+# the router and the admin UI that we are deliberately not reproducing.
+try:
+    ANTHROPIC_API_CONFIGS_ENV = json.loads(os.environ.get("ANTHROPIC_API_CONFIGS", "{}"))
+except Exception as e:
+    print(f"Error loading ANTHROPIC_API_CONFIGS: {e}")
+    ANTHROPIC_API_CONFIGS_ENV = {}
+
+ANTHROPIC_API_CONFIGS = PersistentConfig(
+    "ANTHROPIC_API_CONFIGS",
+    "anthropic.api_configs",
+    ANTHROPIC_API_CONFIGS_ENV,
+)
 
 ####################################
 # WEBUI
@@ -1600,6 +1663,19 @@ ENABLE_RAG_WEB_SEARCH = PersistentConfig(
     os.getenv("ENABLE_RAG_WEB_SEARCH", "False").lower() == "true",
 )
 
+# Deep research (cavekit-browse-web-access.md R4) is gated separately from web
+# search, not folded into it. Searching and reading a named page are one
+# capability -- ask the web something, get a page back. Crawling is a different
+# one: it reads a dozen pages, follows links between them, and takes a minute
+# and a half doing it. A user who turned on "Web Search" did not ask for that.
+#
+# Defaults off. An admin turns it on deliberately, per instance.
+ENABLE_DEEP_RESEARCH = PersistentConfig(
+    "ENABLE_DEEP_RESEARCH",
+    "browse.research.enable",
+    os.getenv("ENABLE_DEEP_RESEARCH", "False").lower() == "true",
+)
+
 RAG_WEB_SEARCH_ENGINE = PersistentConfig(
     "RAG_WEB_SEARCH_ENGINE",
     "rag.web.search.engine",
@@ -1630,6 +1706,46 @@ FIRECRAWL_API_KEY = PersistentConfig(
     os.getenv("FIRECRAWL_API_KEY", ""),
 )
 
+# Knowledge-Base domain crawls (Firecrawl) are crawler behavior, so they honor
+# a site's robots.txt Crawl-delay: before a crawl, the target's robots.txt is
+# read and Firecrawl's inter-request delay is raised to at least what the site
+# asks. This layers ON TOP of the user's static delay (which still applies as
+# the per-page render wait) — the effective inter-request delay becomes
+# max(static delay, robots Crawl-delay). Default on.
+#
+# The robots.txt itself is read through the browse connection (the Playwright
+# tunnel), so honoring only happens when that connection is configured; without
+# it the crawl proceeds on the static delay alone.
+KB_CRAWL_RESPECT_ROBOTS_DELAY = PersistentConfig(
+    "KB_CRAWL_RESPECT_ROBOTS_DELAY",
+    "rag.web.firecrawl.respect_robots_delay",
+    os.getenv("KB_CRAWL_RESPECT_ROBOTS_DELAY", "True").lower() == "true",
+)
+
+# Web Crawl (chat) — the Knowledge-Base domain crawl, driven by a model instead
+# of the KB UI. Same crawl endpoint and pipeline; what differs is who starts it.
+# Defaults off: it writes into a knowledge base, so an admin opts in.
+ENABLE_WEB_CRAWL = PersistentConfig(
+    "ENABLE_WEB_CRAWL",
+    "rag.web.crawl.enable",
+    os.getenv("ENABLE_WEB_CRAWL", "False").lower() == "true",
+)
+
+# Crawl budget for model-driven crawls. Admin-set, never a tool argument: a
+# model that could choose these would DoS Firecrawl and bloat the target KB,
+# and unlike a transient answer the output is persisted storage.
+WEB_CRAWL_MAX_PAGES = PersistentConfig(
+    "WEB_CRAWL_MAX_PAGES",
+    "rag.web.crawl.max_pages",
+    int(os.getenv("WEB_CRAWL_MAX_PAGES", "25")),
+)
+
+WEB_CRAWL_MAX_DEPTH = PersistentConfig(
+    "WEB_CRAWL_MAX_DEPTH",
+    "rag.web.crawl.max_depth",
+    int(os.getenv("WEB_CRAWL_MAX_DEPTH", "2")),
+)
+
 # self.ai's own, first-class connection to a Playwright browser-automation
 # service — independent of the domain-crawl backend (self.crawl/Firecrawl)
 # above. See api/selfai_ui/browse/connection.py (cavekit-browse-connection.md).
@@ -1643,6 +1759,94 @@ BROWSE_PLAYWRIGHT_API_KEY = PersistentConfig(
     "BROWSE_PLAYWRIGHT_API_KEY",
     "browse.playwright.api_key",
     os.getenv("BROWSE_PLAYWRIGHT_API_KEY", ""),
+)
+
+# Web-access tool tuning (cavekit-browse-web-access.md).
+#
+# R2: how much of a directly-read page the model may receive. Content past this
+# point is truncated, with the truncation stated in the returned text — a
+# truncated page is never indistinguishable from a complete one.
+BROWSE_FETCH_MAX_CHARS = PersistentConfig(
+    "BROWSE_FETCH_MAX_CHARS",
+    "browse.fetch.max_chars",
+    int(os.getenv("BROWSE_FETCH_MAX_CHARS", "50000")),
+)
+
+# R3: cap on how many outbound links a single page may contribute. Bounds the
+# model-facing link list, and the research tool's frontier.
+BROWSE_MAX_LINKS_PER_PAGE = PersistentConfig(
+    "BROWSE_MAX_LINKS_PER_PAGE",
+    "browse.fetch.max_links_per_page",
+    int(os.getenv("BROWSE_MAX_LINKS_PER_PAGE", "50")),
+)
+
+# R5: the deep_research traversal budget. These bound a single tool call, and
+# they are deliberately admin-side only — the model cannot read, set, or
+# negotiate them. A model that could set its own depth would set it wrong, and
+# it would turn an in-chat tool into a load generator aimed at a Playwright
+# service shared with every other yard consumer.
+#
+# Whichever of these binds first ends the traversal; the pages gathered so far
+# are returned and the reason is stated, rather than truncating silently.
+DEEP_RESEARCH_MAX_DEPTH = PersistentConfig(
+    "DEEP_RESEARCH_MAX_DEPTH",
+    "browse.research.max_depth",
+    int(os.getenv("DEEP_RESEARCH_MAX_DEPTH", "2")),
+)
+
+DEEP_RESEARCH_MAX_PAGES = PersistentConfig(
+    "DEEP_RESEARCH_MAX_PAGES",
+    "browse.research.max_pages",
+    int(os.getenv("DEEP_RESEARCH_MAX_PAGES", "10")),
+)
+
+# Applies to the WHOLE traversal, not to each fetch. A dozen pages at the
+# link-follow profile's own timeout would otherwise be a multi-minute tool call.
+DEEP_RESEARCH_MAX_SECONDS = PersistentConfig(
+    "DEEP_RESEARCH_MAX_SECONDS",
+    "browse.research.max_seconds",
+    int(os.getenv("DEEP_RESEARCH_MAX_SECONDS", "90")),
+)
+
+DEEP_RESEARCH_CONCURRENCY = PersistentConfig(
+    "DEEP_RESEARCH_CONCURRENCY",
+    "browse.research.concurrency",
+    int(os.getenv("DEEP_RESEARCH_CONCURRENCY", "5")),
+)
+
+# Per page, not per call: a dozen pages at web_fetch's whole-page budget would
+# bury the conversation. Reading one page in full is web_fetch's job.
+DEEP_RESEARCH_MAX_CHARS_PER_PAGE = PersistentConfig(
+    "DEEP_RESEARCH_MAX_CHARS_PER_PAGE",
+    "browse.research.max_chars_per_page",
+    int(os.getenv("DEEP_RESEARCH_MAX_CHARS_PER_PAGE", "6000")),
+)
+
+# robots.txt honoring for deep_research (crawler etiquette). Default on:
+# link-following across a site is crawler behavior and should respect the file.
+DEEP_RESEARCH_RESPECT_ROBOTS = PersistentConfig(
+    "DEEP_RESEARCH_RESPECT_ROBOTS",
+    "browse.research.respect_robots",
+    os.getenv("DEEP_RESEARCH_RESPECT_ROBOTS", "True").lower() == "true",
+)
+
+# The User-Agent our browse connection identifies as. robots.txt rules target a
+# User-agent, and Crawl-delay/allow decisions are resolved against it, so it
+# must be a stable, honest token — not a spoofed browser string.
+BROWSE_USER_AGENT = PersistentConfig(
+    "BROWSE_USER_AGENT",
+    "browse.user_agent",
+    os.getenv("BROWSE_USER_AGENT", "self.ai-research"),
+)
+
+# A ceiling on how long a single robots.txt Crawl-delay may pause the
+# traversal. Some sites declare very large delays; honoring an unbounded one
+# would let one origin stall the whole (already wall-clock-bounded) research
+# call. At the cap we stop visiting that origin rather than sleep past it.
+DEEP_RESEARCH_MAX_CRAWL_DELAY_SECONDS = PersistentConfig(
+    "DEEP_RESEARCH_MAX_CRAWL_DELAY_SECONDS",
+    "browse.research.max_crawl_delay_seconds",
+    float(os.getenv("DEEP_RESEARCH_MAX_CRAWL_DELAY_SECONDS", "10")),
 )
 
 SEARXNG_QUERY_URL = PersistentConfig(
@@ -1929,10 +2133,31 @@ COMFYUI_WORKFLOW = PersistentConfig(
     os.getenv("COMFYUI_WORKFLOW", COMFYUI_DEFAULT_WORKFLOW),
 )
 
+# Node-map that binds the abstract knobs (prompt/model/width/height/steps/seed)
+# to concrete node ids + input keys in COMFYUI_WORKFLOW. MUST be env-settable:
+# with ENABLE_PERSISTENT_CONFIG=False an admin-UI value never survives a pod
+# restart, so an unset default of [] silently reverts image-gen to "prompt never
+# injected" on every restart. Parsed as a JSON list of
+# {type, node_ids, key, value} dicts. (The env-var NAME arg was previously a
+# copy-paste "COMFYUI_WORKFLOW" — fixed to its own key.)
 COMFYUI_WORKFLOW_NODES = PersistentConfig(
-    "COMFYUI_WORKFLOW",
+    "COMFYUI_WORKFLOW_NODES",
     "image_generation.comfyui.nodes",
-    [],
+    json.loads(os.getenv("COMFYUI_WORKFLOW_NODES", "[]")),
+)
+
+# self.sketch (ComfyUI) VRAM-lease CONTROL base — the pod the GPU-lease broker
+# POSTs /api/system/vram-* to when it needs self.sketch to yield VRAM (Color
+# epic Phase 2b). Deliberately separate from COMFYUI_BASE_URL (the Phase-4
+# image-generation *serving* client, which may carry an API key / path prefix):
+# serving vs control, mirroring self.llamolotl's and self.transcribe's split. A
+# single string (like TTS_CONTROL_BASE_URL, not llamolotl's list); the transport
+# treats blank as "unconfigured" and resolves a clean timeout, never a silent
+# success. Defaults to the in-cluster Service so a bare deploy is wired.
+SKETCH_CONTROL_BASE_URL = PersistentConfig(
+    "SKETCH_CONTROL_BASE_URL",
+    "image_generation.sketch.control_base_url",
+    os.getenv("SKETCH_CONTROL_BASE_URL", "http://self-sketch:8188"),
 )
 
 IMAGES_OPENAI_API_BASE_URL = PersistentConfig(
@@ -1995,6 +2220,92 @@ AUDIO_STT_MODEL = PersistentConfig(
     os.getenv("AUDIO_STT_MODEL", ""),
 )
 
+# Control port for the self-hosted STT backend (self.transcribe). This is the
+# management endpoint the transcribe router talks to for model listing (and, in
+# later tasks, pull/swap/delete) — the STT analog of LLAMOLOTL_CONTROL_BASE_URLS.
+# It is deliberately separate from AUDIO_STT_OPENAI_API_BASE_URL (the OpenAI-
+# compatible *serving* endpoint used for transcription requests): serving vs
+# control mirror self.llamolotl's split. Empty when no self-hosted STT backend
+# exposes a router control port (e.g. plain OpenAI-compatible STT).
+AUDIO_STT_CONTROL_BASE_URL = PersistentConfig(
+    "AUDIO_STT_CONTROL_BASE_URL",
+    "audio.stt.control_base_url",
+    os.getenv("AUDIO_STT_CONTROL_BASE_URL", ""),
+)
+
+# The persisted set of typed audio connections (cavekit-audio-connections.md R2).
+# A dict keyed by each connection's stable id — the audio analog of the text-model
+# OLLAMA_API_CONFIGS / OPENAI_API_CONFIGS multi-connection stores. Keying by a
+# generated id (not by type or url) is what lets more than one connection of the
+# same type coexist, each independently addressable, without one collapsing into a
+# sibling. Serialized form: {id: {"type": <AudioConnectionType value>, "fields":
+# {...}}}, produced/consumed by selfai_ui.audio.connections.AudioConnectionStore.
+#
+# Seedable from the AUDIO_CONNECTION_CONFIGS env var (a JSON blob of that same
+# shape), mirroring AUDIO_TTS_ENABLED_VOICES / AUDIO_STT_ENABLED_MODELS below.
+# This matters under ENABLE_PERSISTENT_CONFIG=False (this yard's GitOps posture),
+# where the DB-saved value is ignored every boot and only the env value is
+# authoritative — so a self-hosted connection created at runtime via the CRUD
+# router does NOT survive a restart. Declaring the connection set here lets it be
+# pinned in the manifest and stay durable across reboots. A non-empty value also
+# suppresses the legacy-migration mint (main.py's "if not existing" guard), which
+# is intended: the declared set is the source of truth.
+try:
+    AUDIO_CONNECTION_CONFIGS_ENV = json.loads(os.environ.get("AUDIO_CONNECTION_CONFIGS", "{}"))
+    if not isinstance(AUDIO_CONNECTION_CONFIGS_ENV, dict):
+        AUDIO_CONNECTION_CONFIGS_ENV = {}
+except Exception as e:
+    print(f"Error loading AUDIO_CONNECTION_CONFIGS: {e}")
+    AUDIO_CONNECTION_CONFIGS_ENV = {}
+
+AUDIO_CONNECTION_CONFIGS = PersistentConfig(
+    "AUDIO_CONNECTION_CONFIGS",
+    "audio.connection_configs",
+    AUDIO_CONNECTION_CONFIGS_ENV,
+)
+
+# Admin curation of transcribe-router models (cavekit-audio-transcribe-picker R1).
+# A map of model-id -> bool recording whether an admin has enabled that model for
+# end-user selection. It is deliberately independent of whether a model is
+# downloaded or merely pullable: an admin may enable a model that is only
+# pullable. Absence of an id means "not enabled" (the conservative default —
+# admins curate models in; the picker's R5 fallback covers the none-enabled
+# state). Persisted like every other PersistentConfig so a toggle survives reload.
+try:
+    AUDIO_STT_ENABLED_MODELS_ENV = json.loads(os.environ.get("AUDIO_STT_ENABLED_MODELS", "{}"))
+    if not isinstance(AUDIO_STT_ENABLED_MODELS_ENV, dict):
+        AUDIO_STT_ENABLED_MODELS_ENV = {}
+except Exception as e:
+    print(f"Error loading AUDIO_STT_ENABLED_MODELS: {e}")
+    AUDIO_STT_ENABLED_MODELS_ENV = {}
+
+AUDIO_STT_ENABLED_MODELS = PersistentConfig(
+    "AUDIO_STT_ENABLED_MODELS",
+    "audio.stt.enabled_models",
+    AUDIO_STT_ENABLED_MODELS_ENV,
+)
+
+# Admin curation of TTS voices (cavekit-audio-voice-catalog R5). A map of
+# voice-id -> bool recording whether an admin has enabled that voice for
+# end-user selection. Mirrors AUDIO_STT_ENABLED_MODELS exactly for consistency:
+# absence of an id means "not enabled" (the conservative default — admins curate
+# voices in), and it is persisted like every other PersistentConfig so a toggle
+# survives reload. The admin catalog view shows all voices regardless; this map
+# only narrows the end-user-facing catalog.
+try:
+    AUDIO_TTS_ENABLED_VOICES_ENV = json.loads(os.environ.get("AUDIO_TTS_ENABLED_VOICES", "{}"))
+    if not isinstance(AUDIO_TTS_ENABLED_VOICES_ENV, dict):
+        AUDIO_TTS_ENABLED_VOICES_ENV = {}
+except Exception as e:
+    print(f"Error loading AUDIO_TTS_ENABLED_VOICES: {e}")
+    AUDIO_TTS_ENABLED_VOICES_ENV = {}
+
+AUDIO_TTS_ENABLED_VOICES = PersistentConfig(
+    "AUDIO_TTS_ENABLED_VOICES",
+    "audio.tts.enabled_voices",
+    AUDIO_TTS_ENABLED_VOICES_ENV,
+)
+
 AUDIO_TTS_OPENAI_API_BASE_URL = PersistentConfig(
     "AUDIO_TTS_OPENAI_API_BASE_URL",
     "audio.tts.openai.api_base_url",
@@ -2047,6 +2358,19 @@ AUDIO_TTS_AZURE_SPEECH_OUTPUT_FORMAT = PersistentConfig(
     "AUDIO_TTS_AZURE_SPEECH_OUTPUT_FORMAT",
     "audio.tts.azure.speech_output_format",
     os.getenv("AUDIO_TTS_AZURE_SPEECH_OUTPUT_FORMAT", "audio-24khz-160kbitrate-mono-mp3"),
+)
+
+# Control port for the self-hosted TTS backend (self.speak). This is the
+# endpoint the voice catalog talks to for the connection's *real* voice list —
+# the TTS analog of AUDIO_STT_CONTROL_BASE_URL. It is deliberately separate from
+# AUDIO_TTS_OPENAI_API_BASE_URL (the OpenAI-compatible *serving* endpoint used
+# for synthesis requests): serving vs control mirror self.llamolotl's split.
+# Empty when no self-hosted TTS backend exposes a voice-listing control port
+# (e.g. a plain OpenAI-compatible or hosted-provider TTS).
+AUDIO_TTS_CONTROL_BASE_URL = PersistentConfig(
+    "AUDIO_TTS_CONTROL_BASE_URL",
+    "audio.tts.control_base_url",
+    os.getenv("AUDIO_TTS_CONTROL_BASE_URL", ""),
 )
 
 

@@ -159,6 +159,7 @@ def test_known_tables_accounted_for(migrated_engine):
     import selfai_ui.models.training  # noqa: F401
     import selfai_ui.models.users  # noqa: F401
     from selfai_ui.internal.db import Base
+    from selfai_ui.mods.naming import table_prefix_for
 
     inspector = inspect(migrated_engine)
     existing = set(inspector.get_table_names())
@@ -171,6 +172,13 @@ def test_known_tables_accounted_for(migrated_engine):
         "chatidtag",  # Legacy — pre-tag-table-rename
         "document",  # Legacy — pre-knowledge-migration
         "channel_member",  # Join table (no SQLAlchemy model)
+        # Mod-owned tables: created by a real, enablement-gated Alembic
+        # migration but accessed via raw SQL through the mods facade, not a
+        # SQLAlchemy model, so they never populate Base.metadata. The
+        # reference mod's boot fixtures (tests/mods_reference_boot.py) create
+        # this table in the shared test DB, and it persists for the rest of
+        # the session — a genuine table, not stale migration garbage.
+        f"{table_prefix_for('reference')}handles",
     }
     transient_prefixes = ("_alembic_tmp_", "sqlite_")
 

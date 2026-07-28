@@ -1,0 +1,17 @@
+{
+  "name": "reference-mod-frontend",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "The reference mod's status view, compiled as a Svelte 5 custom element (<mod-reference>) for self.chat's runtime mod loader (cavekit-mods-frontend-client.md R7). Standalone, not part of self.chat's own app build. Compiled output lands at ../entry.<hash>.js.",
+  "scripts": {
+    "build": "vite build"
+  },
+  "//deps": "Everything is a devDependency ON PURPOSE: Vite's lib mode externalizes `dependencies`/`peerDependencies` by default, which would emit bare `import ... from 'svelte'` / 'socket.io-client' the browser cannot resolve (import-map sharing is out of scope for this kit). devDependencies are bundled, yielding one self-contained entry.<hash>.js.",
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^5.0.3",
+    "socket.io-client": "^4.8.1",
+    "svelte": "^5.19.0",
+    "vite": "^6.0.7"
+  }
+}

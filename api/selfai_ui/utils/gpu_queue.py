@@ -693,6 +693,45 @@ async def _dispatch_run_now_jobs() -> None:
 
 
 ####################################
+# Dispatch: Test Mode (dry_run) evals
+####################################
+
+
+async def _dispatch_dry_run_eval_jobs() -> None:
+    """Dispatch queued Test Mode (dry_run) eval jobs immediately, bypassing
+    windows (self.ai#64).
+
+    Test Mode is documented (and labelled in the submit UI) as synthetic
+    data / no model inference -- it doesn't touch the GPU, so the window gate
+    that exists to arbitrate real GPU contention between training/evals/
+    curation doesn't apply to it. Before this, a dry_run job queued outside an
+    active window sat there indefinitely, making "Test Mode" -- meant as a
+    safe, cheap way to validate the harness -- unusable whenever no window
+    happened to be open.
+
+    Unlike `_dispatch_run_now_jobs`, this is not priority-gated: "needs no
+    GPU" is a property of the job itself (`meta.dry_run`), not an admin
+    escalation, so every queued dry_run job qualifies regardless of its
+    `priority`. A job that's also `run_now` will already have been dispatched
+    (and moved off `status == "queued"`) by `_dispatch_run_now_jobs` earlier in
+    the same cycle, so there's no double-dispatch risk from querying again here.
+    """
+    with get_db() as db:
+        rows = (
+            db.query(EvalJob)
+            .filter(EvalJob.status == "queued")
+            .order_by(EvalJob.created_at.asc())
+            .all()
+        )
+        jobs = [EvalJobModel.model_validate(r) for r in rows]
+
+    for job in jobs:
+        if (job.meta or {}).get("dry_run"):
+            log.info(f"GPU queue: dispatching dry_run eval job {job.id} (no GPU needed, window gate bypassed)")
+            await _dispatch_eval_job_by_type(job)
+
+
+####################################
 # Active window query
 ####################################
 
@@ -912,6 +951,7 @@ async def process_gpu_queue_v2() -> None:
                 await _sync_running_jobs()
                 await _promote_scheduled_jobs()
                 await _dispatch_run_now_jobs()
+                await _dispatch_dry_run_eval_jobs()
 
                 window = _get_active_window()
                 if window:

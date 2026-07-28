@@ -38,6 +38,16 @@ REF_MODEL = "model"
 REF_TOOL = "tool"
 REF_KNOWLEDGE = "knowledge"
 
+# Reserved tool_ids that refer to a built-in, config-gated capability rather
+# than a row in the tool table -- consulted only as a FALLBACK when no such row
+# exists (see resolve_tool_ref). Web Search is the only one that exists today
+# (gated by app.state.config.ENABLE_RAG_WEB_SEARCH, same flag InputMenu.svelte
+# checks via $config.features.enable_web_search). Fallback resolution is
+# itself an access gate (an admin who disables Web Search system-wide also
+# revokes every folder preset's ability to reference it), so this stays
+# consistent with the no-existence-leak spirit of R3.
+BUILTIN_TOOL_IDS = {"web_search"}
+
 
 def _record_accessible(record: Any, user: Any, permission: str) -> bool:
     """Apply the router access gate to an already-fetched record.
@@ -59,9 +69,28 @@ def resolve_model_ref(model_id: str, user: Any, permission: str = "read") -> boo
     return _record_accessible(Models.get_model_by_id(model_id), user, permission)
 
 
-def resolve_tool_ref(tool_id: str, user: Any, permission: str = "read") -> bool:
-    """Return ``True`` iff ``tool_id`` resolves to a tool accessible to ``user``."""
-    return _record_accessible(Tools.get_tool_by_id(tool_id), user, permission)
+def resolve_tool_ref(
+    tool_id: str,
+    user: Any,
+    permission: str = "read",
+    web_search_enabled: bool = False,
+) -> bool:
+    """Return ``True`` iff ``tool_id`` resolves to a tool accessible to ``user``.
+
+    A real tool table row always takes priority — the tool table is consulted
+    first, exactly as before this parameter existed. Only when NO row exists
+    for ``tool_id`` AND it's a reserved built-in id (``BUILTIN_TOOL_IDS``) does
+    resolution fall back to whether the corresponding capability is currently
+    enabled system-wide. This keeps a real (if unlikely) tool literally id'd
+    "web_search" fully in charge of its own access control rather than being
+    silently shadowed by the builtin gate.
+    """
+    record = Tools.get_tool_by_id(tool_id)
+    if record is not None:
+        return _record_accessible(record, user, permission)
+    if tool_id in BUILTIN_TOOL_IDS:
+        return web_search_enabled
+    return False
 
 
 def resolve_knowledge_ref(knowledge_id: str, user: Any, permission: str = "read") -> bool:
@@ -73,6 +102,7 @@ def unresolved_preset_references(
     preset: FolderPresetModel,
     user: Any,
     permission: str = "read",
+    web_search_enabled: bool = False,
 ) -> list[tuple[str, str]]:
     """Return every preset reference that does NOT resolve to an accessible record.
 
@@ -84,7 +114,10 @@ def unresolved_preset_references(
     Nonexistent and inaccessible references produce the *same* tuple shape, so
     a caller (T-007) rejecting the write on a non-empty result never
     distinguishes "does not exist" from "not allowed" — satisfying the R3
-    no-existence-leak guarantee.
+    no-existence-leak guarantee. ``web_search_enabled`` reflects whether Web
+    Search is currently enabled system-wide (the caller reads
+    ``app.state.config.ENABLE_RAG_WEB_SEARCH``) and gates the reserved
+    ``"web_search"`` builtin tool_id the same way (see ``BUILTIN_TOOL_IDS``).
     """
     unresolved: list[tuple[str, str]] = []
 
@@ -93,7 +126,7 @@ def unresolved_preset_references(
             unresolved.append((REF_MODEL, preset.default_model_id))
 
     for tool_id in preset.tool_ids or []:
-        if not resolve_tool_ref(tool_id, user, permission):
+        if not resolve_tool_ref(tool_id, user, permission, web_search_enabled):
             unresolved.append((REF_TOOL, tool_id))
 
     for knowledge_id in preset.knowledge_ids or []:
@@ -107,6 +140,7 @@ def preset_references_resolve(
     preset: FolderPresetModel,
     user: Any,
     permission: str = "read",
+    web_search_enabled: bool = False,
 ) -> bool:
     """Convenience: ``True`` iff every reference in ``preset`` is accessible to ``user``."""
-    return not unresolved_preset_references(preset, user, permission)
+    return not unresolved_preset_references(preset, user, permission, web_search_enabled)

@@ -28,6 +28,7 @@ import ipaddress
 import logging
 import re
 import socket
+from html import unescape
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -72,6 +73,25 @@ def strip_scripts_and_trackers(html: str) -> str:
     html = _SELF_CLOSING_SCRIPT_RE.sub("", html)
     html = _TRACKER_TAG_RE.sub("", html)
     return html
+
+
+_ANY_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def html_to_plaintext(html: str) -> str:
+    """Reduce fetched markup to plain text.
+
+    For a text/plain resource fetched through the browser (robots.txt is the
+    motivating case), Chromium wraps the body in `<pre>…</pre>`, so the
+    original text survives verbatim once tags are removed and entities are
+    unescaped. Scripts are dropped first so their contents never leak into the
+    text. This is deliberately simple — it is for machine-readable text files,
+    not for extracting readable prose from a rich page (that is html_to_text's
+    job over in the search path)."""
+    html = _SCRIPT_TAG_RE.sub("", html)
+    html = _SELF_CLOSING_SCRIPT_RE.sub("", html)
+    html = _ANY_TAG_RE.sub("", html)
+    return unescape(html)
 
 
 def _hostname_matches_list(hostname: str, patterns: list[str]) -> bool:
@@ -135,12 +155,22 @@ class BrowseFetchResult(BaseModel):
     error: Optional[str] = None
 
 
-async def browse_fetch(request: Request, url: str, profile: BrowseProfile) -> BrowseFetchResult:
+async def browse_fetch(
+    request: Request, url: str, profile: BrowseProfile, raw_text: bool = False
+) -> BrowseFetchResult:
     """R2: fetch `url` through the core Playwright connection under `profile`.
 
     `profile` is expected to already be resolved (see
     cavekit-browse-profiles.md) — this function does not look profiles up by
     name itself.
+
+    `raw_text=True` returns the fetched resource as plain text (tags stripped,
+    entities unescaped) instead of tracker-stripped HTML. It exists for
+    machine-readable text files fetched through the same tunnelled connection
+    as pages — robots.txt above all — so the SSRF guard, allow/blocklist, auth,
+    and tuning all apply identically and the yard's own address never reaches
+    the origin. It is not a "give me the page as text" convenience for search;
+    that path wants html_to_text's structure-aware extraction, not this.
     """
     service_url = request.app.state.config.BROWSE_PLAYWRIGHT_SERVICE_URL
     api_key = request.app.state.config.BROWSE_PLAYWRIGHT_API_KEY
@@ -237,11 +267,11 @@ async def browse_fetch(request: Request, url: str, profile: BrowseProfile) -> Br
                         last_result = BrowseFetchResult(success=False, error="Fetch returned no usable content")
                         continue
 
-                    content = strip_scripts_and_trackers(content)
+                    content = html_to_plaintext(content) if raw_text else strip_scripts_and_trackers(content)
 
                     if not content.strip():
-                        # Stripping scripts/trackers left nothing usable —
-                        # still a failure, not a silent empty success.
+                        # Processing left nothing usable — still a failure, not
+                        # a silent empty success.
                         last_result = BrowseFetchResult(success=False, error="Fetch returned no usable content")
                         continue
 

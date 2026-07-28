@@ -131,6 +131,7 @@ TRUNCATION_ORDER = [
     "curator_job",
     "job_window_slot",
     "job_window",
+    "vram_consumer",
     "benchmark_config",
     "group",
     "auth",
@@ -199,6 +200,7 @@ def db_session(test_session_factory, test_engine):
     patched_modules = [db_module]
     for mod_name in [
         "selfai_ui.models.job_windows",
+        "selfai_ui.models.vram_leases",
         "selfai_ui.utils.gpu_queue",
         "selfai_ui.models.benchmark_config",
         "selfai_ui.models.curator_jobs",
@@ -405,3 +407,16 @@ def user_without_workspace_permissions(test_app, authenticated_user):
     test_app.state.config.USER_PERMISSIONS = denied
     yield authenticated_user
     test_app.state.config.USER_PERMISSIONS = original
+
+
+# ---------------------------------------------------------------------------
+# Reference-mod real-boot fixtures (Tier 2, T-009)
+# ---------------------------------------------------------------------------
+# Registered as a plugin so every Tier-2 test (T-010…T-016), in any directory
+# under tests/, can request `reference_booted_client` by name without importing
+# it (importing a fixture into a test module trips ruff F811 on the name
+# collision with the test's parameter). `pytest_plugins` is only honoured in the
+# top-most conftest, which this is. Declared at the bottom so it does not push
+# the module's imports past the first non-import statement (E402). See
+# tests/mods_reference_boot.py for the fixtures and the consumer guide.
+pytest_plugins = ("tests.mods_reference_boot",)

@@ -147,21 +147,30 @@ async def connect(sid, environ, auth):
     user = None
     if auth and "token" in auth:
         data = decode_token(auth["token"])
-
         if data is not None and "id" in data:
             user = Users.get_user_by_id(data["id"])
 
-        if user:
-            await SESSION_POOL.aset(sid, user.model_dump())
-            existing_sids = await USER_POOL.aget(user.id)
-            if existing_sids:
-                await USER_POOL.aset(user.id, existing_sids + [sid])
-            else:
-                await USER_POOL.aset(user.id, [sid])
+    # Refuse a connection that carries no valid token. Returning False is the
+    # documented rejection: with always_connect=True the server sends CONNECT
+    # then an immediate DISCONNECT and drops the session, so an anonymous or
+    # invalid-token client never reaches any event handler -- core's or a mod's.
+    # A mod that registers a namespace on this server therefore inherits this
+    # gate for free; that inheritance is the reason mods do not mount their own
+    # websocket stacks (see the mods contract, Decision 2).
+    if user is None:
+        return False
 
-            # print(f"user {user.name}({user.id}) connected with session ID {sid}")
-            await sio.emit("user-list", {"user_ids": await USER_POOL.akeys()})
-            await sio.emit("usage", {"models": await get_models_in_use()})
+    await SESSION_POOL.aset(sid, user.model_dump())
+    existing_sids = await USER_POOL.aget(user.id)
+    if existing_sids:
+        await USER_POOL.aset(user.id, existing_sids + [sid])
+    else:
+        await USER_POOL.aset(user.id, [sid])
+
+    # print(f"user {user.name}({user.id}) connected with session ID {sid}")
+    await sio.emit("user-list", {"user_ids": await USER_POOL.akeys()})
+    await sio.emit("usage", {"models": await get_models_in_use()})
+    return True
 
 
 @sio.on("user-join")
@@ -367,3 +376,65 @@ async def get_user_ids_from_room(room):
 
 async def get_active_status_by_user_id(user_id):
     return await USER_POOL.acontains(user_id)
+
+
+async def emit_to_user(user_id, event, data, *, namespace=None):
+    """Emit an event to every active session of one user.
+
+    This is the piece a mod needs and could not previously reach without an
+    internal import: the user-to-session mapping lives in USER_POOL, and
+    get_event_emitter() is chat-specific (keyed by chat/message id, writes to
+    Chats). A reconciler-watch loop reacting to external state has no request,
+    no chat, and no sid -- only a user id. This gives it a supported way in.
+
+    - Callable from outside any request context; needs only the user id.
+    - A user with no active session is a no-op, not an error: their session
+      list is absent and there is simply nothing to emit to.
+    - Under the Redis manager the emit fans out across replicas, so a user
+      connected to a different replica still receives it -- the same mechanism
+      core's own emits already ride.
+    - `namespace` targets a mod's registered namespace; omitted, it uses the
+      default namespace.
+
+    Exposed to mods through the facade as `emit_to_user`.
+    """
+    session_ids = await USER_POOL.aget(user_id)
+    if not session_ids:
+        return
+    for session_id in session_ids:
+        await sio.emit(event, data, to=session_id, namespace=namespace)
+
+
+def install_namespace_auth(namespace: str) -> None:
+    """Install core's connect-auth gate on a mod's Socket.IO namespace.
+
+    A namespace with no `connect` handler is accepted UNAUTHENTICATED: python-
+    socketio's `_handle_connect` treats "no handler" as not-refused, so the
+    default namespace's gate does NOT extend to a mod's namespace. Without this,
+    the contract's "a mod namespace inherits core's auth for free" is false and
+    any Engine.IO client could connect to a mod namespace the operator believed
+    was gated.
+
+    This registers a `connect` handler on `namespace` that runs the same token
+    decode as the default namespace and returns False for an anonymous or
+    invalid-token client, so the mod's namespace is refused identically. The
+    authenticated sid is recorded into SESSION_POOL/USER_POOL under the same
+    keys the default namespace uses, so `emit_to_user(namespace=...)` and a mod
+    handler's `get_user_id_from_session_pool(sid)` both see the identity core
+    resolved -- the mod never decodes a token itself.
+    """
+
+    async def _connect(sid, environ, auth):
+        user = None
+        if auth and "token" in auth:
+            data = decode_token(auth["token"])
+            if data is not None and "id" in data:
+                user = Users.get_user_by_id(data["id"])
+        if user is None:
+            return False
+        await SESSION_POOL.aset(sid, user.model_dump())
+        existing = await USER_POOL.aget(user.id)
+        await USER_POOL.aset(user.id, (existing or []) + [sid])
+        return True
+
+    sio.on("connect", _connect, namespace=namespace)

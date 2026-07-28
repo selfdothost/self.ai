@@ -1,0 +1,75 @@
+# Docs site config for the `pages` CI job (.gitlab/ci-templates/pages.yml).
+#
+# docs_dir points at a build-time-only staging dir the CI job assembles from
+# product-docs/ + docs/ (operator handoffs) + context/ — those don't live in one
+# directory in-repo, and mkdocs requires a single docs_dir. See the CI file for
+# what gets copied where, and what is deliberately left out.
+site_name: self.ai
+site_description: Product documentation for self.ai — a self-hosted, FOSS AI-serving plane. Installation, configuration, usage, extension authoring, evaluation and training, architecture.
+docs_dir: .docs-build
+site_dir: public
+
+theme:
+  name: material
+  palette:
+    scheme: slate
+  features:
+    - navigation.expand
+    - content.code.copy
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - tables
+  - toc:
+      permalink: true
+
+# search must be listed explicitly once `plugins:` is set at all -- omitting it
+# here would silently drop mkdocs' default search plugin, not just add ours.
+#
+# swagger-ui-tag renders product-docs/api-reference.md's generated openapi.json
+# (see .gitlab/ci-templates/pages.yml for how that file gets there). Assets are
+# vendored in the plugin package itself -- no CDN, no phone-home, consistent
+# with every other page on this site. tryItOutEnabled/validatorUrl are the
+# plugin's own defaults, set explicitly here because the choice is deliberate:
+# a static docs page should let you read the API, not fire live requests at a
+# real deployed instance from an unauthenticated page, and it should never
+# call out to swagger.io's hosted validator.
+plugins:
+  - search
+  - swagger-ui-tag:
+      tryItOutEnabled: false
+      validatorUrl: none
+
+# Curated nav for the product docs. handoffs/ and context/ are deliberately NOT
+# hand-listed — they are internal notes linked from internal.md, still built and
+# searchable, just not individually nav'd.
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Start Here: start-here.md
+  - Installation:
+      - Quickstart: quickstart.md
+      - Full Guide: installation.md
+  - Configuration: configuration.md
+  - API Reference: api-reference.md
+  - Using self.ai: using-selfai.md
+  - Guides:
+      - Create a Model: guides/create-a-model.md
+      - Create a Knowledge Base: guides/create-a-knowledge-base.md
+      - Curate a Dataset: guides/curate-a-dataset.md
+      - Run an Evaluation: guides/run-an-evaluation.md
+      - Train a Model: guides/train-a-model.md
+  - Models:
+      - Image: image.md
+      - Language: language.md
+      - Transcription: transcription.md
+      - Voice: voice.md
+      - Vision: vision.md
+  - Extending self.ai: extending.md
+  - Mods: mods.md
+  - Evaluation & Training: evaluation-and-training.md
+  - Architecture: architecture.md
+  - Contributing: contribute.md
+  - Internal Notes: internal.md

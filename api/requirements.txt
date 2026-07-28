@@ -31,6 +31,15 @@ lakefs  # native client for self.corpus branch commits (issue #49) — unpinned 
 argon2-cffi==23.1.0
 APScheduler==3.10.4
 
+# Async Kubernetes client — the VRAM force-reap capability (R5 / utils/vram_k8s.py)
+# deletes a stale consumer's pod via the k8s API using core's mounted
+# ServiceAccount. Async client (not the sync `kubernetes`) so delete+confirm
+# never blocks the event loop. 35.0.1 was the latest stable on PyPI (2026-02) —
+# NOT resolved in a local build here (bastion host, deps not importable), so
+# pinned to the 35.x line; tighten to the exact resolved == once the image
+# builds in CI, same as firecrawl-py below.
+kubernetes_asyncio>=35.0.0,<36.0.0
+
 # AI libraries
 openai
 anthropic

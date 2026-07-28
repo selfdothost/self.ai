@@ -125,6 +125,54 @@ async def _detect_hf_dataset_format(hf_path: str) -> dict:
         return fallback
 
 
+async def _resolve_course_datasets(course_data: dict, control_url: str) -> tuple[list[dict], list[str]]:
+    """Resolve a course's dataset_ids to trainer dataset configs.
+
+    Two kinds of dataset-flagged Knowledge:
+     - HuggingFace-backed (kb.data.hf_path): reference the HF id directly.
+     - Local/curated (curator output, no hf_path): push its JSONL file(s) to
+       the trainer node and reference the uploaded local path.
+
+    Returns (datasets, failures) — failures is a list of "<name/id>: <reason>"
+    strings for every dataset_id that didn't produce a trainer entry, so a
+    caller with an empty `datasets` result can report exactly which
+    dataset(s) it looked at and why each one was skipped, instead of a single
+    undifferentiated "no valid datasets" message.
+    """
+    dataset_ids = course_data.get("dataset_ids", [])
+    datasets: list[dict] = []
+    failures: list[str] = []
+    for ds_id in dataset_ids:
+        kb = Knowledges.get_knowledge_by_id(ds_id)
+        if not kb:
+            failures.append(f"{ds_id}: dataset not found (it may have been deleted)")
+            continue
+        kb_data = kb.data or {}
+        if kb_data.get("hf_path"):
+            hf_path = kb_data["hf_path"]
+            detected = await _detect_hf_dataset_format(hf_path)
+            if kb_data.get("type"):
+                detected["type"] = kb_data["type"]
+            if kb_data.get("field_messages"):
+                detected["field_messages"] = kb_data["field_messages"]
+            datasets.append({"path": hf_path, **detected})
+        else:
+            uploaded = await _upload_local_dataset(kb, control_url)
+            if not uploaded:
+                failures.append(
+                    f"{kb.name or kb.id}: no valid local dataset files found "
+                    "(expected a curated .json/.jsonl file attached to this Knowledge)"
+                )
+            datasets.extend(uploaded)
+    return datasets, failures
+
+
+def _no_valid_datasets_detail(dataset_ids: list, failures: list[str]) -> str:
+    if not dataset_ids:
+        return "Course has no datasets attached — attach at least one Dataset in the course editor."
+    return "Course has no valid datasets configured: " + "; ".join(failures)
+
+
 ############################
 # Courses
 ############################
@@ -489,33 +537,13 @@ async def approve_job(
     course_data = course.data or {}
     advanced_config = course_data.get("advanced_config", {})
 
-    # Resolve dataset_ids to trainer dataset configs. Two kinds:
-    #  - HuggingFace-backed KB (kb.data.hf_path): reference the HF id directly.
-    #  - Local/curated KB (curator output, no hf_path): push its JSONL file(s)
-    #    to the trainer node and reference the uploaded local path.
     dataset_ids = course_data.get("dataset_ids", [])
-    datasets = []
-    for ds_id in dataset_ids:
-        kb = Knowledges.get_knowledge_by_id(ds_id)
-        if not kb:
-            continue
-        kb_data = kb.data or {}
-        if kb_data.get("hf_path"):
-            hf_path = kb_data["hf_path"]
-            detected = await _detect_hf_dataset_format(hf_path)
-            # Allow explicit overrides stored on the knowledge item
-            if kb_data.get("type"):
-                detected["type"] = kb_data["type"]
-            if kb_data.get("field_messages"):
-                detected["field_messages"] = kb_data["field_messages"]
-            datasets.append({"path": hf_path, **detected})
-        else:
-            datasets.extend(await _upload_local_dataset(kb, control_url))
+    datasets, dataset_failures = await _resolve_course_datasets(course_data, control_url)
 
     if not datasets:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Course has no valid datasets configured",
+            detail=_no_valid_datasets_detail(dataset_ids, dataset_failures),
         )
 
     training_config = {
@@ -862,43 +890,26 @@ async def _dispatch_scheduled_job(job: TrainingJobModel) -> None:
     course_data = course.data or {}
     advanced_config = course_data.get("advanced_config", {})
 
-    # Resolve datasets the same way approve_job does: HF-backed KBs reference
-    # their hf_path; local/curated KBs (no hf_path) get their JSONL uploaded to
-    # the trainer node and referenced by the returned local path.
+    # Resolve datasets the same way approve_job does (shared helper).
     dataset_ids = course_data.get("dataset_ids", [])
-    datasets = []
-    for ds_id in dataset_ids:
-        kb = Knowledges.get_knowledge_by_id(ds_id)
-        if not kb:
-            continue
-        kb_data = kb.data or {}
-        if kb_data.get("hf_path"):
-            hf_path = kb_data["hf_path"]
-            detected = await _detect_hf_dataset_format(hf_path)
-            if kb_data.get("type"):
-                detected["type"] = kb_data["type"]
-            if kb_data.get("field_messages"):
-                detected["field_messages"] = kb_data["field_messages"]
-            datasets.append({"path": hf_path, **detected})
-        else:
-            try:
-                datasets.extend(await _upload_local_dataset(kb, control_url))
-            except Exception as e:
-                TrainingJobs.update_job_status(
-                    id=job.id,
-                    update=TrainingJobStatusUpdate(
-                        status="failed",
-                        error_message=f"Failed to prepare local dataset: {e}",
-                    ),
-                )
-                return
+    try:
+        datasets, dataset_failures = await _resolve_course_datasets(course_data, control_url)
+    except Exception as e:
+        TrainingJobs.update_job_status(
+            id=job.id,
+            update=TrainingJobStatusUpdate(
+                status="failed",
+                error_message=f"Failed to prepare local dataset: {e}",
+            ),
+        )
+        return
 
     if not datasets:
         TrainingJobs.update_job_status(
             id=job.id,
             update=TrainingJobStatusUpdate(
                 status="failed",
-                error_message="Course has no valid datasets configured",
+                error_message=_no_valid_datasets_detail(dataset_ids, dataset_failures),
             ),
         )
         return

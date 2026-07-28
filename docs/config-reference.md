@@ -43,17 +43,20 @@ Notes:
   hard-fails at startup if it is unset or left at the well-known default while
   auth is enabled.
 - The endpoint values above are examples — point them at *your* infrastructure.
-- **Knowledge base / RAG embeddings.** The published image is API-only (no bundled
-  torch / embedding model), so the knowledge base needs an external embeddings
-  endpoint: set `RAG_EMBEDDING_ENGINE=openai` (or `ollama`) and point
-  `RAG_OPENAI_API_BASE_URL` / `RAG_OPENAI_API_KEY` at an OpenAI-compatible
-  embeddings server — typically the same provider you use for chat. With the
-  default (local) engine on this image, uploading or querying a knowledge base
-  returns a clear *"no embedding backend configured"* error. To embed locally
-  instead, run the full image and leave `RAG_EMBEDDING_ENGINE` unset.
-- **Local reranking / hybrid rerank** (`RAG_RERANKING_MODEL`) also requires the
-  full image — it loads a local cross-encoder. Leave it empty on the API-only
-  image (the default); setting it there raises a clear error.
+- **Knowledge base / RAG embeddings.** Core runs no inference of its own — the API
+  image is torch-free by design, with no bundled embedding model — so the knowledge
+  base needs an external embeddings endpoint: set `RAG_EMBEDDING_ENGINE=openai` (or
+  `ollama`) and point `RAG_OPENAI_API_BASE_URL` / `RAG_OPENAI_API_KEY` at an
+  OpenAI-compatible embeddings server — typically the same provider you use for
+  chat. Leaving the engine unset selects a local sentence-transformers model that
+  is not present, and uploading or querying a knowledge base then returns a clear
+  *"no embedding backend configured"* error. There is no "full image" to fall back
+  to; inference lives in the separate serving components, not in core.
+- **Local reranking / hybrid rerank** (`RAG_RERANKING_MODEL`) loads a local
+  cross-encoder and is likewise unavailable in core. Leave it empty (the default);
+  setting it raises an error. Note the error string still reads *"Local reranking
+  requires the full image"* — an Open-WebUI holdover that outlived the image it
+  referred to.
 - **Web loader (Firecrawl).** `RAG_WEB_LOADER_ENGINE=firecrawl` points the loader
   at any Firecrawl-compatible endpoint. To verify a connection before wiring it
   into the app, run `scripts/verify-firecrawl.py` (inside the api image) with

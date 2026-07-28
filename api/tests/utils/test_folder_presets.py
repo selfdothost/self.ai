@@ -168,6 +168,67 @@ def test_each_kind_reported_when_unresolved():
     assert fp.preset_references_resolve(preset, _user("writer")) is False
 
 
+# ---------------------------------------------------------------------------
+# Builtin tool_ids (e.g. "web_search") — fall back to the config flag ONLY
+# when no real tool table row exists for that id
+# ---------------------------------------------------------------------------
+
+
+def test_web_search_resolves_when_enabled_and_no_real_row_exists():
+    with patch.object(fp.Tools, "get_tool_by_id", return_value=None) as mock_get_tool:
+        assert fp.resolve_tool_ref("web_search", _user("writer"), web_search_enabled=True) is True
+        mock_get_tool.assert_called_once_with("web_search")
+
+
+def test_web_search_does_not_resolve_when_disabled_and_no_real_row_exists():
+    with patch.object(fp.Tools, "get_tool_by_id", return_value=None):
+        assert fp.resolve_tool_ref("web_search", _user("writer"), web_search_enabled=False) is False
+
+
+def test_web_search_default_is_disabled():
+    # web_search_enabled defaults to False when a caller omits it.
+    with patch.object(fp.Tools, "get_tool_by_id", return_value=None):
+        assert fp.resolve_tool_ref("web_search", _user("writer")) is False
+
+
+def test_real_tool_row_named_web_search_takes_priority_over_the_builtin_gate():
+    """A tool table row that happens to be id'd "web_search" (however unlikely)
+    is resolved via its own access control, never shadowed by the builtin
+    fallback -- even when the capability is disabled system-wide."""
+    rec = _record(user_id="writer")
+    with patch.object(fp.Tools, "get_tool_by_id", return_value=rec):
+        assert fp.resolve_tool_ref("web_search", _user("writer"), web_search_enabled=False) is True
+
+
+def test_inaccessible_real_tool_row_named_web_search_does_not_fall_back_to_the_gate():
+    rec = _record(user_id="someone_else", access_control={"write": {"user_ids": ["other"]}})
+    with patch.object(fp.Tools, "get_tool_by_id", return_value=rec), patch.object(
+        fp, "has_access", return_value=False
+    ):
+        assert fp.resolve_tool_ref("web_search", _user("writer"), web_search_enabled=True) is False
+
+
+def test_preset_with_web_search_and_real_tool_resolves_when_enabled():
+    preset = FolderPresetModel(tool_ids=["web_search", "t1"])
+
+    def tool_lookup(tool_id):
+        return _record(user_id="writer") if tool_id == "t1" else None
+
+    with patch.object(fp.Tools, "get_tool_by_id", side_effect=tool_lookup):
+        assert (
+            fp.unresolved_preset_references(preset, _user("writer"), web_search_enabled=True) == []
+        )
+
+
+def test_preset_with_web_search_rejected_when_disabled():
+    preset = FolderPresetModel(tool_ids=["web_search"])
+    with patch.object(fp.Tools, "get_tool_by_id", return_value=None):
+        unresolved = fp.unresolved_preset_references(
+            preset, _user("writer"), web_search_enabled=False
+        )
+    assert unresolved == [(fp.REF_TOOL, "web_search")]
+
+
 def test_permission_argument_is_forwarded_to_has_access():
     rec = _record(user_id="someone_else", access_control={"read": {"user_ids": ["writer"]}})
     with patch.object(fp.Knowledges, "get_knowledge_by_id", return_value=rec), patch.object(

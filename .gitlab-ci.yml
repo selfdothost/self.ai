@@ -1,9 +1,11 @@
 # self.ai CI — build the API server image and publish to container.home.
 #
 # Builds the backend only (api) into a slim, torch-free API image.
-# kaniko (daemonless) NOT buildah — the runner pods have no /dev/fuse. Image
-# lands at $CI_REGISTRY_IMAGE/api:<short-sha> (container.home...selfai/self.ai/api).
-# Nothing builds on the bastion; Flux's ImagePolicy promotes from the registry.
+# buildkit-rootless (daemonless) NOT kaniko (gitlab-profile#60 /
+# self.infrastructure#143): kaniko's writable layer always lands on the node's
+# containerd root and can't be redirected; buildkit's state is a flag (`--root`)
+# pointed at the /builds mount, and it runs rootless (uid 1000). Image lands at
+# $CI_REGISTRY_IMAGE/api:<short-sha>. Flux's ImagePolicy promotes from the registry.
 #
 # Runner #28 is run_untagged=false → every job carries a tag. The image build
 # runs on `yard-midbuild` (2x 8c/16Gi floating) — off `bigbuild`, which is
@@ -11,11 +13,47 @@
 #
 # Submodules (eval/speech/inference repos) are NOT fetched — the API build needs
 # only the backend tree.
+#
+# Two-job split (selfinfra/zlib reference): build:api is the MR gate (builds the
+# api/ context with NO --output = kaniko --no-push); publish:api builds + pushes
+# on main only.
 
-stages: [lint, test, build, publish]
+#   pages     — builds and publishes product-docs/ as a mkdocs-material site via
+#               the forge's GitLab Pages. Defined in .gitlab/ci-templates/pages.yml.
+
+stages: [lint, test, build, publish, pages]
+
+# --- Never auto-cancel a pipeline on main. ---------------------------------
+#
+# Default GitLab behaviour ("auto-cancel redundant pipelines") cancels an older
+# running pipeline on a ref when a newer one starts. On a feature branch that is
+# what you want. On main it silently loses builds, and it bit us twice on
+# 2026-07-27/28: a code merge starts publish:api, a manifests-only deploy-pin MR
+# merges four minutes later, and the pin's pipeline cancels the build the pin
+# exists to deploy. Main stays green the whole time — the cancelled pipeline is
+# a separate object nobody is looking at — so the failure reads as "the registry
+# does not have that tag yet" long after the build stopped existing.
+#
+# `interruptible: false` on publish:api does NOT fix this: a job that has not
+# STARTED yet is always treated as cancelable regardless of the flag, and the
+# publish job spends most of its life queued behind the two contended `yard`
+# runner slots. The pipeline-level lever is the only one that holds.
+#
+# Scheduled pipelines run on main too, so this also protects the Tuesday 09:03 PT
+# sync:public-alpha mirror from being cancelled by a merge landing mid-publish.
+#
+# Feature branches keep the default: pushing a fixup still cancels the previous
+# run, which matters with only two runner slots.
+workflow:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      auto_cancel:
+        on_new_commit: none
+    - when: always
 
 include:
   - local: '.gitlab/ci-templates/sync-public-alpha.yml'
+  - local: '.gitlab/ci-templates/pages.yml'
 
 default:
   tags: [yard]
@@ -23,13 +61,33 @@ default:
 variables:
   GIT_SUBMODULE_STRATEGY: none
   API_IMAGE: $CI_REGISTRY_IMAGE/api
+  BUILDKIT_IMAGE: "moby/buildkit:v0.31.2-rootless"   # pinned, not master
+  # Bursty CI jobs: SMALL requests so a job schedules even on a busy node, HIGH
+  # limits so it can burst when it actually runs. These jobs sit idle until
+  # triggered, need real CPU/RAM only briefly, and don't all run at once — so
+  # right-sizing the request (not the limit) is what lets k8s bin-pack them.
+  # Requires the runner to permit resource overwrites (self.infrastructure#173).
+  KUBERNETES_CPU_REQUEST: "250m"
+  KUBERNETES_CPU_LIMIT: "8"
+  KUBERNETES_MEMORY_REQUEST: "1Gi"
+  KUBERNETES_MEMORY_LIMIT: "16Gi"
 
-# --- lint: ruff against api/ -------------------------------------------------
-# First-ever Python lint gate for this repo (self.ai#28) — api/selfai_ui is a
-# hard fork of Open-WebUI v0.5.4 that has never been ruff-checked, so the
-# actual finding count is unknown until this runs for real. allow_failure:
-# true until that backlog is triaged and burned down (mirrors how the eslint
-# gate landed in self.chat: allow_failure first, then flipped once clean).
+# Registry auth + buildkit state dir, both OUTSIDE the build context. The context
+# is $CI_PROJECT_DIR/api, so scratch under $CI_BUILDS_DIR/.buildkit is well
+# outside it — the CI_JOB_TOKEN credential must never sit where a `COPY . .`
+# could bake it into the image (gitlab-profile#60 trap 3). --root points build
+# bytes at the /builds mount, off the node containerd root (#143).
+.buildkit-before: &buildkit-before
+  - export BK_SCRATCH="${CI_BUILDS_DIR:-/builds}/.buildkit"
+  - mkdir -p "$BK_SCRATCH" 2>/dev/null || export BK_SCRATCH="$(dirname "$CI_PROJECT_DIR")/.buildkit"
+  - mkdir -p "$BK_SCRATCH/state" "$BK_SCRATCH/docker"
+  - export DOCKER_CONFIG="$BK_SCRATCH/docker"
+  - echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_JOB_TOKEN" | base64 | tr -d '\n')\"}}}" > "$DOCKER_CONFIG/config.json"
+  - chmod 600 "$DOCKER_CONFIG/config.json"
+  - export BUILDKITD_FLAGS="--oci-worker-no-process-sandbox --root $BK_SCRATCH/state"
+
+# --- lint: ruff against api/ (blocking; clones before it lints — a get_sources
+# error is the forge, not the code — retry). Gated on api/ + this file. ---
 lint:ruff:
   stage: lint
   image: python:3.11-slim-bookworm
@@ -37,17 +95,26 @@ lint:ruff:
     - pip install --no-cache-dir ruff~=0.6.9
   script:
     - cd api && ruff check .
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: [api/**/*, .gitlab-ci.yml]
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      changes: [api/**/*, .gitlab-ci.yml]
 
-# --- test: pytest against api/tests/ ----------------------------------------
-# Plain pip install (not the kaniko/Dockerfile path) against requirements-api.txt
-# (the slim, torch-free API-tier set) + requirements-dev.txt (test-only extras).
-# Runs on MR + main when the backend changes.
-#
-# Blocking (self.ai#26 resolved 2026-07-09: 495 passed, 4 xfailed, 0 failed,
-# confirmed on pipeline 3289). Was allow_failure while
-# test_audio_config_update_persists/test_audio_speech_requires_payload were
-# broken -- both fixed, and the SERVICE_AUTH_SECRET gap that separately broke
-# 2 job-state-machine tests on self.ai#25's ticket wiring is fixed too.
+# --- lint: kustomize render of manifests/ (also guarantees a non-empty pipeline
+# for manifest/CI-only changes so the merge gate has something to pass). ---
+lint:manifests:
+  stage: lint
+  image: alpine/k8s:1.31.1
+  script:
+    - kubectl kustomize manifests/ > /dev/null
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: [manifests/**/*, .gitlab-ci.yml]
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      changes: [manifests/**/*, .gitlab-ci.yml]
+
+# --- test: pytest against api/tests/ (blocking; torch-free API-tier deps) ---
 test:api:
   stage: test
   image: python:3.11-slim-bookworm
@@ -63,32 +130,45 @@ test:api:
     - if: '$CI_COMMIT_BRANCH == "main"'
       changes: [api/**/*]
 
-# --- build: slim FastAPI (selfai_ui) API image ------------------------------
-# Runs on MR + main when the backend changes (not on doc/manifest-only commits).
+# --- build: slim FastAPI (selfai_ui) API image — MR gate (build api/, NO push) -
+# No registry cache (the old job ran --cache=false), so no --import/--export-cache.
 build:api:
   stage: build
-  image:
-    name: gcr.io/kaniko-project/executor:debug
-    entrypoint: [""]
+  image: { name: "$BUILDKIT_IMAGE", entrypoint: [""] }
   tags: [yard-midbuild]
   timeout: 1h
-  before_script:
-    - mkdir -p /kaniko/.docker
-    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_JOB_TOKEN" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
-  script:
-    - >
-      /kaniko/executor
-      --context "$CI_PROJECT_DIR/api"
-      --dockerfile "$CI_PROJECT_DIR/api/Dockerfile"
-      --build-arg BUILD_HASH="$CI_COMMIT_SHORT_SHA"
-      --cache=false
-      --destination "$API_IMAGE:$CI_COMMIT_SHORT_SHA"
-      --destination "$API_IMAGE:latest"
+  before_script: *buildkit-before
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes: [api/**/*]
+  script:
+    - >
+      buildctl-daemonless.sh build
+      --frontend dockerfile.v0
+      --local context="$CI_PROJECT_DIR/api"
+      --local dockerfile="$CI_PROJECT_DIR/api"
+      --opt build-arg:BUILD_HASH="$CI_COMMIT_SHORT_SHA"
+
+# --- publish: build + push api :sha / :latest (main only) ---
+publish:api:
+  stage: publish
+  image: { name: "$BUILDKIT_IMAGE", entrypoint: [""] }
+  tags: [yard-midbuild]
+  timeout: 1h
+  before_script: *buildkit-before
+  rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
       changes: [api/**/*]
+  script:
+    - export TAGS="${API_IMAGE}:${CI_COMMIT_SHORT_SHA},${API_IMAGE}:latest"
+    - 'export OUT="type=image,\"name=${TAGS}\",push=true"'
+    - >
+      buildctl-daemonless.sh build
+      --frontend dockerfile.v0
+      --local context="$CI_PROJECT_DIR/api"
+      --local dockerfile="$CI_PROJECT_DIR/api"
+      --opt build-arg:BUILD_HASH="$CI_COMMIT_SHORT_SHA"
+      --output "$OUT"
 
 # --- publish: mirror main -> public-alpha (GitLab + GitHub), scheduled only -
 sync:public-alpha:

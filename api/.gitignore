@@ -11,3 +11,6 @@ Pipfile
 /data/*
 /selfai_ui/data/*
 .webui_secret_key
+# Local test virtualenv. venv self-ignores via .venv/.gitignore, but that is
+# implicit and vanishes if the directory is ever recreated by other means.
+.venv/

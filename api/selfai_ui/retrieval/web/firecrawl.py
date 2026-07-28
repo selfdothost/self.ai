@@ -158,6 +158,7 @@ class SafeFirecrawlLoader:
         limit: int = 10,
         max_depth: Optional[int] = None,
         delay: Optional[int] = None,
+        robots_crawl_delay: Optional[float] = None,
         poll_interval: int = 2,
         max_consecutive_403s: Optional[int] = None,
         include_paths: Optional[List[str]] = None,
@@ -203,6 +204,19 @@ class SafeFirecrawlLoader:
                     crawl_kwargs["limit"] = limit
                 if scrape_options:
                     crawl_kwargs["scrape_options"] = scrape_options
+                # Inter-request politeness delay (distinct from the static
+                # `delay`, which is the per-page render wait above). The site's
+                # robots.txt Crawl-delay is honored on top of the user's static
+                # value: the effective spacing is the larger of the two. Only
+                # set when there is something to honor, so default Firecrawl
+                # behavior is unchanged for crawls with neither.
+                effective_delay = max(delay or 0, robots_crawl_delay or 0)
+                if effective_delay:
+                    crawl_kwargs["delay"] = effective_delay
+                    log.info(
+                        f"crawl_with_progress: inter-request delay {effective_delay}s "
+                        f"(static={delay or 0}s, robots={robots_crawl_delay or 0}s)"
+                    )
                 if max_depth is not None:
                     crawl_kwargs["max_depth"] = max_depth
                 if include_paths:

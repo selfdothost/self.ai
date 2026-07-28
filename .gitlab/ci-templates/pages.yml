@@ -1,0 +1,84 @@
+# .gitlab/ci-templates/pages.yml — publish self.ai's docs via the forge's GitLab
+# Pages. Follows the pattern self.forge proved end-to-end.
+#
+# The job name MUST be exactly `pages` — GitLab auto-detects it and deploys the
+# `public/` artifact regardless of stage name. `pages:validate` below runs the
+# identical build on MRs under a different name so it can never trigger a deploy.
+#
+# product-docs/ (the real product documentation) and docs/ (operator handoffs)
+# and context/ (treasuremaps, plans) don't live under one directory in-repo, and
+# mkdocs needs a single docs_dir (see mkdocs.yml) — so the job stages a copy
+# under .docs-build/ before building.
+#
+# Deliberately EXCLUDED from the staged site:
+#   - CLAUDE.md            — agent context, not reader docs
+#   - docs/publish-secrets.md — release-engineering credential inventory (vault
+#                            paths and token scopes). No secret values, but it
+#                            does not belong on a browsable site.
+#
+# API Reference (product-docs/api-reference.md) is generated, not written: this
+# job imports the real FastAPI app and calls its own `.openapi()` — the same
+# schema introspection `docs_url`/`openapi_url` would serve if they weren't
+# disabled outside dev (api/selfai_ui/main.py) — and renders it with
+# mkdocs-swagger-ui-tag (assets vendored in the plugin package, no CDN, no
+# phone-home). That's why the image is python:3.11-slim-bookworm, matching
+# api/Dockerfile and every other job that installs requirements-api.txt:
+# unstructured==0.15.9 (self.ai#60) has no 3.13-compatible release, and
+# python:3.13-slim (the previous image here, back when this job only needed
+# mkdocs-material) hits that wall the moment it needs to install API deps.
+
+.pages-build: &pages-build
+  image: python:3.11-slim-bookworm
+  tags: [yard]
+  # Docs have no dependency on the image builds. Without this, an unrelated
+  # build failure would block Pages from ever reaching the `pages` stage.
+  needs: []
+  script:
+    - pip install --no-cache-dir mkdocs-material mkdocs-swagger-ui-tag
+    - pip install --no-cache-dir -r api/requirements-api.txt
+    - mkdir -p .docs-build
+    - cp -r product-docs/. .docs-build/
+    - cp -r docs .docs-build/handoffs
+    - rm -f .docs-build/handoffs/publish-secrets.md
+    - cp -r context .docs-build/context
+    # Generate the OpenAPI schema fresh, every build — never checked into git,
+    # so it can't go stale the way a hand-maintained API page would. Importing
+    # selfai_ui.main queries the DB at module load (config.py's own
+    # `CONFIG_DATA = get_config()`), so a real, writable DATA_DIR has to exist
+    # before the import runs — the default (api/data/) doesn't exist in a
+    # fresh checkout, which fails the import with "unable to open database
+    # file" (a real gap this job caught first try; not a flake).
+    - mkdir -p .api-data
+    - >
+      (cd api && DATA_DIR="$CI_PROJECT_DIR/.api-data"
+      WEBUI_SECRET_KEY="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+      python3 -c "from selfai_ui.main import app; import json; json.dump(app.openapi(), open('../.docs-build/openapi.json', 'w'))")
+    # Not --strict: the staged prose carries pre-existing relative links to
+    # files outside this site (sibling repos, files excluded above). Those are
+    # content issues to fix in the source, not CI bugs; mkdocs still builds and
+    # they render as dead links until then.
+    - mkdocs build
+
+# MR validation only — same build, different job name, never deploys.
+pages:validate:
+  <<: *pages-build
+  stage: pages
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - product-docs/**/*
+        - docs/**/*
+        - context/**/*
+        - api/**/*
+        - mkdocs.yml
+        - .gitlab/ci-templates/pages.yml
+
+# The job name MUST be exactly `pages`.
+pages:
+  <<: *pages-build
+  stage: pages
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  artifacts:
+    paths:
+      - public

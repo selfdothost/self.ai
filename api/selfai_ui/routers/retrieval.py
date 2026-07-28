@@ -22,6 +22,8 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter, TokenTextSpl
 from langchain_core.documents import Document
 from pydantic import BaseModel
 
+from selfai_ui.browse.profiles import resolve_profile
+from selfai_ui.browse.robots import RobotsCache
 from selfai_ui.config import (
     DEFAULT_LOCALE,
     ENV,
@@ -390,6 +392,11 @@ async def get_rag_config(request: Request, user=Depends(get_admin_user)):
             "web_loader_ssl_verification": request.app.state.config.ENABLE_RAG_WEB_LOADER_SSL_VERIFICATION,
             "search": {
                 "enabled": request.app.state.config.ENABLE_RAG_WEB_SEARCH,
+                "deep_research_enabled": request.app.state.config.ENABLE_DEEP_RESEARCH,
+                "deep_research_max_pages": request.app.state.config.DEEP_RESEARCH_MAX_PAGES,
+                "web_crawl_enabled": request.app.state.config.ENABLE_WEB_CRAWL,
+                "web_crawl_max_pages": request.app.state.config.WEB_CRAWL_MAX_PAGES,
+                "web_crawl_max_depth": request.app.state.config.WEB_CRAWL_MAX_DEPTH,
                 "drive": request.app.state.config.ENABLE_GOOGLE_DRIVE_INTEGRATION,
                 "engine": request.app.state.config.RAG_WEB_SEARCH_ENGINE,
                 "searxng_query_url": request.app.state.config.SEARXNG_QUERY_URL,
@@ -439,6 +446,22 @@ class YoutubeLoaderConfig(BaseModel):
 
 class WebSearchConfig(BaseModel):
     enabled: bool
+    # Deep research is a separate capability gated on its own flag, not part of
+    # Web Search — but it lives in this same config block because it consumes
+    # the same search provider. Optional so an older client that omits it does
+    # not clobber the stored value (see the guarded assignment on update).
+    deep_research_enabled: Optional[bool] = None
+    # The page ceiling for a single deep_research traversal — the "scrape
+    # ceiling". Admin-settable; clamped on write so a typo can't turn one chat
+    # message into a hundred fetches against the shared Playwright service.
+    deep_research_max_pages: Optional[int] = None
+    # Web Crawl — the KB domain crawl driven by a model. It lives in this block
+    # because the admin surfaces it on the same panel, not because it is a form
+    # of web search; it writes into a knowledge base rather than answering.
+    # Optional + guarded on write, like the fields above.
+    web_crawl_enabled: Optional[bool] = None
+    web_crawl_max_pages: Optional[int] = None
+    web_crawl_max_depth: Optional[int] = None
     engine: Optional[str] = None
     searxng_query_url: Optional[str] = None
     google_pse_api_key: Optional[str] = None
@@ -516,6 +539,32 @@ async def update_rag_config(request: Request, form_data: ConfigUpdateForm, user=
         )
 
         request.app.state.config.ENABLE_RAG_WEB_SEARCH = form_data.web.search.enabled
+        # Guarded: only overwrite when the client actually sent it. A client
+        # that predates this field leaves it None, which must not be read as
+        # "turn deep research off".
+        if form_data.web.search.deep_research_enabled is not None:
+            request.app.state.config.ENABLE_DEEP_RESEARCH = form_data.web.search.deep_research_enabled
+        if form_data.web.search.deep_research_max_pages is not None:
+            # Clamp to a sane band, in code rather than trusting the client. The
+            # floor keeps a traversal useful (a single page is what web_fetch is
+            # for); the ceiling protects the shared Playwright service from a
+            # fat-fingered value turning one message into a crawl.
+            request.app.state.config.DEEP_RESEARCH_MAX_PAGES = max(
+                1, min(50, form_data.web.search.deep_research_max_pages)
+            )
+        if form_data.web.search.web_crawl_enabled is not None:
+            request.app.state.config.ENABLE_WEB_CRAWL = form_data.web.search.web_crawl_enabled
+        if form_data.web.search.web_crawl_max_pages is not None:
+            # Clamped in code, not trusted from the client. A crawl writes
+            # persisted pages into a knowledge base, so a fat-fingered value
+            # costs storage and Firecrawl load, not just a slow request.
+            request.app.state.config.WEB_CRAWL_MAX_PAGES = max(
+                1, min(500, form_data.web.search.web_crawl_max_pages)
+            )
+        if form_data.web.search.web_crawl_max_depth is not None:
+            request.app.state.config.WEB_CRAWL_MAX_DEPTH = max(
+                1, min(10, form_data.web.search.web_crawl_max_depth)
+            )
         request.app.state.config.RAG_WEB_SEARCH_ENGINE = form_data.web.search.engine
         request.app.state.config.SEARXNG_QUERY_URL = form_data.web.search.searxng_query_url
         request.app.state.config.GOOGLE_PSE_API_KEY = form_data.web.search.google_pse_api_key
@@ -563,6 +612,11 @@ async def update_rag_config(request: Request, form_data: ConfigUpdateForm, user=
             "web_loader_ssl_verification": request.app.state.config.ENABLE_RAG_WEB_LOADER_SSL_VERIFICATION,
             "search": {
                 "enabled": request.app.state.config.ENABLE_RAG_WEB_SEARCH,
+                "deep_research_enabled": request.app.state.config.ENABLE_DEEP_RESEARCH,
+                "deep_research_max_pages": request.app.state.config.DEEP_RESEARCH_MAX_PAGES,
+                "web_crawl_enabled": request.app.state.config.ENABLE_WEB_CRAWL,
+                "web_crawl_max_pages": request.app.state.config.WEB_CRAWL_MAX_PAGES,
+                "web_crawl_max_depth": request.app.state.config.WEB_CRAWL_MAX_DEPTH,
                 "engine": request.app.state.config.RAG_WEB_SEARCH_ENGINE,
                 "searxng_query_url": request.app.state.config.SEARXNG_QUERY_URL,
                 "google_pse_api_key": request.app.state.config.GOOGLE_PSE_API_KEY,
@@ -1153,6 +1207,45 @@ async def _flush_embed_cache(
         pending = len(pages) - cursor
 
 
+def create_crawl_job(request, form_data: ProcessWebCrawlForm, collection_name: str, user_id: str) -> dict:
+    """Create and register a crawl job, returning its job_state.
+
+    Shared by the HTTP endpoint (/process/web/crawl, driven by the KB UI) and
+    the web_crawl chat tool (driven by a model). Both start the *same* crawl —
+    only how the background task is scheduled differs, because BackgroundTasks
+    exists solely inside a request handler. Keeping job creation here means a
+    model-driven crawl is registered, persisted, and resumable on exactly the
+    same terms as a UI-driven one.
+    """
+    if not hasattr(request.app.state, "crawl_jobs"):
+        request.app.state.crawl_jobs = {}
+
+    job_id = str(uuid.uuid4())
+    job_state = {
+        "job_id": job_id,
+        "url": form_data.url,
+        "poll_interval": form_data.poll_interval,
+        "status": "running",
+        "completed": 0,
+        "total": 0,
+        "crawl_id": None,
+        "cancelled": False,
+        "cancel_reason": None,
+        "collection_name": collection_name,
+        "pages": [],
+        "content": None,
+        "error": None,
+        "_firecrawl_processed": 0,
+        "_embed_cursor": 0,
+        "saved_count": 0,
+        "save_errors": [],
+        "user_id": user_id,
+        "batch_size": form_data.batch_size or 10,
+    }
+    request.app.state.crawl_jobs[job_id] = job_state
+    return job_state
+
+
 async def _run_crawl_background(
     request,
     job_state: dict,
@@ -1181,11 +1274,30 @@ async def _run_crawl_background(
             api_key=request.app.state.config.FIRECRAWL_API_KEY,
             api_base_url=api_base,
         )
+        # A domain crawl is crawler behavior — honor the target's robots.txt
+        # Crawl-delay on top of the user's static delay. Read through the browse
+        # connection (the Playwright tunnel), so it only applies when that
+        # connection is configured. A robots read failure must never block an
+        # ingestion job, so any error here just leaves the static delay in play.
+        robots_crawl_delay = None
+        cfg = request.app.state.config
+        if cfg.KB_CRAWL_RESPECT_ROBOTS_DELAY and cfg.BROWSE_PLAYWRIGHT_SERVICE_URL:
+            try:
+                cache = RobotsCache(cfg.BROWSE_USER_AGENT)
+                robots_crawl_delay = await cache.max_crawl_delay(
+                    request, form_data.url, resolve_profile("direct-fetch")
+                )
+                if robots_crawl_delay:
+                    log.info(f"KB crawl: robots.txt Crawl-delay {robots_crawl_delay}s will be honored")
+            except Exception as e:
+                log.warning(f"KB crawl: robots.txt Crawl-delay lookup failed, using static delay only: {e}")
+
         await loader.crawl_with_progress(
             job_state,
             limit=form_data.limit,
             max_depth=form_data.max_depth,
             delay=form_data.delay,
+            robots_crawl_delay=robots_crawl_delay,
             poll_interval=form_data.poll_interval,
             max_consecutive_403s=form_data.max_consecutive_403s,
             include_paths=form_data.include_paths,
@@ -1355,37 +1467,12 @@ async def process_web_crawl(
     collection_name = form_data.collection_name or calculate_sha256_string(form_data.url)[:63]
     validate_url(form_data.url)
 
-    if not hasattr(request.app.state, "crawl_jobs"):
-        request.app.state.crawl_jobs = {}
-
-    job_id = str(uuid.uuid4())
-    job_state = {
-        "job_id": job_id,
-        "url": form_data.url,
-        "poll_interval": form_data.poll_interval,
-        "status": "running",
-        "completed": 0,
-        "total": 0,
-        "crawl_id": None,
-        "cancelled": False,
-        "cancel_reason": None,
-        "collection_name": collection_name,
-        "pages": [],
-        "content": None,
-        "error": None,
-        "_firecrawl_processed": 0,
-        "_embed_cursor": 0,
-        "saved_count": 0,
-        "save_errors": [],
-        "user_id": user.id,
-        "batch_size": form_data.batch_size or 10,
-    }
-    request.app.state.crawl_jobs[job_id] = job_state
-    log.info(f"process_web_crawl: created job {job_id} for collection {collection_name}")
+    job_state = create_crawl_job(request, form_data, collection_name, user.id)
+    log.info(f"process_web_crawl: created job {job_state['job_id']} for collection {collection_name}")
 
     background_tasks.add_task(_run_crawl_background, request, job_state, form_data, collection_name, user.id)
 
-    return {"job_id": job_id, "status": "started"}
+    return {"job_id": job_state["job_id"], "status": "started"}
 
 
 @router.get("/process/web/crawl")
@@ -1790,7 +1877,15 @@ def reset_upload_dir(user=Depends(get_admin_user)) -> bool:
 if ENV == "dev":
 
     @router.get("/ef/{text}")
-    async def get_embeddings(request: Request, text: Optional[str] = "Hello World!"):
+    async def get_embeddings(
+        request: Request, text: Optional[str] = "Hello World!", user=Depends(get_verified_user)
+    ):
+        # Dev-only convenience route, authenticated anyway: `ENV` defaults to
+        # "dev" (`env.py`), so this endpoint's absence from production rests
+        # entirely on the deployment remembering to set ENV=prod. Ours does; one
+        # that forgets would expose anonymous embedding compute. Requiring a user
+        # makes the guard something the route asserts rather than something the
+        # environment is trusted to have configured.
         return {"result": request.app.state.EMBEDDING_FUNCTION(text)}
 
 

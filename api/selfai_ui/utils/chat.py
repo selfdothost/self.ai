@@ -11,6 +11,12 @@ from starlette.responses import StreamingResponse
 from selfai_ui.env import BYPASS_MODEL_ACCESS_CONTROL, GLOBAL_LOG_LEVEL, SRC_LOG_LEVELS
 from selfai_ui.functions import generate_function_chat_completion
 from selfai_ui.models.functions import Functions
+from selfai_ui.routers.anthropic import (
+    generate_chat_completion as generate_anthropic_chat_completion,
+)
+from selfai_ui.routers.anthropic import (
+    generate_completion as generate_anthropic_completion,
+)
 from selfai_ui.routers.llamolotl import (
     generate_chat_completion as generate_llamolotl_chat_completion,
 )
@@ -144,6 +150,12 @@ async def generate_chat_completion(
         return await generate_llamolotl_chat_completion(
             request=request, form_data=form_data, user=user, bypass_filter=bypass_filter
         )
+    elif model["owned_by"] == "anthropic":
+        # Using /anthropic/chat/completions endpoint. The router owns the payload and
+        # response conversion so the result is already OpenAI-shaped (including SSE).
+        return await generate_anthropic_chat_completion(
+            request=request, form_data=form_data, user=user, bypass_filter=bypass_filter
+        )
     else:
         return await generate_openai_chat_completion(
             request=request, form_data=form_data, user=user, bypass_filter=bypass_filter
@@ -182,6 +194,10 @@ async def generate_completion(
         return await generate_ollama_completion(request=request, form_data=form_data, user=user)
     elif model["owned_by"] == "llamolotl":
         return await generate_llamolotl_completion(
+            request=request, form_data=form_data, user=user, bypass_filter=bypass_filter
+        )
+    elif model["owned_by"] == "anthropic":
+        return await generate_anthropic_completion(
             request=request, form_data=form_data, user=user, bypass_filter=bypass_filter
         )
     else:

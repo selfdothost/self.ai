@@ -1,0 +1,69 @@
+# The Phase 1 reference mod: a minimal-but-genuine mod that stays permanently in
+# the tree and proves the Phase 0 contract end to end. Its id is `reference`,
+# deliberately not `example` (the placeholder used across the Phase 0 unit
+# fixtures).
+#
+# Cavekit: cavekit-mods-reference-implementation.md R1, R5 -- T-001
+id: reference
+name: Reference Mod
+version: 0.1.0
+
+# module:attribute -- resolved by mods/loader.py:resolve_entrypoint via
+# import_module(module) then getattr(module, attribute). `Mod` is a class, so
+# the loader instantiates it. `mods.reference.reference_mod` resolves because
+# `api/` is on sys.path and `api/mods/reference/` holds the module.
+entrypoint: mods.reference.reference_mod:Mod
+
+# The real running core resolves selfai_ui.env.VERSION to 0.5.0, which satisfies
+# this floor.
+min_core_version: 0.5.0
+
+# One router mounts under this prefix (register_routers, T-005).
+api:
+  prefix: /reference
+
+# One Socket.IO namespace on core's existing server (register_ws, T-004).
+ws:
+  namespace: /reference
+
+# The declarative nav surface (frontend-api R1/R6 -- T-A07). A view id/path a
+# nav label, an icon, and the add-to-nav flag; visibility is gated by the mod's
+# OWN scope -- we reuse the single `mods.reference.use` scope already declared
+# below, so the same grant that lets a user use the mod's tool/route/namespace
+# also surfaces its nav view. `tag` is left undeclared: it derives from the mod
+# id via naming.custom_element_tag_for("reference") == "mod-reference".
+frontend:
+  bundle_url: /static/mods/reference/index.html
+  view: reference-home
+  label: Reference
+  icon: puzzle
+  add_to_nav: true
+  scopes:
+    - mods.reference.use
+
+# One scope, rooted at scope_root_for("reference") == "mods.reference".
+scopes:
+  - id: mods.reference.use
+    desc: Use the reference mod's tool, route, and namespace.
+
+# The one table this mod owns. Must equal table_prefix_for("reference").
+db:
+  table_prefix: mod_reference_
+
+# Operator-settable configuration (Loader R8). Declared here so the reference mod
+# exercises the config surface for real -- it was the one Phase 0 hook no mod
+# declared, which is why `attach_mod_config` sat uncalled at boot with no test
+# noticing. Both shapes are covered deliberately:
+#
+#   * `greeting` is an ordinary key with an inline default. It resolves from
+#     MOD_REFERENCE_GREETING when that is set, else from `default` here.
+#   * `api_key` is secret, so it carries NO inline value (validate_semantics
+#     refuses one) and resolves only from MOD_REFERENCE_API_KEY. Unset is a valid
+#     state -- GET /reference/config reports whether it is set, never what it is.
+config:
+  - key: greeting
+    desc: Text GET /reference/config echoes back, proving a resolved value reaches the mod.
+    default: hello
+  - key: api_key
+    desc: Example secret credential; sourced only from MOD_REFERENCE_API_KEY, never the manifest.
+    secret: true

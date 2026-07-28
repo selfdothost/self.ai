@@ -29,10 +29,20 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.responses import Response
 
+import selfai_ui.config as _selfai_config
+from selfai_ui.audio.migration import (
+    build_legacy_snapshot,
+    migrate_legacy_audio_config,
+)
 from selfai_ui.config import (
     ADMIN_EMAIL,
+    ANTHROPIC_API_CONFIGS,
+    ANTHROPIC_BASE_URLS,
     API_KEY_ALLOWED_ENDPOINTS,
     # Audio
+    AUDIO_CONNECTION_CONFIGS,
+    AUDIO_STT_CONTROL_BASE_URL,
+    AUDIO_STT_ENABLED_MODELS,
     AUDIO_STT_ENGINE,
     AUDIO_STT_MODEL,
     AUDIO_STT_OPENAI_API_BASE_URL,
@@ -40,6 +50,8 @@ from selfai_ui.config import (
     AUDIO_TTS_API_KEY,
     AUDIO_TTS_AZURE_SPEECH_OUTPUT_FORMAT,
     AUDIO_TTS_AZURE_SPEECH_REGION,
+    AUDIO_TTS_CONTROL_BASE_URL,
+    AUDIO_TTS_ENABLED_VOICES,
     AUDIO_TTS_ENGINE,
     AUDIO_TTS_MODEL,
     AUDIO_TTS_OPENAI_API_BASE_URL,
@@ -57,8 +69,11 @@ from selfai_ui.config import (
     BING_SEARCH_V7_ENDPOINT,
     BING_SEARCH_V7_SUBSCRIPTION_KEY,
     BRAVE_SEARCH_API_KEY,
+    BROWSE_FETCH_MAX_CHARS,
+    BROWSE_MAX_LINKS_PER_PAGE,
     BROWSE_PLAYWRIGHT_API_KEY,
     BROWSE_PLAYWRIGHT_SERVICE_URL,
+    BROWSE_USER_AGENT,
     CACHE_DIR,
     CHUNK_OVERLAP,
     CHUNK_SIZE,
@@ -71,6 +86,13 @@ from selfai_ui.config import (
     CORS_ALLOW_ORIGIN,
     CURATOR_API_CONFIGS,
     CURATOR_BASE_URLS,
+    DEEP_RESEARCH_CONCURRENCY,
+    DEEP_RESEARCH_MAX_CHARS_PER_PAGE,
+    DEEP_RESEARCH_MAX_CRAWL_DELAY_SECONDS,
+    DEEP_RESEARCH_MAX_DEPTH,
+    DEEP_RESEARCH_MAX_PAGES,
+    DEEP_RESEARCH_MAX_SECONDS,
+    DEEP_RESEARCH_RESPECT_ROBOTS,
     DEFAULT_LOCALE,
     DEFAULT_MODELS,
     DEFAULT_PROMPT_SUGGESTIONS,
@@ -78,6 +100,8 @@ from selfai_ui.config import (
     # Admin
     ENABLE_ADMIN_CHAT_ACCESS,
     ENABLE_ADMIN_EXPORT,
+    # Anthropic
+    ENABLE_ANTHROPIC_API,
     ENABLE_API_KEY,
     ENABLE_API_KEY_ENDPOINT_RESTRICTIONS,
     ENABLE_AUTOCOMPLETE_GENERATION,
@@ -87,6 +111,7 @@ from selfai_ui.config import (
     ENABLE_COMMUNITY_SHARING,
     # Curator
     ENABLE_CURATOR_API,
+    ENABLE_DEEP_RESEARCH,
     ENABLE_EVALUATION_ARENA_MODELS,
     ENABLE_GOOGLE_DRIVE_INTEGRATION,
     ENABLE_IMAGE_GENERATION,
@@ -115,6 +140,7 @@ from selfai_ui.config import (
     ENABLE_SELF_CORPUS,
     ENABLE_SIGNUP,
     ENABLE_TAGS_GENERATION,
+    ENABLE_WEB_CRAWL,
     # Misc
     ENV,
     EVALUATION_ARENA_MODELS,
@@ -137,6 +163,7 @@ from selfai_ui.config import (
     JINA_API_KEY,
     JWT_EXPIRES_IN,
     KAGI_SEARCH_API_KEY,
+    KB_CRAWL_RESPECT_ROBOTS_DELAY,
     LANGUAGE_EVAL_BASE_URLS,
     LDAP_APP_DN,
     LDAP_APP_PASSWORD,
@@ -204,6 +231,7 @@ from selfai_ui.config import (
     SERPSTACK_API_KEY,
     SERPSTACK_HTTPS,
     SHOW_ADMIN_DETAILS,
+    SKETCH_CONTROL_BASE_URL,
     STATIC_DIR,
     TAGS_GENERATION_PROMPT_TEMPLATE,
     # Tasks
@@ -215,6 +243,8 @@ from selfai_ui.config import (
     TITLE_GENERATION_PROMPT_TEMPLATE,
     TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE,
     USER_PERMISSIONS,
+    WEB_CRAWL_MAX_DEPTH,
+    WEB_CRAWL_MAX_PAGES,
     WEBHOOK_URL,
     # WebUI
     WEBUI_AUTH,
@@ -250,7 +280,9 @@ from selfai_ui.models.functions import Functions
 from selfai_ui.models.models import Models
 from selfai_ui.models.users import Users
 from selfai_ui.routers import (
+    anthropic,
     audio,
+    audio_connections,
     auths,
     benchmarks,
     channels,
@@ -268,7 +300,10 @@ from selfai_ui.routers import (
     language_eval,
     llamolotl,
     memories,
+    mod_assets,
+    mod_frontend_manifest,
     models,
+    mods,
     ollama,
     openai,
     pipelines,
@@ -279,8 +314,11 @@ from selfai_ui.routers import (
     tasks,
     tools,
     training,
+    transcribe,
     users,
     utils,
+    voice_catalog,
+    vram_leases,
     windows,
 )
 from selfai_ui.routers.retrieval import (
@@ -367,13 +405,34 @@ async def lifespan(app: FastAPI):
         reset_config()
 
     _register_browse_reference_profiles()
+    # Mods load synchronously, BEFORE yield: routes must be mounted and scopes
+    # seeded before the first request is served, unlike the fire-and-forget
+    # background tasks below. boot_mods contains its own per-mod failure
+    # isolation, so a broken mod cannot stop the app coming up.
+    mods_result = _boot_mods(app)
     asyncio.create_task(periodic_usage_pool_cleanup())
     asyncio.create_task(_resume_crawl_jobs(app.state))
     asyncio.create_task(_run_gpu_queue(app.state))
+    _register_llamolotl_vram_consumer()
+    _register_speak_vram_consumer()
+    _register_sketch_vram_consumer()
+    # Single consumer-aware dispatcher owning the llamolotl, speak AND sketch
+    # transports — the broker has one global transport and does not route by
+    # consumer_id, so this REPLACES a separate llamolotl install (which the
+    # dispatcher subsumes) and prevents self.speak/self.sketch from clobbering the
+    # deployed llamolotl transport (cavekit-vram-speak-consumer T-003; Color Phase
+    # 2b). The R5 force-reap escalation (context/gpu-lease-force-reap) reads the
+    # reaper off the broker, not the transport, so it is unaffected by this
+    # dispatcher.
+    _install_speak_release_transport(app.state)
+    # R6 consumer VRAM state poller — relays each consumer's real held VRAM into
+    # the registry via heartbeat(), closing the drift gap live validation found.
+    asyncio.create_task(_run_vram_poller(app.state))
     asyncio.create_task(_ensure_curator_classifier_models(app.state))
     asyncio.create_task(_backfill_self_corpus_repos(app.state))
     asyncio.create_task(_run_model_integrity_sweep(app.state))
     yield
+    _drain_mods(mods_result)
 
 
 def _register_browse_reference_profiles() -> None:
@@ -383,6 +442,32 @@ def _register_browse_reference_profiles() -> None:
     from selfai_ui.browse.reference_profiles import register_reference_profiles
 
     register_reference_profiles()
+
+
+def _boot_mods(app: FastAPI):
+    """Discover, load, and seed the enabled mods at startup — the single boot
+    entry point for the mods system (cavekit-mods-discovery.md R1/R4). Returns
+    the LoadResult so the shutdown drain can run the loaded mods' hooks.
+
+    Import is local so the mods package is only pulled in at startup, matching
+    the other lifespan wrappers."""
+    from selfai_ui.config import ENABLED_MODS, MODS_INSTALL_DIRS
+    from selfai_ui.env import VERSION
+    from selfai_ui.mods.loader import boot_mods
+
+    result = boot_mods(app, MODS_INSTALL_DIRS, ENABLED_MODS.value, core_version=VERSION)
+    for message in result.errors:
+        log.error(message)
+    if result.loaded:
+        log.info("mods: loaded %s", ", ".join(result.loaded_ids))
+    return result
+
+
+def _drain_mods(result) -> None:
+    """Run each loaded mod's shutdown hooks on orderly shutdown."""
+    from selfai_ui.mods.loader import run_shutdown_hooks
+
+    run_shutdown_hooks(result)
 
 
 async def _resume_crawl_jobs(app_state) -> None:
@@ -415,6 +500,398 @@ async def _run_gpu_queue(app_state) -> None:
     await gpu_queue.process_gpu_queue_v2()
 
 
+def _existing_vram_held(consumer_id: str) -> int:
+    """Held bytes already recorded for ``consumer_id`` in the registry, or 0 if
+    unknown/unreadable.
+
+    Used by the config-driven ``_register_*_vram_consumer`` hooks so a
+    re-registration at boot PRESERVES the persisted (and poller-relayed) held
+    instead of clobbering it back to 0. ``register()`` is a trusted held-writer,
+    but core registers llamolotl/speak/sketch on their behalf with NO knowledge of
+    their real held — the form's held defaults to 0. On every pod restart that
+    would reset held to 0 while ``last_reported_at`` is refreshed (so the row is
+    NOT stale), making core briefly believe the shared 4090 is emptier than it is
+    and over-grant -> OOM. Preserving the last-known held is the conservative
+    direction (worst case a brief under-grant the R6 poller corrects within a
+    cycle). Defensive: any read error yields 0, a fresh consumer's natural default.
+    """
+    try:
+        from selfai_ui.models.vram_leases import VramLeases
+
+        existing = VramLeases.get(consumer_id)
+        if existing is not None and existing.held_bytes:
+            return int(existing.held_bytes)
+    except Exception:
+        pass
+    return 0
+
+
+def _register_llamolotl_vram_consumer() -> None:
+    """Config-driven registration of self.llamolotl in the VRAM lease registry
+    at startup (cavekit-gpu-lease-broker R4/AC1).
+
+    This phase has a single known VRAM consumer, so registration is config- not
+    self-service-driven: read llamolotl's addressable capacity + reclamation
+    priority from env and upsert it under the ``self.llamolotl`` identity (the
+    same string ``_LLAMOLOTL_AUDIENCE`` uses for the outbound ticket audience).
+    ``register`` is an idempotent upsert keyed on ``consumer_id``, so this is
+    safe to run on every boot — a re-register just refreshes the row.
+
+    If ``LLAMOLOTL_VRAM_CAPACITY_BYTES`` is unset/blank/malformed the consumer is
+    simply not registered and we log that it's unconfigured — self.ai must boot
+    fine on deployments with no llamolotl / no lease broker wired, so this never
+    raises out of the lifespan.
+
+    Import is local so the lease-broker models are only pulled in at startup,
+    matching the other lifespan wrappers."""
+    from selfai_ui.env import (
+        LLAMOLOTL_K8S_NAMESPACE,
+        LLAMOLOTL_K8S_POD_SELECTOR,
+        LLAMOLOTL_VRAM_CAPACITY_BYTES,
+        LLAMOLOTL_VRAM_LEASE_PRIORITY,
+    )
+
+    raw = (LLAMOLOTL_VRAM_CAPACITY_BYTES or "").strip()
+    if not raw:
+        log.info(
+            "vram-lease: LLAMOLOTL_VRAM_CAPACITY_BYTES unset — skipping "
+            "self.llamolotl registration (lease broker unconfigured)"
+        )
+        return
+
+    try:
+        capacity_bytes = int(raw)
+    except ValueError:
+        log.warning(
+            "vram-lease: LLAMOLOTL_VRAM_CAPACITY_BYTES=%r is not an integer — "
+            "skipping self.llamolotl registration",
+            raw,
+        )
+        return
+
+    # R5 force-reap pod identity (opt-in): blank env -> None, leaving
+    # self.llamolotl registered but force-reap ineligible (cavekit R5/AC7).
+    k8s_namespace = (LLAMOLOTL_K8S_NAMESPACE or "").strip() or None
+    k8s_pod_selector = (LLAMOLOTL_K8S_POD_SELECTOR or "").strip() or None
+    pod_identity_configured = k8s_namespace is not None and k8s_pod_selector is not None
+
+    try:
+        from selfai_ui.models.vram_leases import (
+            VramConsumerRegisterForm,
+            VramLeases,
+        )
+
+        VramLeases.register(
+            VramConsumerRegisterForm(
+                consumer_id=_LLAMOLOTL_AUDIENCE,
+                total_capacity_bytes=capacity_bytes,
+                priority=LLAMOLOTL_VRAM_LEASE_PRIORITY,
+                held_bytes=_existing_vram_held(_LLAMOLOTL_AUDIENCE),
+                k8s_namespace=k8s_namespace,
+                k8s_pod_selector=k8s_pod_selector,
+            )
+        )
+        log.info(
+            "vram-lease: registered %s (capacity %d bytes, priority %d, "
+            "force-reap %s)",
+            _LLAMOLOTL_AUDIENCE,
+            capacity_bytes,
+            LLAMOLOTL_VRAM_LEASE_PRIORITY,
+            "armed (pod identity configured)"
+            if pod_identity_configured
+            else "ineligible (no pod identity configured)",
+        )
+    except Exception as e:
+        # Registration is best-effort at boot: a registry/DB hiccup must not
+        # stop the app coming up (mirrors the fire-and-forget lifespan tasks).
+        log.warning("vram-lease: self.llamolotl registration failed: %r", e)
+
+
+def _install_llamolotl_release_transport(app_state) -> None:
+    """Install the concrete self.llamolotl release transport on the VRAM broker
+    at startup (cavekit-gpu-lease-broker R4, T-016).
+
+    This is what makes an R2 release-request against ``self.llamolotl`` actually
+    call the sibling pod's ``/api/system/vram-release`` endpoint (authenticated
+    with a ``system:write`` service ticket) instead of the broker raising its
+    transport-less RuntimeError. It is installed UNCONDITIONALLY: the transport
+    carries its own config guard (an unconfigured control URL resolves to a clean
+    ``timeout``, never a silent success), so it degrades gracefully on
+    deployments with no llamolotl control port wired.
+
+    NOTE: this does NOT remove ``_ensure_llamolotl_model_ready`` from
+    ``gpu_queue.py`` — the dispatch-side cutover onto the broker is separate
+    follow-up work gated on live validation (T-018/T-019), not done here.
+
+    Import is local so the transport (and httpx) is only pulled in at startup,
+    matching the other lifespan wrappers. Best-effort: a wiring hiccup must not
+    stop the app coming up."""
+    try:
+        from selfai_ui.utils.vram_llamolotl import install_llamolotl_release_transport
+
+        install_llamolotl_release_transport(app_state)
+    except Exception as e:
+        log.warning("vram-lease: installing self.llamolotl release transport failed: %r", e)
+
+
+async def _run_vram_poller(app_state) -> None:
+    """Start the R6 consumer VRAM state poller (cavekit-gpu-lease-broker R6,
+    T-010). Mirrors ``_run_gpu_queue``'s wrapper shape: local imports, build the
+    ``{consumer_id: state_source}`` map, then hand off to the resilient interval
+    loop.
+
+    This is what closes the gap live R1-R4 validation found: ``held`` only ever
+    moved through the lease protocol itself (register / heartbeat / confirmed-
+    release / grant), so real VRAM a consumer loaded outside any lease
+    negotiation (e.g. a plain chat request) was invisible to the registry. The
+    poller periodically reads each configured consumer's self-reported state and
+    relays HELD via the EXISTING ``heartbeat()`` entry point (R6-AC2).
+
+    For this single-known-consumer phase the map has one candidate entry —
+    ``self.llamolotl``, using :class:`LlamolotlVramStateSource` — added only when
+    ``LLAMOLOTL_CONTROL_BASE_URLS`` is configured. When it is not, the map is
+    EMPTY: the loop still runs but polls nobody (the graceful unconfigured case,
+    the same posture as the release transport's config guard) so self.ai boots
+    fine on deployments with no llamolotl control port wired.
+
+    Best-effort, like the neighboring wrappers: a wiring hiccup here must never
+    stop the app coming up (the outer ``try`` keeps a bad state-source
+    construction from taking down the lifespan; the loop itself is separately
+    resilient per R6-AC1)."""
+    try:
+        from selfai_ui.utils.vram_llamolotl import LlamolotlVramStateSource
+        from selfai_ui.utils.vram_poller import process_vram_poll_loop
+
+        state_sources = {}
+        # Resolve the control-port config the SAME way the state source /
+        # release transport do (app_state.config.LLAMOLOTL_CONTROL_BASE_URLS);
+        # configured -> poll self.llamolotl, unconfigured -> empty map (poll
+        # nobody). Absence of a state source for a registered consumer is a
+        # clean skip (R6-AC3), so an empty map is a valid, no-op steady state.
+        cfg = getattr(app_state, "config", None)
+        control_urls = list(getattr(cfg, "LLAMOLOTL_CONTROL_BASE_URLS", None) or []) if cfg else []
+        if control_urls:
+            state_sources[_LLAMOLOTL_AUDIENCE] = LlamolotlVramStateSource(app_state=app_state)
+            log.info(
+                "vram-poll: state poller armed for %s (control port configured)",
+                _LLAMOLOTL_AUDIENCE,
+            )
+        else:
+            log.info(
+                "vram-poll: LLAMOLOTL_CONTROL_BASE_URLS unset — poller running "
+                "but polling no consumers (no configured state source)"
+            )
+
+        # self.speak + self.sketch are ALSO registered VRAM consumers (Color 2b),
+        # but each SERVES a pull-based GET /api/system/vram-state the poller must
+        # read — nothing pushes their held into the registry. Without a state source
+        # here their held stays at its registration value and ages to stale, so core
+        # sees an INVISIBLE holder and over-grants the shared 4090 (the exact hazard
+        # the self.speak GPU deploy was gated on). Each uses a single-string control
+        # base (config.TTS_CONTROL_BASE_URL / config.SKETCH_CONTROL_BASE_URL), armed
+        # only when that base is configured — same guard posture as llamolotl above.
+        from selfai_ui.utils.vram_state_source import ControlBaseVramStateSource
+
+        for _audience, _attr in (
+            (_SPEAK_AUDIENCE, "TTS_CONTROL_BASE_URL"),
+            (_SKETCH_AUDIENCE, "SKETCH_CONTROL_BASE_URL"),
+        ):
+            _base = getattr(cfg, _attr, None) if cfg else None
+            if _base and str(_base).strip():
+                state_sources[_audience] = ControlBaseVramStateSource(
+                    app_state=app_state, config_attr=_attr, audience=_audience
+                )
+                log.info(
+                    "vram-poll: state poller armed for %s (control base configured)",
+                    _audience,
+                )
+            else:
+                log.info("vram-poll: %s control base unset — not polling it", _audience)
+
+        await process_vram_poll_loop(state_sources)
+    except Exception as e:
+        # Never let a poller-wiring failure escape the lifespan (mirrors the
+        # other best-effort lease-broker startup wrappers).
+        log.warning("vram-poll: state poller wiring failed: %r", e)
+
+
+def _register_speak_vram_consumer() -> None:
+    """Config-driven registration of self.speak in the VRAM lease registry at
+    startup (cavekit-vram-speak-consumer R1) — a same-shape analogue of
+    ``_register_llamolotl_vram_consumer()``.
+
+    self.speak is the broker's SECOND config-driven consumer: read its
+    advertised capacity + reclamation priority from env and upsert it under the
+    ``self.speak`` identity (the same string ``routers/audio.py`` mints
+    self.speak service tickets with). ``register`` is an idempotent upsert keyed
+    on ``consumer_id``, so this is safe to run on every boot — a re-register just
+    refreshes the row.
+
+    If ``SPEAK_VRAM_CAPACITY_BYTES`` is unset/blank/malformed the consumer is
+    simply not registered and we log that it's unconfigured — self.ai must boot
+    fine on deployments with no self.speak VRAM env wired, so this never raises
+    out of the lifespan.
+
+    Import is local so the lease-broker models are only pulled in at startup,
+    matching the other lifespan wrappers."""
+    from selfai_ui.env import (
+        SPEAK_VRAM_CAPACITY_BYTES,
+        SPEAK_VRAM_LEASE_PRIORITY,
+    )
+
+    raw = (SPEAK_VRAM_CAPACITY_BYTES or "").strip()
+    if not raw:
+        log.info(
+            "vram-lease: SPEAK_VRAM_CAPACITY_BYTES unset — skipping self.speak "
+            "registration (lease broker unconfigured for speak)"
+        )
+        return
+
+    try:
+        capacity_bytes = int(raw)
+    except ValueError:
+        log.warning(
+            "vram-lease: SPEAK_VRAM_CAPACITY_BYTES=%r is not an integer — "
+            "skipping self.speak registration",
+            raw,
+        )
+        return
+
+    try:
+        from selfai_ui.models.vram_leases import (
+            VramConsumerRegisterForm,
+            VramLeases,
+        )
+
+        VramLeases.register(
+            VramConsumerRegisterForm(
+                consumer_id=_SPEAK_AUDIENCE,
+                total_capacity_bytes=capacity_bytes,
+                priority=SPEAK_VRAM_LEASE_PRIORITY,
+                held_bytes=_existing_vram_held(_SPEAK_AUDIENCE),
+            )
+        )
+        log.info(
+            "vram-lease: registered %s (capacity %d bytes, priority %d)",
+            _SPEAK_AUDIENCE,
+            capacity_bytes,
+            SPEAK_VRAM_LEASE_PRIORITY,
+        )
+    except Exception as e:
+        # Registration is best-effort at boot: a registry/DB hiccup must not
+        # stop the app coming up (mirrors the fire-and-forget lifespan tasks).
+        log.warning("vram-lease: self.speak registration failed: %r", e)
+
+
+def _register_sketch_vram_consumer() -> None:
+    """Config-driven registration of self.sketch in the VRAM lease registry at
+    startup (Color epic Phase 2b) — a same-shape analogue of
+    ``_register_speak_vram_consumer()``.
+
+    self.sketch (ComfyUI image generation on the shared 4090) is the broker's
+    THIRD config-driven consumer: read its advertised capacity + reclamation
+    priority from env and upsert it under the ``self.sketch`` identity (the same
+    string the ComfyUI shim validates inbound tickets against). ``register`` is an
+    idempotent upsert keyed on ``consumer_id``, so this is safe to run on every
+    boot.
+
+    If ``SKETCH_VRAM_CAPACITY_BYTES`` is unset/blank/malformed the consumer is
+    simply not registered and we log that it's unconfigured — self.ai must boot
+    fine on deployments with no self.sketch VRAM env wired, so this never raises
+    out of the lifespan."""
+    from selfai_ui.env import (
+        SKETCH_VRAM_CAPACITY_BYTES,
+        SKETCH_VRAM_LEASE_PRIORITY,
+    )
+
+    raw = (SKETCH_VRAM_CAPACITY_BYTES or "").strip()
+    if not raw:
+        log.info(
+            "vram-lease: SKETCH_VRAM_CAPACITY_BYTES unset — skipping self.sketch "
+            "registration (lease broker unconfigured for sketch)"
+        )
+        return
+
+    try:
+        capacity_bytes = int(raw)
+    except ValueError:
+        log.warning(
+            "vram-lease: SKETCH_VRAM_CAPACITY_BYTES=%r is not an integer — "
+            "skipping self.sketch registration",
+            raw,
+        )
+        return
+
+    try:
+        from selfai_ui.models.vram_leases import (
+            VramConsumerRegisterForm,
+            VramLeases,
+        )
+
+        VramLeases.register(
+            VramConsumerRegisterForm(
+                consumer_id=_SKETCH_AUDIENCE,
+                total_capacity_bytes=capacity_bytes,
+                priority=SKETCH_VRAM_LEASE_PRIORITY,
+                held_bytes=_existing_vram_held(_SKETCH_AUDIENCE),
+            )
+        )
+        log.info(
+            "vram-lease: registered %s (capacity %d bytes, priority %d)",
+            _SKETCH_AUDIENCE,
+            capacity_bytes,
+            SKETCH_VRAM_LEASE_PRIORITY,
+        )
+    except Exception as e:
+        # Registration is best-effort at boot: a registry/DB hiccup must not
+        # stop the app coming up (mirrors the fire-and-forget lifespan tasks).
+        log.warning("vram-lease: self.sketch registration failed: %r", e)
+
+
+def _install_speak_release_transport(app_state) -> None:
+    """Install a consumer-aware release-transport dispatcher on the VRAM broker
+    that keeps BOTH self.llamolotl and self.speak reachable through the broker's
+    single global transport (cavekit-vram-speak-consumer R2, T-003 — the one
+    production-critical piece).
+
+    This REPLACES the separate ``_install_llamolotl_release_transport`` call:
+    ``VramBrokerImpl`` holds ONE global transport (``set_transport``) and does
+    NOT route by ``consumer_id``, so installing the speak transport alone would
+    CLOBBER the deployed llamolotl transport — every release, including
+    llamolotl's own, would then POST to self.speak's endpoint, breaking live
+    VRAM arbitration in production. Instead we build both concrete transports and
+    wrap them in a :class:`ConsumerAwareReleaseTransport` that dispatches by
+    ``consumer_id`` (``self.speak`` → speak; else → llamolotl) — preserving
+    llamolotl's deployed URL/audience/scope exactly while adding self.speak.
+
+    Each concrete transport carries its own config guard (an unconfigured
+    control URL resolves to a clean ``timeout``, never a silent success), so this
+    degrades gracefully on deployments with either control port unwired. Import
+    is local so the transports (and httpx) are only pulled in at startup.
+    Best-effort: a wiring hiccup must not stop the app coming up."""
+    try:
+        from selfai_ui.utils.vram_broker import VramBroker
+        from selfai_ui.utils.vram_llamolotl import LlamolotlReleaseTransport
+        from selfai_ui.utils.vram_sketch import SketchReleaseTransport
+        from selfai_ui.utils.vram_speak import (
+            ConsumerAwareReleaseTransport,
+            SpeakReleaseTransport,
+        )
+
+        dispatcher = ConsumerAwareReleaseTransport(
+            speak_transport=SpeakReleaseTransport(app_state=app_state),
+            llamolotl_transport=LlamolotlReleaseTransport(app_state=app_state),
+            sketch_transport=SketchReleaseTransport(app_state=app_state),
+        )
+        VramBroker.set_transport(dispatcher)
+        log.info(
+            "vram-lease: installed consumer-aware release transport "
+            "(self.llamolotl + self.speak + self.sketch) on VramBroker"
+        )
+    except Exception as e:
+        log.warning("vram-lease: installing consumer-aware release transport failed: %r", e)
+
+
 async def _run_model_integrity_sweep(app_state) -> None:
     """Periodic /models integrity sweep -- self.ai/self.ai#38. Checks
     models llama-server reports as known against what self.llamolotl's
@@ -429,6 +906,17 @@ async def _run_model_integrity_sweep(app_state) -> None:
 # utils/gpu_queue.py — must match self.llamolotl's SERVICE_AUTH_AUDIENCE
 # (self.llamolotl#12).
 _LLAMOLOTL_AUDIENCE = "self.llamolotl"
+
+# The self.speak service identity — the same string routers/audio.py mints
+# self.speak service tickets with, and the registry consumer_id for the
+# self.speak VRAM lease (cavekit-vram-speak-consumer).
+_SPEAK_AUDIENCE = "self.speak"
+
+# The self.sketch (ComfyUI) service identity — the registry consumer_id for the
+# self.sketch VRAM lease and the audience core mints release tickets against
+# (Color epic Phase 2b). Must match SketchReleaseTransport.SKETCH_AUDIENCE and
+# the ComfyUI shim's SERVICE_AUTH_AUDIENCE.
+_SKETCH_AUDIENCE = "self.sketch"
 
 
 async def _ensure_curator_classifier_models(app_state) -> None:
@@ -625,6 +1113,18 @@ app.state.OPENAI_MODELS = {}
 
 ########################################
 #
+# ANTHROPIC
+#
+########################################
+
+app.state.config.ENABLE_ANTHROPIC_API = ENABLE_ANTHROPIC_API
+app.state.config.ANTHROPIC_BASE_URLS = ANTHROPIC_BASE_URLS
+app.state.config.ANTHROPIC_API_CONFIGS = ANTHROPIC_API_CONFIGS
+
+app.state.ANTHROPIC_MODELS = {}
+
+########################################
+#
 # WEBUI
 #
 ########################################
@@ -757,8 +1257,23 @@ app.state.config.BING_SEARCH_V7_ENDPOINT = BING_SEARCH_V7_ENDPOINT
 app.state.config.BING_SEARCH_V7_SUBSCRIPTION_KEY = BING_SEARCH_V7_SUBSCRIPTION_KEY
 app.state.config.FIRECRAWL_API_BASE_URL = FIRECRAWL_API_BASE_URL
 app.state.config.FIRECRAWL_API_KEY = FIRECRAWL_API_KEY
+app.state.config.KB_CRAWL_RESPECT_ROBOTS_DELAY = KB_CRAWL_RESPECT_ROBOTS_DELAY
+app.state.config.ENABLE_WEB_CRAWL = ENABLE_WEB_CRAWL
+app.state.config.WEB_CRAWL_MAX_PAGES = WEB_CRAWL_MAX_PAGES
+app.state.config.WEB_CRAWL_MAX_DEPTH = WEB_CRAWL_MAX_DEPTH
 app.state.config.BROWSE_PLAYWRIGHT_SERVICE_URL = BROWSE_PLAYWRIGHT_SERVICE_URL
 app.state.config.BROWSE_PLAYWRIGHT_API_KEY = BROWSE_PLAYWRIGHT_API_KEY
+app.state.config.BROWSE_FETCH_MAX_CHARS = BROWSE_FETCH_MAX_CHARS
+app.state.config.BROWSE_MAX_LINKS_PER_PAGE = BROWSE_MAX_LINKS_PER_PAGE
+app.state.config.DEEP_RESEARCH_MAX_DEPTH = DEEP_RESEARCH_MAX_DEPTH
+app.state.config.DEEP_RESEARCH_MAX_PAGES = DEEP_RESEARCH_MAX_PAGES
+app.state.config.DEEP_RESEARCH_MAX_SECONDS = DEEP_RESEARCH_MAX_SECONDS
+app.state.config.DEEP_RESEARCH_CONCURRENCY = DEEP_RESEARCH_CONCURRENCY
+app.state.config.DEEP_RESEARCH_MAX_CHARS_PER_PAGE = DEEP_RESEARCH_MAX_CHARS_PER_PAGE
+app.state.config.DEEP_RESEARCH_RESPECT_ROBOTS = DEEP_RESEARCH_RESPECT_ROBOTS
+app.state.config.DEEP_RESEARCH_MAX_CRAWL_DELAY_SECONDS = DEEP_RESEARCH_MAX_CRAWL_DELAY_SECONDS
+app.state.config.BROWSE_USER_AGENT = BROWSE_USER_AGENT
+app.state.config.ENABLE_DEEP_RESEARCH = ENABLE_DEEP_RESEARCH
 
 app.state.config.RAG_WEB_SEARCH_RESULT_COUNT = RAG_WEB_SEARCH_RESULT_COUNT
 app.state.config.RAG_WEB_SEARCH_CONCURRENT_REQUESTS = RAG_WEB_SEARCH_CONCURRENT_REQUESTS
@@ -827,6 +1342,9 @@ app.state.config.COMFYUI_BASE_URL = COMFYUI_BASE_URL
 app.state.config.COMFYUI_API_KEY = COMFYUI_API_KEY
 app.state.config.COMFYUI_WORKFLOW = COMFYUI_WORKFLOW
 app.state.config.COMFYUI_WORKFLOW_NODES = COMFYUI_WORKFLOW_NODES
+# self.sketch VRAM-lease control base (Color Phase 2b) — read by
+# SketchReleaseTransport off app.state.config, mirroring TTS_CONTROL_BASE_URL.
+app.state.config.SKETCH_CONTROL_BASE_URL = SKETCH_CONTROL_BASE_URL
 
 app.state.config.IMAGE_SIZE = IMAGE_SIZE
 app.state.config.IMAGE_STEPS = IMAGE_STEPS
@@ -842,6 +1360,8 @@ app.state.config.STT_OPENAI_API_BASE_URL = AUDIO_STT_OPENAI_API_BASE_URL
 app.state.config.STT_OPENAI_API_KEY = AUDIO_STT_OPENAI_API_KEY
 app.state.config.STT_ENGINE = AUDIO_STT_ENGINE
 app.state.config.STT_MODEL = AUDIO_STT_MODEL
+app.state.config.STT_CONTROL_BASE_URL = AUDIO_STT_CONTROL_BASE_URL
+app.state.config.STT_ENABLED_MODELS = AUDIO_STT_ENABLED_MODELS
 
 app.state.config.WHISPER_MODEL = WHISPER_MODEL
 
@@ -852,10 +1372,30 @@ app.state.config.TTS_MODEL = AUDIO_TTS_MODEL
 app.state.config.TTS_VOICE = AUDIO_TTS_VOICE
 app.state.config.TTS_API_KEY = AUDIO_TTS_API_KEY
 app.state.config.TTS_SPLIT_ON = AUDIO_TTS_SPLIT_ON
+app.state.config.TTS_CONTROL_BASE_URL = AUDIO_TTS_CONTROL_BASE_URL
+app.state.config.TTS_ENABLED_VOICES = AUDIO_TTS_ENABLED_VOICES
 
 
 app.state.config.TTS_AZURE_SPEECH_REGION = AUDIO_TTS_AZURE_SPEECH_REGION
 app.state.config.TTS_AZURE_SPEECH_OUTPUT_FORMAT = AUDIO_TTS_AZURE_SPEECH_OUTPUT_FORMAT
+
+
+# --- Relocate legacy flat audio settings into typed connections (R5, T-006) ---
+# One-time and idempotent: only when no typed connection exists yet, mint a
+# SavedAudioConnection per previously-configured engine (STT and/or TTS) from the
+# old flat *_ENGINE knobs, copying every address/credential verbatim so an
+# already-configured backend keeps working with no re-entry or re-auth. Which
+# connection actually serves a request is untouched here (that is T-007).
+_existing_audio_connections = AUDIO_CONNECTION_CONFIGS.value or {}
+if not _existing_audio_connections:
+    _migrated_audio_store = migrate_legacy_audio_config(
+        build_legacy_snapshot(_selfai_config),
+        existing_configs=_existing_audio_connections,
+    )
+    if len(_migrated_audio_store):
+        AUDIO_CONNECTION_CONFIGS.value = _migrated_audio_store.to_serializable()
+        AUDIO_CONNECTION_CONFIGS.save()
+app.state.config.AUDIO_CONNECTION_CONFIGS = AUDIO_CONNECTION_CONFIGS
 
 
 app.state.faster_whisper_model = None
@@ -963,23 +1503,47 @@ app.include_router(curator.router, prefix="/curator", tags=["curator"])
 app.include_router(language_eval.router, prefix="/language-eval", tags=["language-eval"])
 app.include_router(code_eval.router, prefix="/code-eval", tags=["code-eval"])
 app.include_router(windows.router, prefix="/api/windows", tags=["windows"])
+app.include_router(vram_leases.router, prefix="/api/vram-leases", tags=["vram-leases"])
 app.include_router(benchmarks.router, prefix="/api/benchmarks", tags=["benchmarks"])
 app.include_router(queue.router, prefix="/api", tags=["queue"])
 app.include_router(llamolotl.router, prefix="/llamolotl", tags=["llamolotl"])
 app.include_router(ollama.router, prefix="/ollama", tags=["ollama"])
 app.include_router(openai.router, prefix="/openai", tags=["openai"])
+app.include_router(anthropic.router, prefix="/anthropic", tags=["anthropic"])
 
 
 app.include_router(pipelines.router, prefix="/api/v1/pipelines", tags=["pipelines"])
 app.include_router(tasks.router, prefix="/api/v1/tasks", tags=["tasks"])
 app.include_router(images.router, prefix="/api/v1/images", tags=["images"])
 app.include_router(audio.router, prefix="/api/v1/audio", tags=["audio"])
+app.include_router(
+    audio_connections.router,
+    prefix="/api/v1/audio/connections",
+    tags=["audio-connections"],
+)
+app.include_router(transcribe.router, prefix="/api/v1/transcribe", tags=["transcribe"])
+app.include_router(voice_catalog.router, prefix="/api/v1/voice-catalog", tags=["voice-catalog"])
 app.include_router(retrieval.router, prefix="/api/v1/retrieval", tags=["retrieval"])
 
 app.include_router(configs.router, prefix="/api/v1/configs", tags=["configs"])
 
 app.include_router(auths.router, prefix="/api/v1/auths", tags=["auths"])
 app.include_router(users.router, prefix="/api/v1/users", tags=["users"])
+# The mod registry: which mods are enabled and loaded, filtered by the caller's
+# scopes. Reads app.state.MODS, which boot_mods publishes; before any mod is
+# enabled the response is an empty list, not an error.
+app.include_router(mods.router, prefix="/api/v1/mods", tags=["mods"])
+# Per-mod static assets at `/static/mods/<id>/<path>` (frontend-api R3). Included
+# HERE, before the `/static` StaticFiles mount below (main.py:1718), so
+# `/static/mods/...` resolves to this traversal-safe handler; other `/static/...`
+# paths fall through to the core mount unchanged. No prefix -- the route names its
+# full `/static/mods/...` path itself.
+app.include_router(mod_assets.router, tags=["mods"])
+
+# The always-fresh per-mod frontend manifest (frontend-api R4 -- T-A05): resolves
+# a mod id to its current content-hashed bundle URL with no-cache headers. The
+# route names its full `/api/v1/mods/{id}/frontend-manifest` path itself.
+app.include_router(mod_frontend_manifest.router, tags=["mods"])
 
 
 app.include_router(channels.router, prefix="/api/v1/channels", tags=["channels"])
@@ -1242,6 +1806,11 @@ async def chat_completion(
             "tool_ids": form_data.get("tool_ids", None),
             "files": form_data.get("files", None),
             "features": form_data.get("features", None),
+            # Popped, not read: this must reach the tool layer via metadata but
+            # must NOT stay in the payload sent to the model. metadata is built
+            # from this explicit allowlist, so a new top-level field the client
+            # sends is dropped unless it is named here.
+            "web_crawl_kb_id": form_data.pop("web_crawl_kb_id", None),
         }
         form_data["metadata"] = metadata
 
@@ -1423,6 +1992,8 @@ async def get_app_config(request: Request):
                 {
                     "enable_channels": app.state.config.ENABLE_CHANNELS,
                     "enable_web_search": app.state.config.ENABLE_RAG_WEB_SEARCH,
+                    "enable_deep_research": app.state.config.ENABLE_DEEP_RESEARCH,
+                    "enable_web_crawl": app.state.config.ENABLE_WEB_CRAWL,
                     "enable_google_drive_integration": app.state.config.ENABLE_GOOGLE_DRIVE_INTEGRATION,
                     "enable_image_generation": app.state.config.ENABLE_IMAGE_GENERATION,
                     "enable_community_sharing": app.state.config.ENABLE_COMMUNITY_SHARING,

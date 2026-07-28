@@ -2,9 +2,12 @@ import asyncio
 import inspect
 import json
 import logging
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from html.parser import HTMLParser
+from typing import Optional
+from urllib.parse import urldefrag, urljoin, urlparse
 from uuid import uuid4
 
 from fastapi import Request
@@ -13,7 +16,9 @@ from starlette.responses import StreamingResponse
 
 from selfai_ui.browse.access_control import has_browsing_access
 from selfai_ui.browse.connection import browse_fetch
+from selfai_ui.browse.hop_policy import is_same_site
 from selfai_ui.browse.profiles import resolve_profile
+from selfai_ui.browse.robots import RobotsCache
 from selfai_ui.constants import TASKS
 from selfai_ui.env import (
     ENABLE_REALTIME_CHAT_SAVE,
@@ -22,9 +27,17 @@ from selfai_ui.env import (
 )
 from selfai_ui.models.chats import Chats
 from selfai_ui.models.functions import Functions
+from selfai_ui.models.knowledge import Knowledges
 from selfai_ui.models.users import UserModel, Users
 from selfai_ui.retrieval.utils import get_sources_from_files
-from selfai_ui.routers.retrieval import save_docs_to_vector_db, search_web
+from selfai_ui.retrieval.web.utils import validate_url
+from selfai_ui.routers.retrieval import (
+    ProcessWebCrawlForm,
+    _run_crawl_background,
+    create_crawl_job,
+    save_docs_to_vector_db,
+    search_web,
+)
 from selfai_ui.routers.tasks import (
     TaskFormData,
     generate_chat_tags,
@@ -37,6 +50,7 @@ from selfai_ui.socket.main import (
     get_event_emitter,
 )
 from selfai_ui.tasks import create_task
+from selfai_ui.utils.access_control import has_access
 from selfai_ui.utils.chat import generate_chat_completion
 from selfai_ui.utils.misc import (
     add_or_update_system_message,
@@ -51,6 +65,7 @@ from selfai_ui.utils.task import (
     rag_template,
 )
 from selfai_ui.utils.tools import get_tools
+from selfai_ui.utils.toolspec import ToolSpec
 from selfai_ui.utils.webhook import post_webhook
 
 logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
@@ -134,15 +149,15 @@ async def chat_completion_filter_functions_handler(request, body, model, extra_p
     return body, {}
 
 
-WEB_SEARCH_TOOL_SPEC = {
-    "name": "web_search",
-    "description": (
+WEB_SEARCH_TOOL_SPEC = ToolSpec(
+    name="web_search",
+    description=(
         "Search the web for current, real-time, or otherwise unfamiliar information that "
         "is not already available in this conversation. Use this only when the existing "
         "context is insufficient to answer accurately — do not use it for general "
         "knowledge, conversation, or anything already covered above."
     ),
-    "parameters": {
+    input_schema={
         "type": "object",
         "properties": {
             "query": {
@@ -152,7 +167,57 @@ WEB_SEARCH_TOOL_SPEC = {
         },
         "required": ["query"],
     },
-}
+)
+
+
+# RFC 3986 scheme grammar. Used to tell "no scheme at all" (a bare host, which
+# we may reasonably read as https) from "a scheme that is not http(s)" (which
+# must be refused, not rewritten).
+_URL_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*:")
+
+
+WEB_FETCH_TOOL_SPEC = ToolSpec(
+    name="web_fetch",
+    description=(
+        "Read the contents of one specific web page whose URL is already known — because "
+        "the user gave it, or because it appeared in earlier results in this conversation. "
+        "Use this when a particular page needs to be read; use web_search instead when you "
+        "need to find out which page to read. Returns the page's text, not a summary."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "The full absolute URL of the page to read, including its scheme (https://).",
+            }
+        },
+        "required": ["url"],
+    },
+)
+
+
+DEEP_RESEARCH_TOOL_SPEC = ToolSpec(
+    name="deep_research",
+    description=(
+        "Research a topic in depth: search the web, read the most promising results, and "
+        "follow relevant links from those pages to gather more detail. Use this for "
+        "questions that need more than a quick answer — comparisons, how something works, "
+        "gathering evidence from several sources. Use web_search instead for a quick "
+        "factual lookup, and web_fetch when you already know the one page you need. This "
+        "reads several pages and takes noticeably longer than a search."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The research question or topic, phrased as a search query.",
+            }
+        },
+        "required": ["query"],
+    },
+)
 
 
 class _HTMLTextExtractor(HTMLParser):
@@ -169,18 +234,40 @@ class _HTMLTextExtractor(HTMLParser):
         self._skip_depth = 0
         self._in_title = False
         self.title = ""
+        # cavekit-browse-web-access.md R3: anchors in document order, as
+        # (raw href, anchor text). Resolution to absolute URLs, filtering, and
+        # deduplication all happen in extract_links() — this class's job is
+        # only to stop throwing hrefs away, which is what it used to do.
+        self._anchors: list[tuple[str, list[str]]] = []
+        self._anchor_depth = 0
 
     def handle_starttag(self, tag, attrs):
         if tag in self._SKIP_TAGS:
             self._skip_depth += 1
         if tag == "title":
             self._in_title = True
+        if tag == "a" and self._skip_depth == 0:
+            href = next((v for k, v in attrs if k == "href" and v), None)
+            if href:
+                self._anchors.append((href, []))
+                self._anchor_depth += 1
+
+    def handle_startendtag(self, tag, attrs):
+        # A self-closing <a/> opens and closes in one token; routing it through
+        # handle_starttag would leave _anchor_depth permanently raised and
+        # capture every following run of text as that anchor's label.
+        if tag in self._SKIP_TAGS or tag == "a":
+            return
+        self.handle_starttag(tag, attrs)
+        self.handle_endtag(tag)
 
     def handle_endtag(self, tag):
         if tag in self._SKIP_TAGS:
             self._skip_depth = max(0, self._skip_depth - 1)
         if tag == "title":
             self._in_title = False
+        if tag == "a" and self._anchor_depth > 0:
+            self._anchor_depth -= 1
         if tag in self._BREAK_TAGS:
             self._parts.append("\n")
 
@@ -189,22 +276,85 @@ class _HTMLTextExtractor(HTMLParser):
             self.title += data
         elif self._skip_depth == 0:
             self._parts.append(data)
+            if self._anchor_depth > 0 and self._anchors:
+                self._anchors[-1][1].append(data)
 
     def get_text(self) -> str:
         lines = [line.strip() for line in "".join(self._parts).splitlines()]
         return "\n".join(line for line in lines if line)
+
+    def get_anchors(self) -> list[tuple[str, str]]:
+        return [(href, " ".join("".join(text).split())) for href, text in self._anchors]
 
 
 def html_to_text(html: str) -> tuple[str, str]:
     """R4: extract (readable_text, title) from HTML. Never raises — a
     parse failure on genuinely malformed input just yields what could be
     recovered rather than failing the whole search."""
+    text, title, _links = html_to_text_and_links(html)
+    return text, title
+
+
+# cavekit-browse-web-access.md R3: schemes that never navigate to a fetchable
+# document. Excluded before resolution so they can never reach a fetch.
+_NON_NAVIGATIONAL_SCHEMES = ("javascript:", "mailto:", "data:", "tel:", "sms:", "blob:", "file:")
+
+
+def html_to_text_and_links(
+    html: str, base_url: Optional[str] = None, max_links: Optional[int] = None
+) -> tuple[str, str, list[tuple[str, str]]]:
+    """R3: extract (readable_text, title, links) from HTML, where each link is
+    an ``(absolute_url, link_text)`` pair.
+
+    `base_url` is the address the HTML was fetched from; relative and
+    root-relative hrefs are resolved against it. Without it, only already-
+    absolute http(s) URLs survive — a relative href has no meaning we can
+    honestly guess at, so it is dropped rather than fabricated.
+
+    Links are deduplicated by destination (first occurrence wins, so document
+    order is preserved and the cap is deterministic rather than dependent on
+    set iteration) and truncated to `max_links`.
+
+    Never raises, for the same reason html_to_text doesn't: malformed markup on
+    a real page must degrade to a partial result, not fail the caller.
+    """
     parser = _HTMLTextExtractor()
     try:
         parser.feed(html)
     except Exception as e:
-        log.warning(f"html_to_text: parse error, using partial result: {e}")
-    return parser.get_text(), parser.title.strip()
+        log.warning(f"html_to_text_and_links: parse error, using partial result: {e}")
+
+    links: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for href, text in parser.get_anchors():
+        href = href.strip()
+        if not href or href.startswith("#"):
+            continue
+        if href.lower().startswith(_NON_NAVIGATIONAL_SCHEMES):
+            continue
+
+        absolute = urljoin(base_url, href) if base_url else href
+
+        # Post-resolution scheme check: only http(s) is fetchable, and a base
+        # URL cannot turn a non-web scheme into one.
+        parsed = urlparse(absolute)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            continue
+
+        # The fragment names a position within a document, not a different
+        # document — dropping it collapses the several in-page anchors a page
+        # typically carries into the one destination they actually share.
+        absolute = urldefrag(absolute).url
+
+        if absolute in seen:
+            continue
+        seen.add(absolute)
+        links.append((absolute, text))
+
+        if max_links is not None and len(links) >= max_links:
+            break
+
+    return parser.get_text(), parser.title.strip(), links
 
 
 async def run_web_search_tool_call(request: Request, query: str, extra_params: dict, user) -> str:
@@ -374,6 +524,510 @@ async def run_web_search_tool_call(request: Request, query: str, extra_params: d
         return f"Web search failed: {e}"
 
 
+async def run_web_fetch_tool_call(request: Request, url: str, extra_params: dict, user) -> str:
+    """R1: read one page the model named, through the core Playwright
+    connection under the direct-fetch profile.
+
+    Deliberately NOT the search pipeline. No search provider is contacted (R1),
+    and the result is the page's own readable text rather than the excerpts of
+    it that best match some query (R2) — "read this page" is a different
+    question from "what in this page matches my query", and there may be no
+    query at all.
+
+    This tool is a leaf: it never follows a link. Multi-hop traversal is
+    deep_research's job (R4), where it can be budgeted (R5) and where hops
+    sourced from page content can be constrained (R6).
+    """
+    event_emitter = extra_params["__event_emitter__"]
+
+    # cavekit-browse-access-control.md R1: checked before the connection is
+    # ever invoked, exactly as web_search does.
+    if not has_browsing_access(user, request.app.state.config.USER_PERMISSIONS):
+        return "Web browsing is not permitted for this account."
+
+    url = (url or "").strip()
+    if not url:
+        return "No URL was provided to read."
+
+    # A bare "example.com/page" is what a model most often emits when it means
+    # a URL. Assume https for it — but only when there is genuinely no scheme.
+    # Testing for "://" is not good enough: "javascript:alert(1)" contains no
+    # "://", so that test would prepend a scheme to it and hand urlparse a
+    # string that superficially parses as an https URL with a netloc.
+    if not _URL_SCHEME_RE.match(url):
+        url = f"https://{url}"
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        # R1/R2: a stated failure, never empty content presented as success.
+        return f"Cannot read {url!r}: only http and https URLs can be read."
+
+    await event_emitter(
+        {
+            "type": "status",
+            "data": {
+                "action": "web_fetch",
+                "description": "Reading {{url}}",
+                "url": url,
+                "done": False,
+            },
+        }
+    )
+
+    async def _failed(message: str) -> str:
+        await event_emitter(
+            {
+                "type": "status",
+                "data": {
+                    "action": "web_fetch",
+                    "description": "Could not read {{url}}",
+                    "url": url,
+                    "done": True,
+                    "error": True,
+                },
+            }
+        )
+        return message
+
+    try:
+        profile = resolve_profile("direct-fetch")
+        fetch_result = await browse_fetch(request, url, profile)
+
+        if not fetch_result.success:
+            return await _failed(f"Could not read {url}: {fetch_result.error}")
+
+        text, title, _links = html_to_text_and_links(fetch_result.content, base_url=url)
+
+        if not text.strip():
+            # R2: no usable text is a stated failure, not an empty success.
+            return await _failed(f"Could not read {url}: the page returned no readable text.")
+
+        # R2: bound what the model receives, and say so when it was cut. A
+        # truncated page must never be indistinguishable from a complete one.
+        max_chars = request.app.state.config.BROWSE_FETCH_MAX_CHARS
+        truncated = len(text) > max_chars
+        if truncated:
+            text = text[:max_chars]
+
+        await event_emitter(
+            {
+                "type": "status",
+                "data": {
+                    "action": "web_fetch",
+                    "description": "Read {{url}}",
+                    "url": url,
+                    "title": title,
+                    "done": True,
+                },
+            }
+        )
+
+        # R7: attributed to the origin it came from. Everything inside this
+        # boundary is untrusted third-party text, and the model is never handed
+        # it without the source in view.
+        header = f'<source name="{title or url}" url="{url}">'
+        footer = "</source>"
+        if truncated:
+            footer = (
+                f"\n[Truncated: this page was longer than {max_chars} characters and was cut "
+                f"off here. The text above is the beginning of the page, not all of it.]\n"
+            ) + footer
+
+        return f"{header}\n{text}\n{footer}"
+
+    except Exception as e:
+        log.exception(e)
+        return await _failed(f"Could not read {url}: {e}")
+
+
+async def run_deep_research_tool_call(request: Request, query: str, extra_params: dict, user) -> str:
+    """R4: search, read, follow links from what was read, and assemble — the
+    whole traversal inside a single tool call.
+
+    Why one call rather than letting the outer tool-calling loop do the hopping:
+    MAX_TOOL_CALL_ROUNDS is a budget shared by every tool in a turn, so a
+    research chain run through it would starve everything else and would have
+    its depth governed by a constant that exists for an unrelated reason.
+    Keeping traversal here is also what makes the budget enforceable (R5) and
+    the hop policy applicable (R6) at all.
+    """
+    event_emitter = extra_params["__event_emitter__"]
+
+    if not has_browsing_access(user, request.app.state.config.USER_PERMISSIONS):
+        return "Web browsing is not permitted for this account."
+
+    config = request.app.state.config
+    # R5: read once, at the start. These come from configuration and never from
+    # the model's arguments — deep_research's tool spec exposes only `query`.
+    max_depth = config.DEEP_RESEARCH_MAX_DEPTH
+    max_pages = config.DEEP_RESEARCH_MAX_PAGES
+    max_seconds = config.DEEP_RESEARCH_MAX_SECONDS
+    concurrency = max(1, config.DEEP_RESEARCH_CONCURRENCY)
+    per_page_chars = config.DEEP_RESEARCH_MAX_CHARS_PER_PAGE
+    max_links = config.BROWSE_MAX_LINKS_PER_PAGE
+    max_crawl_delay = config.DEEP_RESEARCH_MAX_CRAWL_DELAY_SECONDS
+
+    loop = asyncio.get_running_loop()
+    # R5: one deadline for the WHOLE traversal. Bounding each fetch instead
+    # would let N pages at the profile timeout add up without limit.
+    deadline = loop.time() + max_seconds
+
+    # robots.txt honoring. deep_research follows links across a site, which is
+    # crawler behavior, so it respects the file when enabled: a disallowed URL
+    # is skipped, and a declared Crawl-delay spaces out fetches to that origin.
+    # One cache for the whole traversal (fetch each origin's robots.txt once).
+    robots = RobotsCache(config.BROWSE_USER_AGENT) if config.DEEP_RESEARCH_RESPECT_ROBOTS else None
+    # Per-origin next-available time and lock: same-origin fetches serialize and
+    # space by the Crawl-delay; different origins stay concurrent.
+    origin_next_ok: dict[tuple, float] = {}
+    origin_locks: dict[tuple, asyncio.Lock] = {}
+    disallowed_by_robots = 0
+
+    async def _gated_fetch(url: str):
+        """browse_fetch, gated by robots.txt when honoring is on. Returns
+        ("ok", result) | ("fail", result) | ("robots", None). The "robots" kind
+        is a URL the origin disallows for our agent, or one whose Crawl-delay
+        can't be honored inside the remaining budget — counted, not fetched."""
+        if robots is not None:
+            if not await robots.is_allowed(request, url, profile):
+                return ("robots", None)
+            delay = await robots.crawl_delay(request, url, profile)
+            if delay:
+                if delay > max_crawl_delay:
+                    # Honoring it would stall this origin past our cap; don't
+                    # sleep that long, just leave the origin alone.
+                    return ("robots", None)
+                origin = (urlparse(url).scheme, urlparse(url).netloc)
+                lock = origin_locks.setdefault(origin, asyncio.Lock())
+                async with lock:
+                    wait = origin_next_ok.get(origin, 0.0) - loop.time()
+                    if wait > 0:
+                        if loop.time() + wait >= deadline:
+                            # Waiting would blow the whole-traversal deadline.
+                            return ("robots", None)
+                        await asyncio.sleep(wait)
+                    origin_next_ok[origin] = loop.time() + delay
+                    result = await browse_fetch(request, url, profile)
+                    return ("ok" if result.success else "fail", result)
+        result = await browse_fetch(request, url, profile)
+        return ("ok" if result.success else "fail", result)
+
+    await event_emitter(
+        {
+            "type": "status",
+            "data": {
+                "action": "deep_research",
+                "description": 'Researching "{{searchQuery}}"',
+                "query": query,
+                "urls": [],
+                "done": False,
+            },
+        }
+    )
+
+    async def _terminal(description: str, urls: list, error: bool = False) -> None:
+        await event_emitter(
+            {
+                "type": "status",
+                "data": {
+                    "action": "deep_research",
+                    "description": description,
+                    "query": query,
+                    "urls": urls,
+                    "done": True,
+                    **({"error": True} if error else {}),
+                },
+            }
+        )
+
+    try:
+        with ThreadPoolExecutor() as executor:
+            search_results = await loop.run_in_executor(
+                executor,
+                lambda: search_web(request, config.RAG_WEB_SEARCH_ENGINE, query),
+            )
+
+        if not search_results:
+            await _terminal("No search results found", [], error=True)
+            return "No search results found."
+
+        profile = resolve_profile("link-follow")
+
+        # R6: depth-0 URLs came from the search provider, not from any page's
+        # content, so no fetched page chose them — they are eligible whatever
+        # their origin. Everything discovered later is subject to the hop policy.
+        frontier: list[tuple[str, int]] = [(result.link, 0) for result in search_results]
+        queued: set[str] = {url for url, _ in frontier}
+
+        pages: list[dict] = []
+        refused_hops = 0
+        stop_reason = ""
+
+        while frontier and len(pages) < max_pages:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                stop_reason = f"the {max_seconds}s time limit was reached"
+                break
+
+            # Never fetch more than the remaining page budget, so the last
+            # batch cannot overshoot max_pages.
+            batch = frontier[: min(concurrency, max_pages - len(pages))]
+            frontier = frontier[len(batch) :]
+
+            try:
+                fetched = await asyncio.wait_for(
+                    asyncio.gather(
+                        *(_gated_fetch(url) for url, _ in batch),
+                        return_exceptions=True,
+                    ),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError:
+                stop_reason = f"the {max_seconds}s time limit was reached"
+                break
+
+            for (url, depth), outcome in zip(batch, fetched):
+                if isinstance(outcome, BaseException):
+                    log.debug(f"deep_research: skipping {url}: {outcome}")
+                    continue
+                kind, fetch_result = outcome
+                if kind == "robots":
+                    # Disallowed by robots.txt, or a Crawl-delay we won't sit
+                    # out. Recorded, not silently dropped.
+                    disallowed_by_robots += 1
+                    log.debug(f"deep_research: robots.txt skip {url}")
+                    continue
+                if kind != "ok" or not fetch_result.success:
+                    # R4: a failed hop excludes that page; it never fails the call.
+                    log.debug(f"deep_research: skipping {url}: {fetch_result and fetch_result.error}")
+                    continue
+
+                text, title, links = html_to_text_and_links(fetch_result.content, base_url=url, max_links=max_links)
+                if not text.strip():
+                    continue
+
+                pages.append({"url": url, "title": title, "text": text, "depth": depth})
+
+                if depth + 1 > max_depth:
+                    continue
+
+                for link_url, _link_text in links:
+                    if link_url in queued:
+                        continue
+                    if not is_same_site(url, link_url):
+                        # R6: recorded, not silently dropped. This is the branch
+                        # that refuses an injected page's attempt to steer the
+                        # traversal off-site.
+                        refused_hops += 1
+                        log.debug(f"deep_research: refusing off-site hop {url} -> {link_url}")
+                        continue
+                    queued.add(link_url)
+                    frontier.append((link_url, depth + 1))
+
+            await event_emitter(
+                {
+                    "type": "status",
+                    "data": {
+                        "action": "deep_research",
+                        "description": "Read {{count}} pages",
+                        "query": query,
+                        "urls": [page["url"] for page in pages],
+                        "done": False,
+                    },
+                }
+            )
+
+        if not stop_reason and len(pages) >= max_pages:
+            stop_reason = f"the {max_pages}-page limit was reached"
+
+        if not pages:
+            await _terminal("No pages could be read", [], error=True)
+            return f'No pages could be read while researching "{query}".'
+
+        urls = [page["url"] for page in pages]
+        await _terminal("Read {{count}} pages", urls)
+
+        # R7: every block attributed to the origin it came from. All of this is
+        # untrusted third-party text and is never handed over unattributed.
+        parts = []
+        for page in pages:
+            text = page["text"]
+            note = ""
+            if len(text) > per_page_chars:
+                text = text[:per_page_chars]
+                note = f"\n[Excerpt: this page was longer than {per_page_chars} characters and was cut off here.]"
+            parts.append(f'<source name="{page["title"] or page["url"]}" url="{page["url"]}">\n{text}{note}\n</source>')
+
+        # R5: say what happened. Reaching a limit is not an error, but it must
+        # not look like the traversal ran to completion either.
+        preamble = f'Researched "{query}" — read {len(pages)} page(s).'
+        if stop_reason:
+            preamble += f" Stopped early because {stop_reason}; there may be more to find."
+        if refused_hops:
+            preamble += f" {refused_hops} off-site link(s) found on those pages were not followed."
+        if disallowed_by_robots:
+            preamble += f" {disallowed_by_robots} URL(s) were skipped to respect robots.txt."
+
+        return preamble + "\n\n" + "\n\n".join(parts)
+
+    except Exception as e:
+        log.exception(e)
+        await _terminal('Error researching "{{searchQuery}}"', [], error=True)
+        return f"Research failed: {e}"
+
+
+WEB_CRAWL_TOOL_SPEC = ToolSpec(
+    name="web_crawl",
+    description=(
+        "Crawl a website and save its pages into the knowledge base the user selected for this "
+        "conversation. Use this when the user wants a site ingested for later reference — "
+        "documentation, a wiki, a blog archive — rather than answered right now. The crawl runs "
+        "in the background and can take several minutes; this returns immediately with a job "
+        "reference, not the page contents. Use web_search or deep_research instead when the user "
+        "wants an answer in this conversation."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "The site or page URL to start crawling from, including its scheme (https://).",
+            }
+        },
+        "required": ["url"],
+    },
+)
+
+
+async def run_web_crawl_tool_call(request: Request, url: str, extra_params: dict, user) -> str:
+    """Start a Knowledge-Base domain crawl into the KB the user bound to this
+    conversation, and return a handle. Fire-and-report: the crawl runs in the
+    background and this never waits for it.
+
+    This is the same crawl the KB UI runs — same ProcessWebCrawlForm, same
+    create_crawl_job registration, same _run_crawl_background pipeline (so the
+    same batched embedding, job persistence, startup-resume, and robots.txt
+    Crawl-delay honoring). What differs is only who starts it and how the task
+    is scheduled: a request handler has BackgroundTasks, a tool call does not.
+    """
+    event_emitter = extra_params["__event_emitter__"]
+    metadata = extra_params.get("__metadata__") or {}
+    config = request.app.state.config
+
+    if not has_browsing_access(user, config.USER_PERMISSIONS):
+        return "Web browsing is not permitted for this account."
+
+    # The admin flag is checked here too, not just at offer time: a stale client
+    # must not keep writing into knowledge bases after an admin turns this off.
+    if not config.ENABLE_WEB_CRAWL:
+        return "Web crawl is not enabled on this instance."
+
+    if not (metadata.get("features") or {}).get("web_crawl"):
+        return "Web crawl is not enabled for this conversation."
+
+    kb_id = metadata.get("web_crawl_kb_id")
+    if not kb_id:
+        return "No knowledge base is selected for web crawl. Choose one in the Web Crawl settings first."
+
+    knowledge = Knowledges.get_knowledge_by_id(kb_id)
+    if knowledge is None:
+        return "The selected knowledge base no longer exists. Choose another in the Web Crawl settings."
+
+    # D3: the picker only ever shows write-access knowledge bases, but that is a
+    # convenience, not the boundary. Re-check here, because the side effect is
+    # writing into someone's knowledge base and the request metadata is
+    # attacker-shaped input like any other.
+    if not (knowledge.user_id == user.id or has_access(user.id, "write", knowledge.access_control)):
+        log.warning(f"web_crawl: refused — user {user.id} lacks write access to KB {kb_id}")
+        return "You do not have write access to the selected knowledge base."
+
+    if not config.FIRECRAWL_API_KEY and not config.FIRECRAWL_API_BASE_URL:
+        return "Crawling is not configured on this instance (no Firecrawl endpoint)."
+
+    url = (url or "").strip()
+    if not url:
+        return "No URL was provided to crawl."
+    if not _URL_SCHEME_RE.match(url):
+        url = f"https://{url}"
+
+    try:
+        validate_url(url)
+    except Exception as e:
+        return f"Cannot crawl {url!r}: {e}"
+
+    await event_emitter(
+        {
+            "type": "status",
+            "data": {
+                "action": "web_crawl",
+                "description": "Crawling {{url}}",
+                "url": url,
+                "knowledge_name": knowledge.name,
+                "done": False,
+            },
+        }
+    )
+
+    try:
+        # D6: budget is admin configuration, never a tool argument.
+        form_data = ProcessWebCrawlForm(
+            url=url,
+            collection_name=knowledge.id,
+            limit=config.WEB_CRAWL_MAX_PAGES,
+            max_depth=config.WEB_CRAWL_MAX_DEPTH,
+        )
+        job_state = create_crawl_job(request, form_data, knowledge.id, user.id)
+
+        # D4: fire-and-report. A request handler would hand this to
+        # BackgroundTasks; a tool call schedules it itself. Held on app.state so
+        # the task isn't garbage-collected mid-crawl.
+        task = asyncio.create_task(
+            _run_crawl_background(request, job_state, form_data, knowledge.id, user.id)
+        )
+        if not hasattr(request.app.state, "crawl_tasks"):
+            request.app.state.crawl_tasks = set()
+        request.app.state.crawl_tasks.add(task)
+        task.add_done_callback(request.app.state.crawl_tasks.discard)
+
+        await event_emitter(
+            {
+                "type": "status",
+                "data": {
+                    "action": "web_crawl",
+                    "description": "Started crawling {{url}}",
+                    "url": url,
+                    "knowledge_name": knowledge.name,
+                    "job_id": job_state["job_id"],
+                    "done": True,
+                },
+            }
+        )
+
+        return (
+            f'Started crawling {url} into the "{knowledge.name}" knowledge base '
+            f'(job {job_state["job_id"]}, up to {config.WEB_CRAWL_MAX_PAGES} pages). '
+            "This runs in the background and is not finished yet — pages appear in the knowledge "
+            "base as they are ingested. Do not summarize the site from this result; tell the user "
+            "the crawl has started and that they can ask about the knowledge base once it finishes."
+        )
+
+    except Exception as e:
+        log.exception(e)
+        await event_emitter(
+            {
+                "type": "status",
+                "data": {
+                    "action": "web_crawl",
+                    "description": "Could not start crawling {{url}}",
+                    "url": url,
+                    "done": True,
+                    "error": True,
+                },
+            }
+        )
+        return f"Could not start crawling {url}: {e}"
+
+
 MAX_TOOL_CALL_ROUNDS = 5
 
 
@@ -394,13 +1048,33 @@ async def _dispatch_tool_call(
         query = arguments.get("query") or get_last_user_message(messages)
         return await run_web_search_tool_call(request, query, extra_params, user)
 
+    if name == "web_fetch":
+        return await run_web_fetch_tool_call(request, arguments.get("url") or "", extra_params, user)
+
+    if name == "web_crawl":
+        return await run_web_crawl_tool_call(request, arguments.get("url") or "", extra_params, user)
+
+    if name == "deep_research":
+        # Offered only when its own toggle is on; refused here too, because a
+        # model can emit a tool name it was never offered and the offer list is
+        # not a security boundary.
+        features = (extra_params.get("__metadata__") or {}).get("features") or {}
+        if not features.get("deep_research"):
+            return "Deep research is not enabled for this conversation."
+        query = arguments.get("query") or get_last_user_message(messages)
+        return await run_deep_research_tool_call(request, query, extra_params, user)
+
     if name in admin_tools:
         event_emitter = extra_params["__event_emitter__"]
         await event_emitter(
             {"type": "status", "data": {"action": "tool_calls", "description": f"Calling {name}...", "done": False}}
         )
         try:
-            allowed_params = admin_tools[name].get("spec", {}).get("parameters", {}).get("properties", {})
+            # The declared argument names, read off the typed spec. A missing spec
+            # or a schema body with no `properties` yields {}, so an argument the
+            # model invented is still dropped rather than raising here.
+            spec = admin_tools[name].get("spec")
+            allowed_params = (getattr(spec, "input_schema", None) or {}).get("properties") or {}
             tool_function = admin_tools[name]["callable"]
             filtered_args = {k: v for k, v in arguments.items() if k in allowed_params}
             tool_output = await tool_function(**filtered_args)
@@ -616,18 +1290,54 @@ async def generate_chat_completion_with_tools(request: Request, form_data: dict,
     MAX_TOOL_CALL_ROUNDS is hit.
 
     Falls straight through to a normal single completion call when there's
-    nothing to offer the model (no admin tool_ids, web search off) — zero
-    overhead for the common case. Otherwise dispatches to a real streaming
-    loop (content relayed live, round-by-round) or the simpler buffered
-    loop, matching whatever the client asked for.
+    nothing to offer the model (no admin tool_ids, no mod tool this user may
+    call, web search off) — zero overhead for the common case. Otherwise
+    dispatches to a real streaming loop (content relayed live, round-by-round)
+    or the simpler buffered loop, matching whatever the client asked for.
     """
     metadata = form_data.get("metadata", {}) or {}
 
     tool_ids = metadata.get("tool_ids", None)
     features = metadata.get("features", None) or {}
     web_search_enabled = bool(features.get("web_search"))
+    # Deep research is its own toggle, not part of Web Search. Searching, and
+    # reading a page the user named, are one capability: ask the web something,
+    # get a page back. Crawling is a different one -- it reads a dozen pages,
+    # follows links between them, and can spend 90s doing it. Someone who
+    # enabled "Web Search" did not ask for that, so enabling it must not opt
+    # them in.
+    deep_research_enabled = bool(features.get("deep_research"))
+    # Web Crawl is not a bare boolean: it also needs the knowledge base the user
+    # bound to this conversation. Without a destination there is nothing to
+    # offer, so both must be present (cavekit/treasuremap D1).
+    web_crawl_kb_id = metadata.get("web_crawl_kb_id")
+    web_crawl_enabled = bool(features.get("web_crawl")) and bool(web_crawl_kb_id)
 
-    if not tool_ids and not web_search_enabled:
+    # Mod tools are assembled BEFORE the fall-through gate, because holding one
+    # is one of the things that opens it (self.ai#61). `tool_ids` is the user's
+    # selected *user-authored* toolkits; a user whose only capabilities come from
+    # an installed mod selects nothing, so a gate consulting only `tool_ids` sent
+    # them to a plain completion carrying no tools at all. Their mod's tools
+    # worked solely as a side effect of also having picked an unrelated toolkit,
+    # which is the opposite of why a mod exists.
+    #
+    # Assembling here rather than below the gate costs nothing on an instance
+    # running no mods: `assemble_for_user` returns immediately when nothing is
+    # loaded, and is scope-gated per user, so "a mod is enabled" does not become
+    # "every request pays for tool calling". It also removes what would be a
+    # second assembly pass -- one result both decides the gate and merges below.
+    from selfai_ui.mods.tools import assemble_for_user, resolve_collisions
+
+    mod_defaults = getattr(request.app.state.config, "USER_PERMISSIONS", None) or {}
+    mod_tool_pairs = assemble_for_user(getattr(request.app.state, "MODS", None), user, defaults=mod_defaults)
+
+    if (
+        not tool_ids
+        and not web_search_enabled
+        and not deep_research_enabled
+        and not web_crawl_enabled
+        and not mod_tool_pairs
+    ):
         return await generate_chat_completion(request, form_data, user)
 
     models = request.app.state.MODELS
@@ -663,9 +1373,27 @@ async def generate_chat_completion_with_tools(request: Request, form_data: dict,
         else {}
     )
 
-    openai_tools = [{"type": "function", "function": tool["spec"]} for tool in admin_tools.values()]
+    # Mod tools: scope-gated per user, in the same dict shape as user-authored
+    # tools, merged through the same collision rule. Assembled above the gate;
+    # this is only the merge, and it is a no-op for an instance running no mods.
+    if mod_tool_pairs:
+        admin_tools = resolve_collisions(list(admin_tools.items()) + mod_tool_pairs)
+
+    # Serialized at the wrap site, not carried typed: what goes on the wire is a
+    # plain dict, so the round payload below still `json.dumps` with no `default=`
+    # hook. `to_openai()` deep-copies the schema body, so nothing downstream of
+    # here can reach back into a cached spec.
+    openai_tools = [{"type": "function", "function": tool["spec"].to_openai()} for tool in admin_tools.values()]
     if web_search_enabled:
-        openai_tools.append({"type": "function", "function": WEB_SEARCH_TOOL_SPEC})
+        # The Web Search toggle covers both ways of getting a page: ask a search
+        # engine which page, or name the page directly. Its stored key and label
+        # are unchanged.
+        openai_tools.append({"type": "function", "function": WEB_SEARCH_TOOL_SPEC.to_openai()})
+        openai_tools.append({"type": "function", "function": WEB_FETCH_TOOL_SPEC.to_openai()})
+    if deep_research_enabled:
+        openai_tools.append({"type": "function", "function": DEEP_RESEARCH_TOOL_SPEC.to_openai()})
+    if web_crawl_enabled:
+        openai_tools.append({"type": "function", "function": WEB_CRAWL_TOOL_SPEC.to_openai()})
 
     messages = list(form_data["messages"])
 
@@ -1026,6 +1754,7 @@ async def process_chat_response(request, response, form_data, user, events, meta
 
             if response.get("choices", [])[0].get("message", {}).get("content"):
                 content = response["choices"][0]["message"]["content"]
+                reasoning = response["choices"][0]["message"].get("reasoning_content")
 
                 if content:
 
@@ -1045,6 +1774,7 @@ async def process_chat_response(request, response, form_data, user, events, meta
                                 "done": True,
                                 "content": content,
                                 "title": title,
+                                **({"reasoning": reasoning} if reasoning else {}),
                             },
                         }
                     )
@@ -1055,6 +1785,7 @@ async def process_chat_response(request, response, form_data, user, events, meta
                         metadata["message_id"],
                         {
                             "content": content,
+                            **({"reasoning": reasoning} if reasoning else {}),
                         },
                     )
 
@@ -1093,6 +1824,10 @@ async def process_chat_response(request, response, form_data, user, events, meta
         async def post_response_handler(response, events):
             message = Chats.get_message_by_id_and_message_id(metadata["chat_id"], metadata["message_id"])
             content = message.get("content", "") if message else ""
+            # Reasoning is accumulated separately from content and never merged into it --
+            # it is model thinking, not the answer, and inlining it would corrupt the saved
+            # message. Providers that don't emit it leave this empty (self.ai#59).
+            reasoning = message.get("reasoning", "") if message else ""
 
             try:
                 for event in events:
@@ -1140,24 +1875,30 @@ async def process_chat_response(request, response, form_data, user, events, meta
                             )
 
                         else:
-                            value = data.get("choices", [])[0].get("delta", {}).get("content")
+                            delta = data.get("choices", [])[0].get("delta", {})
+                            value = delta.get("content")
+                            reasoning_value = delta.get("reasoning_content")
 
-                            if value:
-                                content = f"{content}{value}"
+                            if reasoning_value:
+                                reasoning = f"{reasoning}{reasoning_value}"
+
+                            if value or reasoning_value:
+                                if value:
+                                    content = f"{content}{value}"
+
+                                update = {"content": content}
+                                if reasoning:
+                                    update["reasoning"] = reasoning
 
                                 if ENABLE_REALTIME_CHAT_SAVE:
                                     # Save message in the database
                                     Chats.upsert_message_to_chat_by_id_and_message_id(
                                         metadata["chat_id"],
                                         metadata["message_id"],
-                                        {
-                                            "content": content,
-                                        },
+                                        update,
                                     )
                                 else:
-                                    data = {
-                                        "content": content,
-                                    }
+                                    data = update
 
                         await event_emitter(
                             {
@@ -1176,15 +1917,18 @@ async def process_chat_response(request, response, form_data, user, events, meta
 
                 title = Chats.get_chat_title_by_id(metadata["chat_id"])
                 data = {"done": True, "content": content, "title": title}
+                if reasoning:
+                    data["reasoning"] = reasoning
 
                 if not ENABLE_REALTIME_CHAT_SAVE:
                     # Save message in the database
+                    final_update = {"content": content}
+                    if reasoning:
+                        final_update["reasoning"] = reasoning
                     Chats.upsert_message_to_chat_by_id_and_message_id(
                         metadata["chat_id"],
                         metadata["message_id"],
-                        {
-                            "content": content,
-                        },
+                        final_update,
                     )
 
                 # Send a webhook notification if the user is not active

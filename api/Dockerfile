@@ -57,8 +57,30 @@ RUN apt-get update && \
 # build time becomes a problem, reintroduce caching with a content-hash build-arg
 # referenced in this RUN so the layer key tracks the deps.
 COPY requirements-api.txt ./requirements-api.txt
+# The trailing pip force-reinstall + assert are DUCT TAPE for a uv
+# install-corruption that broke the R5 force-reaper's in-cluster auth (401 on
+# every real pod delete; selfinfra#166 / self.ai!210). `uv pip install` produced
+# a MIXED-VERSION kubernetes_asyncio tree: an old `config/incluster_config.py`
+# (which writes the SA token as api_key['authorization']) stitched together with
+# a newer `client/configuration.py` (whose auth_settings() only emits a bearer
+# header when api_key['BearerToken'] is set). The two disagree on the key name,
+# so auth_settings() returned {} and the client sent NO Authorization header ->
+# 401 -- even though load_incluster_config() had read the token fine (curl with
+# the same token = 200). It is NOT a version bug (any single clean version is
+# self-consistent), so there is no version pin here. pip's --force-reinstall
+# does the clean remove-then-write uv skipped; the assert then drives the REAL
+# load_incluster_config()->auth_settings() path against a fake token and FAILS
+# THE BUILD if the wiring can't produce a bearer header -- so a mismatched tree
+# can never reach a pod. Unit tests inject a fake k8s client and never exercise
+# this, which is why it only ever surfaced live (T-007).
 RUN pip3 install --no-cache-dir uv && \
-    uv pip install --system --no-cache -r requirements-api.txt
+    uv pip install --system --no-cache -r requirements-api.txt && \
+    pip3 install --no-cache-dir --force-reinstall --no-deps "kubernetes_asyncio>=35.0.0" && \
+    mkdir -p /tmp/sa-assert && \
+    printf 'build-assert-token' > /tmp/sa-assert/token && \
+    printf 'x' > /tmp/sa-assert/ca.crt && \
+    KUBERNETES_SERVICE_HOST=10.0.0.1 KUBERNETES_SERVICE_PORT=443 python3 -c "import asyncio; import kubernetes_asyncio.config.incluster_config as ic; ic.SERVICE_TOKEN_FILENAME='/tmp/sa-assert/token'; ic.SERVICE_CERT_FILENAME='/tmp/sa-assert/ca.crt'; from kubernetes_asyncio import client, config; config.load_incluster_config(); c=client.Configuration.get_default_copy(); a=asyncio.run(c.auth_settings()); v=(a.get('BearerToken') or {}).get('value'); assert v and 'build-assert-token' in str(v), 'kubernetes_asyncio in-cluster auth wiring broken (mismatched/corrupt install): load_incluster_config wrote the token but auth_settings() did not surface a bearer header. auth_settings keys='+repr(list(a.keys()))+' api_key keys='+repr(list(c.api_key.keys())); print('kubernetes_asyncio in-cluster auth wiring OK')" && \
+    rm -rf /tmp/sa-assert
 
 # Backend source: the selfai_ui package, start.sh, alembic + peewee migrations.
 COPY . .

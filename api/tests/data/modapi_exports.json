@@ -1,0 +1,16 @@
+{
+  "_comment": "Snapshot of selfai_ui.modapi.__all__. Adding a name: update this file in the same commit. REMOVING or renaming one: that is a compatibility break and requires a core major-version increment. tests/test_mods_facade_boundary.py enforces both.",
+  "core_version": "0.5.0",
+  "exports": [
+    "get_verified_user",
+    "has_permission",
+    "permission_defaults",
+    "get_user_id_from_session_pool",
+    "get_db",
+    "sio",
+    "emit_to_user",
+    "ToolSpec",
+    "get_tools_specs",
+    "CORE_VERSION"
+  ]
+}

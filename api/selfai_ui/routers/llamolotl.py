@@ -15,7 +15,7 @@ from fastapi import (
     Query,
     Request,
 )
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
@@ -29,6 +29,7 @@ from selfai_ui.env import (
 from selfai_ui.models.models import ModelForm, ModelMeta, ModelParams, Models
 from selfai_ui.utils.access_control import has_access, has_permission
 from selfai_ui.utils.auth import get_admin_user, get_verified_user
+from selfai_ui.utils.lease_admission import AdmissionAction, evaluate_admission
 from selfai_ui.utils.payload import (
     apply_model_params_to_body_openai,
     apply_model_system_prompt_to_body,
@@ -107,7 +108,12 @@ async def send_post_request(
     stream: bool = True,
     key: Optional[str] = None,
     ticket: Optional[str] = None,
+    extra_headers: Optional[dict] = None,
 ):
+    # extra_headers are added to the RESPONSE we return to our caller (not the
+    # outbound request to llama.cpp) — used for the X-Selfai-Model-Substituted
+    # marker (Decision 6 / R3, T-016) so a caller can always tell which model
+    # actually answered, on both the streaming and non-streaming paths.
     r = None
     try:
         session = aiohttp.ClientSession(trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT))
@@ -125,6 +131,8 @@ async def send_post_request(
 
         if stream:
             response_headers = dict(r.headers)
+            if extra_headers:
+                response_headers.update(extra_headers)
             return StreamingResponse(
                 r.content,
                 status_code=r.status,
@@ -133,7 +141,10 @@ async def send_post_request(
             )
         else:
             res = await r.json()
+            status_code = r.status
             await cleanup_response(r, session)
+            if extra_headers:
+                return JSONResponse(content=res, status_code=status_code, headers=extra_headers)
             return res
 
     except Exception as e:
@@ -535,6 +546,25 @@ async def generate_chat_completion(
                 detail="Model not found",
             )
 
+    # Decision 6 / R3: lease admission checkpoint — consult the broker/registry
+    # BEFORE dispatching a local generation (T-014 seam; T-015 exclusive-refuse,
+    # T-016 eval-substitute, T-019 staleness fill the logic against this seam).
+    admission = evaluate_admission(request, model_id)
+    substituted_from = None
+    if admission.action == AdmissionAction.REFUSE:
+        raise HTTPException(
+            status_code=admission.refuse_status, detail=admission.refuse_detail
+        )
+    if admission.action == AdmissionAction.SUBSTITUTE and admission.substitute_model:
+        # Serve the already-loaded eval model instead of the requested one; record
+        # the original id for the X-Selfai-Model-Substituted response header (T-016).
+        substituted_from = admission.requested_model or model_id
+        model_id = admission.substitute_model
+        payload["model"] = admission.substitute_model
+        # Re-resolve model_info so the SUBSTITUTED model's LoRA is applied below,
+        # not the originally-requested one (#35-R2 substituted-LoRA).
+        model_info = Models.get_model_by_id(model_id) or model_info
+
     # Ensure the correct LoRAs are applied before generating
     if model_info:
         await _ensure_loras_applied(request, model_info)
@@ -559,6 +589,9 @@ async def generate_chat_completion(
         payload=json.dumps(payload),
         stream=stream,
         key=key,
+        extra_headers=(
+            {"X-Selfai-Model-Substituted": substituted_from} if substituted_from else None
+        ),
     )
 
 
@@ -606,6 +639,21 @@ async def generate_completion(
                 detail="Model not found",
             )
 
+    # Decision 6 / R3: lease admission checkpoint — same seam as the chat path
+    # (T-014; T-015/T-016/T-019 fill the logic). Applies only to this llamolotl
+    # local-generation path; Ollama/cloud paths are untouched.
+    admission = evaluate_admission(request, model_id)
+    substituted_from = None
+    if admission.action == AdmissionAction.REFUSE:
+        raise HTTPException(
+            status_code=admission.refuse_status, detail=admission.refuse_detail
+        )
+    if admission.action == AdmissionAction.SUBSTITUTE and admission.substitute_model:
+        substituted_from = admission.requested_model or model_id
+        model_id = admission.substitute_model
+        payload["model"] = admission.substitute_model
+        model_info = Models.get_model_by_id(model_id) or model_info
+
     # Ensure the correct LoRAs are applied before generating
     if model_info:
         await _ensure_loras_applied(request, model_info)
@@ -630,6 +678,9 @@ async def generate_completion(
         payload=json.dumps(payload),
         stream=stream,
         key=key,
+        extra_headers=(
+            {"X-Selfai-Model-Substituted": substituted_from} if substituted_from else None
+        ),
     )
 
 

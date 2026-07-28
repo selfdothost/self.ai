@@ -10,6 +10,7 @@ from selfai_ui.models.eval_jobs import EvalJob
 from selfai_ui.models.job_windows import JobWindowSlotModel, JobWindowWithSlots
 from selfai_ui.models.training import TrainingJob
 from selfai_ui.utils.gpu_queue import (
+    _dispatch_dry_run_eval_jobs,
     _dispatch_run_now_jobs,
     _dispatch_window_jobs,
     _fits_in_window,
@@ -83,7 +84,14 @@ def _make_training_job(db_session, *, status="queued", priority="normal", create
 
 
 def _make_eval_job(
-    db_session, *, eval_type="language-eval", status="queued", priority="normal", benchmark="hellaswag", created_at=None
+    db_session,
+    *,
+    eval_type="language-eval",
+    status="queued",
+    priority="normal",
+    benchmark="hellaswag",
+    created_at=None,
+    meta=None,
 ):
     now = created_at or int(time.time())
     job = EvalJob(
@@ -96,6 +104,7 @@ def _make_eval_job(
         priority=priority,
         created_at=now,
         updated_at=now,
+        meta=meta,
     )
     db_session.add(job)
     db_session.commit()
@@ -195,6 +204,41 @@ def test_dispatch_run_now_dispatches_eval(db_session):
     job = _make_eval_job(db_session, priority="run_now", status="queued", eval_type="language-eval")
     with patch("selfai_ui.utils.gpu_queue._dispatch_eval_job_by_type", new_callable=AsyncMock) as mock_fn:
         asyncio.run(_dispatch_run_now_jobs())
+        mock_fn.assert_called_once()
+        assert mock_fn.call_args[0][0].id == job.id
+
+
+# ---- _dispatch_dry_run_eval_jobs (self.ai#64) ----
+
+
+def test_dispatch_dry_run_dispatches_queued_test_mode_job(db_session):
+    job = _make_eval_job(db_session, status="queued", priority="normal", meta={"dry_run": True})
+    with patch("selfai_ui.utils.gpu_queue._dispatch_eval_job_by_type", new_callable=AsyncMock) as mock_fn:
+        asyncio.run(_dispatch_dry_run_eval_jobs())
+        mock_fn.assert_called_once()
+        assert mock_fn.call_args[0][0].id == job.id
+
+
+def test_dispatch_dry_run_ignores_real_eval_job(db_session):
+    _make_eval_job(db_session, status="queued", priority="normal", meta=None)
+    with patch("selfai_ui.utils.gpu_queue._dispatch_eval_job_by_type", new_callable=AsyncMock) as mock_fn:
+        asyncio.run(_dispatch_dry_run_eval_jobs())
+        mock_fn.assert_not_called()
+
+
+def test_dispatch_dry_run_ignores_non_queued_job(db_session):
+    _make_eval_job(db_session, status="running", priority="normal", meta={"dry_run": True})
+    with patch("selfai_ui.utils.gpu_queue._dispatch_eval_job_by_type", new_callable=AsyncMock) as mock_fn:
+        asyncio.run(_dispatch_dry_run_eval_jobs())
+        mock_fn.assert_not_called()
+
+
+def test_dispatch_dry_run_not_gated_by_priority(db_session):
+    # Unlike run_now, a dry_run job dispatches regardless of priority -- "needs
+    # no GPU" is a property of the job, not an admin escalation.
+    job = _make_eval_job(db_session, status="queued", priority="normal", meta={"dry_run": True})
+    with patch("selfai_ui.utils.gpu_queue._dispatch_eval_job_by_type", new_callable=AsyncMock) as mock_fn:
+        asyncio.run(_dispatch_dry_run_eval_jobs())
         mock_fn.assert_called_once()
         assert mock_fn.call_args[0][0].id == job.id
 

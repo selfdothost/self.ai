@@ -190,6 +190,46 @@ def test_fully_resolvable_preset_accepted_and_persisted(authenticated_user, test
 
 
 # ---------------------------------------------------------------------------
+# Builtin "web_search" tool_id — resolved by the live ENABLE_RAG_WEB_SEARCH
+# config flag, not the tool table (no tool row for it exists or ever will)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.tier0
+def test_web_search_tool_id_accepted_when_enabled(authenticated_user, test_app):
+    original = test_app.state.config.ENABLE_RAG_WEB_SEARCH
+    test_app.state.config.ENABLE_RAG_WEB_SEARCH = True
+    try:
+        fid = _make_folder(authenticated_user)
+        resp = authenticated_user.post(
+            f"/api/v1/folders/{fid}/update",
+            json={"name": "Preset Target", "tool_ids": ["web_search"]},
+        )
+        assert resp.status_code == 200
+        preset = authenticated_user.get(f"/api/v1/folders/{fid}").json()["meta"]["preset"]
+        assert preset["tool_ids"] == ["web_search"]
+    finally:
+        test_app.state.config.ENABLE_RAG_WEB_SEARCH = original
+
+
+@pytest.mark.tier0
+def test_web_search_tool_id_rejected_when_disabled(authenticated_user, test_app, db_session):
+    original = test_app.state.config.ENABLE_RAG_WEB_SEARCH
+    test_app.state.config.ENABLE_RAG_WEB_SEARCH = False
+    try:
+        fid = _make_folder(authenticated_user)
+        resp = authenticated_user.post(
+            f"/api/v1/folders/{fid}/update",
+            json={"name": "Preset Target", "tool_ids": ["web_search"]},
+        )
+        assert resp.status_code == 400
+        row = db_session.query(Folder).filter_by(id=fid).first()
+        assert (row.meta or {}).get("preset") is None
+    finally:
+        test_app.state.config.ENABLE_RAG_WEB_SEARCH = original
+
+
+# ---------------------------------------------------------------------------
 # R3 no-existence-leak — inaccessible rejected identically to nonexistent
 # ---------------------------------------------------------------------------
 

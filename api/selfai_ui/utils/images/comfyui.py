@@ -16,6 +16,12 @@ log.setLevel(SRC_LOG_LEVELS["COMFYUI"])
 
 default_headers = {"User-Agent": "Mozilla/5.0"}
 
+# Per-recv ceiling on the progress WebSocket. ComfyUI streams frequent messages
+# while sampling; the only long gap is a cold checkpoint load, so this is
+# generous. Without it a dropped connection (or, before the execution_error
+# handling below, a failed prompt) would block get_images forever.
+WS_RECV_TIMEOUT = 300
+
 
 def queue_prompt(prompt, client_id, base_url, api_key):
     log.info("queue_prompt")
@@ -68,25 +74,38 @@ def get_history(prompt_id, base_url, api_key):
 def get_images(ws, prompt, client_id, base_url, api_key):
     prompt_id = queue_prompt(prompt, client_id, base_url, api_key)["prompt_id"]
     output_images = []
+    ws.settimeout(WS_RECV_TIMEOUT)
     while True:
-        out = ws.recv()
-        if isinstance(out, str):
-            message = json.loads(out)
-            if message["type"] == "executing":
-                data = message["data"]
-                if data["node"] is None and data["prompt_id"] == prompt_id:
-                    break  # Execution is done
-        else:
+        try:
+            out = ws.recv()
+        except websocket.WebSocketTimeoutException:
+            log.error(f"ComfyUI: no progress within {WS_RECV_TIMEOUT}s for prompt {prompt_id}")
+            raise
+        if not isinstance(out, str):
             continue  # previews are binary data
+        message = json.loads(out)
+        mtype = message.get("type")
+        data = message.get("data", {})
+        # Only act on our own prompt (client_id is per-request, but be strict).
+        if mtype == "executing" and data.get("node") is None and data.get("prompt_id") == prompt_id:
+            break  # Execution is done
+        elif mtype == "execution_error" and data.get("prompt_id") == prompt_id:
+            # Upstream ComfyUI emits this on a failed graph — without handling it
+            # the loop would spin until WS_RECV_TIMEOUT instead of surfacing why.
+            msg = data.get("exception_message") or data.get("exception_type") or data
+            log.error(f"ComfyUI execution_error for prompt {prompt_id}: {data}")
+            raise RuntimeError(f"ComfyUI execution error: {msg}")
+        elif mtype == "execution_interrupted" and data.get("prompt_id") == prompt_id:
+            log.error(f"ComfyUI execution_interrupted for prompt {prompt_id}: {data}")
+            raise RuntimeError(f"ComfyUI execution interrupted for prompt {prompt_id}")
 
     history = get_history(prompt_id, base_url, api_key)[prompt_id]
-    for o in history["outputs"]:
-        for node_id in history["outputs"]:
-            node_output = history["outputs"][node_id]
-            if "images" in node_output:
-                for image in node_output["images"]:
-                    url = get_image_url(image["filename"], image["subfolder"], image["type"], base_url)
-                    output_images.append({"url": url})
+    for node_id in history["outputs"]:
+        node_output = history["outputs"][node_id]
+        if "images" in node_output:
+            for image in node_output["images"]:
+                url = get_image_url(image["filename"], image["subfolder"], image["type"], base_url)
+                output_images.append({"url": url})
     return {"data": output_images}
 
 

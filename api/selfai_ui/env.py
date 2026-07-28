@@ -77,6 +77,7 @@ if "cuda_error" in locals():
     log.exception(cuda_error)
 
 log_sources = [
+    "ANTHROPIC",
     "AUDIO",
     "COMFYUI",
     "CONFIG",
@@ -130,9 +131,20 @@ FROM_INIT_PY = os.environ.get("FROM_INIT_PY", "False").lower() == "true"
 if FROM_INIT_PY:
     PACKAGE_DATA = {"version": importlib.metadata.version("selfai-ui")}
 else:
-    try:
-        PACKAGE_DATA = json.loads((BASE_DIR / "package.json").read_text())
-    except Exception:
+    # Read the version from api/package.json, which is BACKEND_DIR in the image
+    # (the Dockerfile COPYs the api/ build context into /app/backend). The old
+    # BASE_DIR path was the repo root -- an Open-WebUI monolith holdover that is
+    # OUTSIDE the split API image's build context, so it never resolved and
+    # VERSION silently fell to 0.0.0 in every deployment. That made every mod's
+    # min_core_version (the contract examples use 0.5.0) fail the version gate.
+    # BASE_DIR is kept as a fallback for a monolith/combined layout.
+    for candidate in (BACKEND_DIR / "package.json", BASE_DIR / "package.json"):
+        try:
+            PACKAGE_DATA = json.loads(candidate.read_text())
+            break
+        except Exception:
+            continue
+    else:
         PACKAGE_DATA = {"version": "0.0.0"}
 
 
@@ -398,6 +410,62 @@ SERVICE_AUTH_SECRET = os.environ.get("SERVICE_AUTH_SECRET", "")
 # confirm the ticket came from self.ai specifically (defense alongside the
 # signature check, not instead of it).
 SERVICE_AUTH_ISSUER = os.environ.get("SERVICE_AUTH_ISSUER", "self.ai")
+# self.ai's own audience identity for tickets minted *toward* it by a peer
+# service (the inbound direction). Every other mesh backend validates tickets
+# against its own SERVICE_AUTH_AUDIENCE; when self.ai is itself the callee
+# (e.g. a consumer like self.llamolotl calling the VRAM lease broker), it
+# validates the `aud` claim against this. Defaults to "self.ai" — the same
+# identity string SERVICE_AUTH_ISSUER uses, since self.ai is both the mesh's
+# ticket-granting service and, for the broker, a ticket-consuming callee.
+SERVICE_AUTH_AUDIENCE = os.environ.get("SERVICE_AUTH_AUDIENCE", "self.ai")
+
+# --- GPU VRAM lease broker: config-driven self.llamolotl registration (R4) ---
+# self.llamolotl is the single known VRAM consumer this phase registers at
+# startup (cavekit-gpu-lease-broker R4/AC1 — manual/config-driven is acceptable
+# for one known instance; not required to be self-service/dynamic yet). Left
+# empty by default: an unset capacity means "unconfigured", so startup skips the
+# registration and logs it rather than crashing (self.ai must boot fine on
+# deployments with no llamolotl / no lease broker wired). Kept as the raw string
+# here and parsed defensively at use so a malformed value degrades to "skip",
+# never an import-time crash.
+LLAMOLOTL_VRAM_CAPACITY_BYTES = os.environ.get("LLAMOLOTL_VRAM_CAPACITY_BYTES", "")
+# Reclamation priority for self.llamolotl's lease (lower = asked to release
+# first when a later grant needs to reclaim). Integer, defaults to 0.
+LLAMOLOTL_VRAM_LEASE_PRIORITY = int(os.environ.get("LLAMOLOTL_VRAM_LEASE_PRIORITY", "0"))
+# R5 force-reap pod identity for self.llamolotl: the k8s namespace and a pod
+# selector (label selector like "app=self-llamolotl", or a Deployment name the
+# reaper resolves to pods) core uses to delete the pod when it goes stale and
+# won't cooperate with a release. Both blank by default = unconfigured = the
+# consumer is registered but never force-reap eligible (opt-in via config,
+# cavekit-gpu-lease-broker R5/AC7). Parsed defensively at registration
+# (blank -> None), mirroring the capacity/priority block above.
+LLAMOLOTL_K8S_NAMESPACE = os.environ.get("LLAMOLOTL_K8S_NAMESPACE", "")
+LLAMOLOTL_K8S_POD_SELECTOR = os.environ.get("LLAMOLOTL_K8S_POD_SELECTOR", "")
+
+# --- GPU VRAM lease broker: config-driven self.speak registration ---
+# self.speak is the broker's SECOND config-driven VRAM consumer (mirrors the
+# llamolotl block above; cavekit-vram-speak-consumer R1). Same discipline: kept
+# as the raw string and parsed defensively at use so a malformed value degrades
+# to "skip" rather than crashing at import; unset default "" means
+# "unconfigured" → startup skips the self.speak registration and logs it.
+SPEAK_VRAM_CAPACITY_BYTES = os.environ.get("SPEAK_VRAM_CAPACITY_BYTES", "")
+# Reclamation priority for self.speak's lease (lower = asked to release first).
+# Integer, defaults to 0; the manifest supplies 5 (below llamolotl's 10) so the
+# audio path yields before the inference brain.
+SPEAK_VRAM_LEASE_PRIORITY = int(os.environ.get("SPEAK_VRAM_LEASE_PRIORITY", "0"))
+
+# --- GPU VRAM lease broker: config-driven self.sketch registration ---
+# self.sketch (ComfyUI image generation) is the broker's THIRD config-driven VRAM
+# consumer (Color epic Phase 2b; same shape as the speak block above). Same
+# discipline: kept as the raw string and parsed defensively at use so a malformed
+# value degrades to "skip" rather than crashing at import; unset default "" means
+# "unconfigured" → startup skips the self.sketch registration and logs it.
+SKETCH_VRAM_CAPACITY_BYTES = os.environ.get("SKETCH_VRAM_CAPACITY_BYTES", "")
+# Reclamation priority for self.sketch's lease (lower = asked to release first).
+# Integer, defaults to 0; the manifest supplies 3 (below self.speak's 5, itself
+# below llamolotl's 10) so image generation — the most interruptible, bursty
+# workload — yields VRAM before both audio and the inference brain.
+SKETCH_VRAM_LEASE_PRIORITY = int(os.environ.get("SKETCH_VRAM_LEASE_PRIORITY", "0"))
 
 ENABLE_WEBSOCKET_SUPPORT = os.environ.get("ENABLE_WEBSOCKET_SUPPORT", "True").lower() == "true"
 

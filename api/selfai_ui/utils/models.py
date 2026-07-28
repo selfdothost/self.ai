@@ -11,7 +11,7 @@ from selfai_ui.env import GLOBAL_LOG_LEVEL, SRC_LOG_LEVELS
 from selfai_ui.functions import get_function_models
 from selfai_ui.models.functions import Functions
 from selfai_ui.models.models import Models
-from selfai_ui.routers import llamolotl, ollama, openai
+from selfai_ui.routers import anthropic, llamolotl, ollama, openai
 from selfai_ui.utils.access_control import has_access
 from selfai_ui.utils.plugin import load_function_module_by_id
 
@@ -25,6 +25,7 @@ async def get_all_base_models(request: Request):
     openai_models = []
     ollama_models = []
     llamolotl_models = []
+    anthropic_models = []
 
     if request.app.state.config.ENABLE_OPENAI_API:
         openai_models = await openai.get_all_models(request)
@@ -59,8 +60,12 @@ async def get_all_base_models(request: Request):
             for model in llamolotl_result.get("data", [])
         ]
 
+    if request.app.state.config.ENABLE_ANTHROPIC_API:
+        anthropic_result = await anthropic.get_all_models(request)
+        anthropic_models = anthropic_result.get("data", [])
+
     function_models = await get_function_models(request)
-    models = function_models + openai_models + ollama_models + llamolotl_models
+    models = function_models + openai_models + ollama_models + llamolotl_models + anthropic_models
 
     return models
 
