@@ -49,8 +49,11 @@ def test_connect_is_refused_without_a_token(monkeypatch):
     async def _run():
         from selfai_ui.socket import main as socket_main
 
-        result = await socket_main.connect("sid1", {}, None)
-        assert result is False, "a connection with no auth must be refused"
+        # Refusal is now a raise carrying a coded reason (self.ai#81) rather than
+        # a bare `return False`, so the client is told why it was dropped.
+        with pytest.raises(socket_main.SocketConnectionRefused) as exc:
+            await socket_main.connect("sid1", {}, None)
+        assert exc.value.error_args["data"]["code"] == "auth_required"
 
 
     asyncio.run(_run())
@@ -63,8 +66,9 @@ def test_connect_is_refused_with_an_invalid_token(monkeypatch):
         from selfai_ui.socket import main as socket_main
 
         monkeypatch.setattr(socket_main, "decode_token", lambda t: None)
-        result = await socket_main.connect("sid2", {}, {"token": "garbage"})
-        assert result is False
+        with pytest.raises(socket_main.SocketConnectionRefused) as exc:
+            await socket_main.connect("sid2", {}, {"token": "garbage"})
+        assert exc.value.error_args["data"]["code"] == "invalid_token"
 
 
     asyncio.run(_run())
@@ -362,9 +366,13 @@ def test_a_registered_mod_namespace_refuses_an_unauthenticated_connect(modmod):
         connect = core_sio.handlers["/authns"].get("connect")
         assert connect is not None, "the loader must install an auth connect handler"
 
-        # ...and it refuses a tokenless connect exactly like core's default.
-        refused = asyncio.run(connect("sid1", {}, None))
-        assert refused is False, "an unauthenticated connect to a mod namespace must be refused"
+        # ...and it refuses a credential-less connect exactly like core's
+        # default -- same raise, same coded reason.
+        from selfai_ui.socket.main import SocketConnectionRefused
+
+        with pytest.raises(SocketConnectionRefused) as exc:
+            asyncio.run(connect("sid1", {}, None))
+        assert exc.value.error_args["data"]["code"] == "auth_required"
     finally:
         core_sio.handlers.pop("/authns", None)
 

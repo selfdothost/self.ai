@@ -173,6 +173,16 @@ PINNED_REVISION_FILES = frozenset(
         "242a2047eae0_update_chat_table.py",
         "3781e22d8b01_update_message_table.py",
         "3ab32c4b8f59_update_tags.py",
+        # self.ai#134, the Studio permission rekey. Unrelated to ToolSpec and
+        # confirmed not to touch `tool.specs`: it reads and rewrites only the
+        # `permissions` JSON on the `group` table, moving a top-level
+        # `workspace` key to `studio`. Added per this pin's own instruction.
+        "3f7eff4c5814_rename_workspace_permission_to_studio.py",
+        # Phase 2 of the Tokenization Studio programme. Unrelated to ToolSpec
+        # and confirmed not to touch `tool.specs`: it is a single
+        # `op.add_column("chat", "kind")`, additive and nullable, on the `chat`
+        # table only. Added per this pin's own instruction.
+        "d6e7f8a9b0c1_add_chat_kind.py",
         "4ace53fd72c8_update_folder_table_datetime.py",
         "57c599a3cb57_add_channel_table.py",
         "6a39f3d8e55c_add_knowledge_table.py",
@@ -182,10 +192,13 @@ PINNED_REVISION_FILES = frozenset(
         "a1b2c3d4e5f6_add_training_tables.py",
         "a2b3c4d5e6f7_add_priority_to_jobs.py",
         "af906e964978_add_feedback_table.py",
+        "b1c2d3e4f5a6_add_vram_consumer_device_occupancy.py",
         "b2c3d4e5f6a7_add_eval_job_table.py",
         "b3c4d5e6f7a8_create_curator_job_table.py",
         "b7e1c0ffee42_add_mod_reference_handles_table.py",
         "c0fbf31ca0db_update_file_table.py",
+        "c1d2e3f4a5b6_add_voice_tables.py",
+        "c2d3e4f5a6b7_add_vram_consumer_reservation.py",
         "c29facfe716b_update_file_table_path.py",
         "c3d4e5f6a7b8_add_eval_type_to_eval_job.py",
         "c4d5e6f7a8b9_create_job_window_tables.py",
@@ -193,6 +206,18 @@ PINNED_REVISION_FILES = frozenset(
         "ca81bd47c050_add_config_table.py",
         "d4e5f6a7b8c9_add_scheduled_for_to_training_job.py",
         "d5e6f7a8b9c0_create_benchmark_config_table.py",
+        # Unrelated work (eval catalog, self.ai#90): renames/expands rows in
+        # benchmark_config so the seeded names match what the harnesses can
+        # actually schedule. Reads and writes benchmark_config only — no DDL,
+        # never touches tool.specs. Pinned per this test's own escape hatch.
+        "e1f2a3b4c5d6_reseed_benchmark_config_real_task_names.py",
+        # Unrelated work (eval catalog Phase 2, self.ai#91): creates only the
+        # custom_eval registry table, never touches tool.specs. Pinned per this
+        # test's own escape hatch.
+        "f2a3b4c5d6e7_add_custom_eval_table.py",
+        # self.ai#93 — creates the backup_job table. Unrelated to ToolSpec: it
+        # adds a new table and does not touch `tool` or `tool.specs`.
+        "f3a7c2d1e8b9_add_backup_job_table.py",
         # Unrelated work (GPU VRAM-lease broker): creates only the vram_consumer
         # table, never touches tool.specs. Pinned per this test's own escape hatch.
         "e7d2a9c1f3b0_add_vram_consumer_table.py",
@@ -205,8 +230,30 @@ PINNED_REVISION_FILES = frozenset(
         # Same broker, Decision 6 R4: adds loaded-model columns to vram_consumer
         # (eval-coexist datum), never touches tool.specs. Pinned per escape hatch.
         "a9b0c1d2e3f4_add_vram_consumer_loaded_model.py",
+        # Same broker, self.ai#105: adds the nullable last_observed_at column to
+        # vram_consumer (never-observed force-reap guard), never touches
+        # tool.specs. Pinned per escape hatch.
+        "d7e8f9a0b1c2_add_vram_consumer_last_observed_at.py",
         "e5f6a7b8c9d0_move_files_to_kb_subdirs.py",
         "f6a7b8c9d0e1_add_knowledge_file_table.py",
+        # Unrelated work (self.crew#141): creates only the crew mod's own
+        # mod_crew_sessions table, enablement-gated, never touches tool.specs.
+        # Pinned per this test's own escape hatch.
+        "d2e3f4a5b6c7_add_mod_crew_sessions_table.py",
+        # Unrelated work (self.ai#25): creates only the mcp_backend table for
+        # dynamic MCP front-door registration. New table, no ALTER of anything,
+        # never touches tool.specs. Pinned per this test's own escape hatch.
+        "c9d8e7f6a5b4_add_mcp_backend_table.py",
+        # Unrelated work (self.ai#131): creates only model_line and
+        # model_version for model versioning. Two new tables, no ALTER of
+        # anything — deliberately additive, not even to the `model` table it
+        # sits beside. Never touches tool.specs. Pinned per this test's own
+        # escape hatch.
+        "b4c5d6e7f8a9_add_model_line_and_version.py",
+        # Unrelated work (self.ai#131 R6): creates only the publish_job table.
+        # New table, no ALTER of anything, never touches tool.specs. Pinned per
+        # this test's own escape hatch.
+        "c5d6e7f8a9b0_add_publish_job.py",
     }
 )
 

@@ -61,9 +61,14 @@ async def get_user_permissisions(user=Depends(get_verified_user)):
 ############################
 # User Default Permissions
 ############################
-class WorkspacePermissions(BaseModel):
+class StudioPermissions(BaseModel):
+    # Renamed from WorkspacePermissions in Phase 0 of the Tokenization Studio
+    # programme. This is a BREAKING WIRE CHANGE on the admin default-permissions
+    # endpoint, consumed only by self.chat's Permissions.svelte, which renames in
+    # the same release.
+    #
     # extra="allow" throughout: the configured defaults carry keys these models
-    # do not declare (`workspace.training`, the whole `features` block), and
+    # do not declare (`studio.training`, the whole `features` block), and
     # mod scopes will add a `mods.<id>.*` namespace no model can ever declare
     # ahead of time. Forbidding extras made `model_dump()` drop them, and the
     # endpoint then wrote the truncated result back over the config -- an admin
@@ -89,7 +94,7 @@ class ChatPermissions(BaseModel):
 class UserPermissions(BaseModel):
     model_config = ConfigDict(extra="allow")
 
-    workspace: WorkspacePermissions
+    studio: StudioPermissions
     chat: ChatPermissions
 
 

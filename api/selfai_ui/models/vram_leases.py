@@ -33,6 +33,37 @@ explicit operator action that zeroes a confirmed-dead consumer's leftover
 lease (R1-AC7). Nothing else — no elapsed time, no staleness — ever frees a
 held amount automatically.
 
+Reservations vs measurements (self.ai#76)
+-----------------------------------------
+``held_bytes`` used to carry two irreconcilable meanings at once. Writer (4)
+above, ``record_grant``, wrote a PROMISE — VRAM core had just granted, before
+the consumer had allocated any of it — while ``heartbeat`` overwrote the same
+column with a MEASUREMENT of what the consumer actually holds. The poller runs
+every ``VRAM_POLL_INTERVAL_SECONDS`` (30s by default), so a grant issued to a
+consumer that had not finished loading was simply erased on the next cycle, and
+the next grant handed out the very same VRAM. That is the over-grant the broker
+exists to prevent, arriving through the broker's own bookkeeping.
+
+The promise now has its own column. ``held_bytes`` means ONLY "measured, as the
+consumer last self-reported"; ``reserved_bytes`` means "granted and not yet
+observed on the card". A consumer's effective holding is
+
+    max(held_bytes, reserved_bytes-if-still-live)
+
+which reads conservatively while the two disagree and collapses back to the
+measurement the moment the allocation lands and overtakes the promise. Nothing
+about the trust invariant changes: ``held_bytes`` still only ever comes from a
+consumer's own report, and ``reserved_bytes`` is core writing down a decision
+core itself made.
+
+A reservation is time-bounded (``RESERVATION_TTL_SECONDS``). A consumer that is
+granted VRAM and then dies before allocating must not hold capacity out of the
+pool forever, and no confirmation is ever coming to clear it — so, unlike a
+stale HELD (which is never auto-freed, R1-AC7), an unfulfilled reservation
+expires. The asymmetry is deliberate: a stale held is evidence of real VRAM
+nobody has proven released, while an expired reservation is a promise the
+consumer demonstrably never took up.
+
 Staleness (R1-AC5/AC6/AC7)
 --------------------------
 Staleness is derived lazily from ``last_reported_at`` against
@@ -40,6 +71,50 @@ Staleness is derived lazily from ``last_reported_at`` against
 value intact and a distinguishable ``stale`` effective-state — it is never
 coerced to "0 held" or dropped — and is excluded from ``eligible_holders()``
 (core cannot trust a release confirmation from an unreachable consumer).
+
+What ``held_bytes`` MEANS, and what it does not (self.ai#74)
+-----------------------------------------------------------
+``total_held()`` sums ``held_bytes`` across consumers, which is only sound if
+every consumer measures the SAME, DISJOINT thing about itself. self.ai#74 found
+they did not: self.llamolotl reported the WHOLE CARD's used memory (which
+already contains the other consumers' VRAM), while self.speak and self.sketch
+reported ``torch.cuda.memory_allocated()`` (their own tensor bytes only,
+excluding the reserved pool their own release path frees). The sum was a mix of
+overlapping and undercounted quantities.
+
+The contract is now ONE unit, stated here because four repos depend on it:
+
+    held_bytes = the device VRAM THIS consumer is holding that it would give
+                 back if asked to fully release — measured by the consumer
+                 about ITSELF, in bytes.
+
+For a torch consumer that is ``torch.cuda.memory_reserved()`` (exactly what
+``empty_cache()`` returns after an unload). It deliberately EXCLUDES the CUDA
+context, which an unload does not free — the context is real VRAM, but it is
+not *releasable*, so attributing it to a consumer's held would make the broker
+believe it can reclaim memory that will never come back.
+
+Per-process attribution from the driver was evaluated and rejected: the driver's
+per-process query does report VRAM per PID, but those PIDs are host-namespace and
+none of these pods share the host PID namespace, so a consumer cannot find its
+own row. Self-measurement is the only option available to all consumers.
+
+(Both are described rather than named: ``test_ac4_no_probe_path_in_module_source``
+greps this module for probe surfaces by substring, and that guard is worth more
+than the convenience of writing the tool names here — this registry must never
+probe. The commands and the in-cluster evidence are in the treasuremap,
+context/treasuremaps/2026-07-28-vram-held-unit.md in the Data repo.)
+
+That leaves a real gap the ledger cannot see: CUDA contexts, plus any process on
+the card that is not a registered lease consumer. The ``device_*`` columns close
+it. A consumer that can see the whole card reports it separately (NEVER as its
+own held), and ``record_device_occupancy`` records the derived
+``device_unattributed_bytes`` = card-used minus the ledger's total held at that
+instant. ``free_capacity()`` subtracts that overhead term as well as the held
+sum. Because the overhead moves only on a poll while the held sum moves
+immediately, a confirmed release still raises free capacity AT ONCE — which the
+R3 reclamation loop depends on (it re-reads ``free_capacity()`` each round and
+would stall for a poll interval if the card reading alone drove the number).
 """
 
 import enum
@@ -99,6 +174,15 @@ LEASE_MODE_EXCLUSIVE = LeaseMode.EXCLUSIVE.value
 # kit's spirit — override with VRAM_LEASE_STALE_THRESHOLD_SECONDS.
 STALE_THRESHOLD_SECONDS = int(os.environ.get("VRAM_LEASE_STALE_THRESHOLD_SECONDS", 120))
 
+# How long a granted-but-unobserved reservation keeps counting against capacity
+# (self.ai#76). It has to comfortably exceed the time between a grant and the
+# consumer's VRAM actually showing up: an allocation plus at least one poll
+# cycle (VRAM_POLL_INTERVAL_SECONDS, 30s) so a fulfilled reservation is
+# superseded by measurement rather than by expiry. 120s covers a large model
+# load with room to spare. Too short re-opens the over-grant window this fixes;
+# too long strands capacity after a consumer dies mid-grant.
+RESERVATION_TTL_SECONDS = int(os.environ.get("VRAM_RESERVATION_TTL_SECONDS", 120))
+
 
 ####################
 # VramConsumer DB Schema
@@ -123,8 +207,20 @@ class VramConsumer(Base):
     lease_mode = Column(
         Text, default=LEASE_MODE_SHARED, server_default=LEASE_MODE_SHARED, nullable=False
     )
+    # self.ai#76: VRAM granted but not yet observed on the card. Kept OUT of
+    # held_bytes so the poller's measurement can never erase it (that erasure was
+    # the bug). reserved_at bounds its life — see RESERVATION_TTL_SECONDS.
+    reserved_bytes = Column(BigInteger)
+    reserved_at = Column(BigInteger)
     # Self-report / confirmed-release timestamp — the basis for staleness.
     last_reported_at = Column(BigInteger)
+    # self.ai#105: when a GENUINE consumer-originated observation last arrived —
+    # a heartbeat (what the R6 poller drives) or a confirmed release. Never
+    # written by register() or by a core-side grant, which is exactly what makes
+    # it different from last_reported_at above. NULL means "we have never once
+    # heard from this consumer", and the R5 force-reap gate refuses to act on
+    # that: it is a deployment gap, not a fault.
+    last_observed_at = Column(BigInteger)
     created_at = Column(BigInteger)
     updated_at = Column(BigInteger)
     # R5 force-reap pod identity (opt-in registration config, alongside
@@ -143,6 +239,20 @@ class VramConsumer(Base):
     # judge freshness via the same staleness bound the lease uses (T-019).
     loaded_model_id = Column(Text)
     loaded_model_reported_at = Column(BigInteger)
+    # self.ai#74: CARD-level occupancy as reported by this consumer — a DIFFERENT
+    # quantity from held_bytes and NEVER summed with it. `device_used_bytes` is
+    # the whole card's used VRAM (every process, lease consumer or not);
+    # `device_unattributed_bytes` is the derived gap (card-used minus the
+    # ledger's total held at the instant of the reading) that free_capacity()
+    # subtracts as overhead the per-consumer ledger cannot see. All nullable:
+    # NULL = this consumer never reported a card reading, which is both the
+    # pre-poll state and the permanent state for a consumer that does not
+    # implement the field — free_capacity() then falls back to pure ledger
+    # arithmetic, so old consumers keep working unchanged.
+    device_used_bytes = Column(BigInteger)
+    device_total_bytes = Column(BigInteger)
+    device_unattributed_bytes = Column(BigInteger)
+    device_reported_at = Column(BigInteger)
 
 
 ####################
@@ -161,7 +271,12 @@ class VramConsumerModel(BaseModel):
     # R1/Decision 6: exclusive-lease posture (an active exclusive holder blocks
     # all other grants; the ≤1 invariant is enforced by the broker).
     lease_mode: str = LEASE_MODE_SHARED
+    # self.ai#76: granted-but-not-yet-observed VRAM, separate from measured held.
+    reserved_bytes: Optional[int] = None
+    reserved_at: Optional[int] = None
     last_reported_at: Optional[int] = None
+    # self.ai#105: None = never once observed (see the column comment).
+    last_observed_at: Optional[int] = None
     created_at: Optional[int] = None
     updated_at: Optional[int] = None
     # R5 force-reap pod identity; both-None = not force-reap eligible (AC7).
@@ -171,6 +286,30 @@ class VramConsumerModel(BaseModel):
     # R6 poller) + when it was last reported, for the chat eval-coexist route.
     loaded_model_id: Optional[str] = None
     loaded_model_reported_at: Optional[int] = None
+    # self.ai#74 card-level occupancy (NOT this consumer's held; never summed).
+    device_used_bytes: Optional[int] = None
+    device_total_bytes: Optional[int] = None
+    device_unattributed_bytes: Optional[int] = None
+    device_reported_at: Optional[int] = None
+
+
+class DeviceOccupancy(BaseModel):
+    """A card-level VRAM reading relayed by one consumer (self.ai#74).
+
+    ``used_bytes``/``total_bytes`` are the whole card as the driver sees it —
+    every process, whether or not it is a registered lease consumer.
+    ``unattributed_bytes`` is the derived gap between that reading and the
+    ledger's ``total_held()`` at the instant it was recorded: CUDA contexts and
+    non-consumer processes, i.e. real VRAM no consumer can claim as its own
+    releasable held. ``reported_by``/``reported_at`` say which consumer supplied
+    it and when, so a caller can judge freshness the same way it judges a
+    lease."""
+
+    used_bytes: int
+    total_bytes: Optional[int] = None
+    unattributed_bytes: int = 0
+    reported_by: str
+    reported_at: int
 
 
 class VramConsumerStatus(VramConsumerModel):
@@ -196,6 +335,13 @@ class CapacitySummary(BaseModel):
     total_held_bytes: int
     free_bytes: int
     consumers: list[VramConsumerStatus] = []
+    # self.ai#74 observability: the card reading free_bytes was computed against,
+    # and the overhead term it subtracted. ``device_occupancy`` is None when no
+    # consumer has reported a fresh card reading — in which case free_bytes is
+    # the pure ledger arithmetic and ``unattributed_bytes`` is 0. Exposed so an
+    # operator can see WHY free is what it is (ledger-only vs card-corrected).
+    device_occupancy: Optional[DeviceOccupancy] = None
+    unattributed_bytes: int = 0
 
 
 ####################
@@ -210,6 +356,47 @@ def _is_stale(last_reported_at: Optional[int], now: Optional[int] = None) -> boo
         return True
     now = now if now is not None else int(time.time())
     return (now - last_reported_at) > STALE_THRESHOLD_SECONDS
+
+
+def _reservation_live(consumer, now: Optional[int] = None) -> bool:
+    """True while a consumer's reservation still counts against capacity
+    (self.ai#76). A reservation with no amount, or one older than
+    ``RESERVATION_TTL_SECONDS``, does not."""
+    reserved = getattr(consumer, "reserved_bytes", None) or 0
+    if reserved <= 0:
+        return False
+    reserved_at = getattr(consumer, "reserved_at", None)
+    if reserved_at is None:
+        return False
+    now = now if now is not None else int(time.time())
+    return (now - reserved_at) <= RESERVATION_TTL_SECONDS
+
+
+def _effective_held(consumer, now: Optional[int] = None) -> int:
+    """What a consumer is holding for capacity purposes (self.ai#76): the larger
+    of what it last MEASURED and what core has RESERVED for it but not yet seen.
+
+    ``max`` rather than a sum, deliberately — the reservation and the measurement
+    describe the SAME VRAM at two moments, so adding them would double-count a
+    grant the instant the consumer began allocating it. Taking the larger is the
+    conservative reading while they disagree, and it collapses to the measurement
+    as soon as the allocation lands and overtakes the promise."""
+    measured = getattr(consumer, "held_bytes", None) or 0
+    if not _reservation_live(consumer, now):
+        return measured
+    return max(measured, consumer.reserved_bytes or 0)
+
+
+def effective_held(consumer, now: Optional[int] = None) -> int:
+    """Public reading of :func:`_effective_held`, for callers outside this module
+    that need a single consumer's capacity-relevant hold — ``vram_admission``
+    sizes a model swap against llamolotl's own.
+
+    Deliberately a thin alias rather than a second implementation: the
+    max-not-sum rule above is the only definition of "what is this consumer
+    holding", and a caller that re-derived it would drift from
+    ``free_capacity()`` the first time #76's semantics moved."""
+    return _effective_held(consumer, now)
 
 
 def _effective_state(consumer, now: Optional[int] = None) -> str:
@@ -251,6 +438,15 @@ class VramLeasesTable:
                 # A fresh registration is proof of life -> clear any stale flag.
                 if row.lease_state == LEASE_STATE_STALE:
                     row.lease_state = LEASE_STATE_STEADY
+                # ...and proof of a NEW PROCESS, which cannot be mid-exclusive-
+                # window: whatever it had seized is gone with the old process
+                # (self.ai#78). Leaving lease_mode set meant a dead exclusive
+                # holder's flag survived, and re-activated the moment its pod came
+                # back and registered — denying every other consumer's grant with
+                # no window actually running, clearable only by hand. Staleness
+                # only MASKS an exclusive holder (active_exclusive_holder skips
+                # stale rows); nothing ever cleared it.
+                row.lease_mode = LEASE_MODE_SHARED
             else:
                 row = VramConsumer(
                     consumer_id=form.consumer_id,
@@ -288,7 +484,13 @@ class VramLeasesTable:
     def heartbeat(self, consumer_id: str, held_bytes: int) -> Optional[VramConsumerModel]:
         """Consumer self-report reconfirming its held amount. Updates
         held_bytes + last_reported_at and clears any stale marking (a
-        self-report is proof of life). AC4-legal held writer."""
+        self-report is proof of life). AC4-legal held writer.
+
+        Retires a FULFILLED reservation (self.ai#76): once the measurement
+        reaches what was reserved, the promise has been observed on the card and
+        keeping it would double-count. A reservation the measurement has not yet
+        caught up to is deliberately left alone — that is precisely the window
+        this column exists to protect, and clearing it here is the bug."""
         with get_db() as db:
             now = int(time.time())
             row = db.query(VramConsumer).filter_by(consumer_id=consumer_id).first()
@@ -296,7 +498,13 @@ class VramLeasesTable:
                 return None
             row.held_bytes = held_bytes
             row.last_reported_at = now
+            # A heartbeat is the consumer speaking for itself — the one thing
+            # registration is not (self.ai#105).
+            row.last_observed_at = now
             row.updated_at = now
+            if (row.reserved_bytes or 0) > 0 and held_bytes >= (row.reserved_bytes or 0):
+                row.reserved_bytes = None
+                row.reserved_at = None
             if row.lease_state == LEASE_STATE_STALE:
                 row.lease_state = LEASE_STATE_STEADY
             try:
@@ -328,7 +536,14 @@ class VramLeasesTable:
                 return None
             row.held_bytes = new_held_bytes
             row.last_reported_at = now
+            # The consumer answered us, which is observation in the same sense a
+            # heartbeat is (self.ai#105).
+            row.last_observed_at = now
             row.updated_at = now
+            # A consumer that has just RELEASED is not mid-allocation; whatever
+            # was reserved for it is moot (self.ai#76).
+            row.reserved_bytes = None
+            row.reserved_at = None
             row.lease_state = LEASE_STATE_STEADY
             try:
                 db.commit()
@@ -349,19 +564,29 @@ class VramLeasesTable:
         the requester holds that much more. (reconcile, the operator zero-out,
         is the only other held writer.)
 
-        Increments held_bytes by amount_bytes (a grant adds to any existing
-        hold), refreshes last_reported_at (the requester is actively talking to
-        core, which is proof of life), keeps the lease `steady`, and — when
-        ``priority`` is given — records the request's reclamation priority on the
-        row so a LATER grant asks this newly-minted holder to release in the
-        correct ascending-priority order. Returns None if the requester is not
-        registered (grants are only tracked for registered consumers)."""
+        Writes the granted amount to ``reserved_bytes`` — NOT ``held_bytes``
+        (self.ai#76). held_bytes is the consumer's own MEASUREMENT and is
+        overwritten wholesale by every poller heartbeat, so a grant recorded there
+        was erased within one poll cycle whenever the consumer had not finished
+        allocating yet, and the next grant re-handed-out the same VRAM. The
+        reservation lives in its own column, counts against capacity via
+        ``_effective_held``, and is superseded once the measurement overtakes it.
+
+        The reservation ACCUMULATES (``+=``) across grants, matching the old
+        held-increment semantics: two grants before either is observed reserve
+        both amounts. Also refreshes last_reported_at (the requester is actively
+        talking to core, which is proof of life), stamps reserved_at so the
+        reservation can age out, keeps the lease `steady`, and — when ``priority``
+        is given — records the request's reclamation priority so a LATER grant
+        asks this newly-minted holder to release in the correct ascending-priority
+        order. Returns None if the requester is not registered."""
         with get_db() as db:
             now = int(time.time())
             row = db.query(VramConsumer).filter_by(consumer_id=consumer_id).first()
             if not row:
                 return None
-            row.held_bytes = (row.held_bytes or 0) + amount_bytes
+            row.reserved_bytes = (row.reserved_bytes or 0) + amount_bytes
+            row.reserved_at = now
             if priority is not None:
                 row.priority = priority
             row.last_reported_at = now
@@ -593,6 +818,93 @@ class VramLeasesTable:
             row.loaded_model_reported_at = int(time.time())
             db.commit()
 
+    # ---- self.ai#74: card-level occupancy (NOT a held writer) ----
+
+    def record_device_occupancy(
+        self, consumer_id: str, used_bytes: int, total_bytes: Optional[int] = None
+    ) -> None:
+        """Relay a CARD-level VRAM reading from ``consumer_id`` (self.ai#74).
+
+        This is emphatically NOT a ``held_bytes`` writer and does not touch held,
+        lease_state, or last_reported_at — the trust invariant is untouched. It
+        records a different quantity: what the DRIVER says the whole card is
+        using, which includes CUDA contexts and processes that are not lease
+        consumers at all.
+
+        ``device_unattributed_bytes`` is derived HERE, at relay time, as
+        ``max(0, used_bytes - total_held())`` — the overhead the per-consumer
+        ledger cannot account for. Computing it now (rather than at read time) is
+        what lets ``free_capacity()`` stay responsive: the overhead term moves
+        only on a poll, while the held sum moves the instant a release is
+        confirmed, so a confirmed release raises free capacity immediately
+        instead of waiting a poll interval for the card reading to catch up.
+
+        A no-op for an unregistered consumer. Never raises."""
+        with get_db() as db:
+            row = db.query(VramConsumer).filter_by(consumer_id=consumer_id).first()
+            if row is None:
+                return
+            rows = db.query(VramConsumer).all()
+            # MEASURED held only (self.ai#76): the overhead term is the gap
+            # between what the card reports and what consumers have been OBSERVED
+            # holding. A reservation is not on the card yet, so counting it here
+            # would understate real overhead and inflate free capacity.
+            held_now = sum(r.held_bytes or 0 for r in rows)
+            row.device_used_bytes = used_bytes
+            row.device_total_bytes = total_bytes
+            row.device_unattributed_bytes = max(0, used_bytes - held_now)
+            row.device_reported_at = int(time.time())
+            try:
+                db.commit()
+            except Exception as e:
+                log.exception(e)
+
+    def device_occupancy(self) -> Optional[DeviceOccupancy]:
+        """The freshest card-level reading that is still within the staleness
+        bound, or ``None`` if no consumer has reported one recently (self.ai#74).
+
+        Judged on ``device_reported_at`` — its OWN timestamp, deliberately not
+        the consumer's ``last_reported_at``: a consumer can be alive and
+        heartbeating while its card reading is old, and an overhead figure is
+        only safe to subtract while it is current. When several consumers report,
+        the most recent wins; they are all measuring the same physical card, so
+        the newest reading is simply the best one."""
+        with get_db() as db:
+            now = int(time.time())
+            rows = (
+                db.query(VramConsumer)
+                .filter(VramConsumer.device_reported_at.isnot(None))
+                .all()
+            )
+            fresh = [
+                r
+                for r in rows
+                if r.device_used_bytes is not None
+                and (now - (r.device_reported_at or 0)) <= STALE_THRESHOLD_SECONDS
+            ]
+            if not fresh:
+                return None
+            best = max(fresh, key=lambda r: r.device_reported_at or 0)
+            return DeviceOccupancy(
+                used_bytes=int(best.device_used_bytes or 0),
+                total_bytes=(
+                    int(best.device_total_bytes)
+                    if best.device_total_bytes is not None
+                    else None
+                ),
+                unattributed_bytes=int(best.device_unattributed_bytes or 0),
+                reported_by=best.consumer_id,
+                reported_at=int(best.device_reported_at or 0),
+            )
+
+    def unattributed_overhead(self) -> int:
+        """VRAM in use on the card that no consumer claims as its own held
+        (self.ai#74): CUDA contexts plus any non-consumer process. 0 when no
+        fresh card reading exists — the honest default, since an unmeasured
+        overhead must not be invented."""
+        occ = self.device_occupancy()
+        return occ.unattributed_bytes if occ is not None else 0
+
     # ---- R1-AC7: explicit operator reconciliation (the ONLY auto-free path) ----
 
     def reconcile(self, consumer_id: str) -> Optional[VramConsumerModel]:
@@ -607,6 +919,11 @@ class VramLeasesTable:
             if not row:
                 return None
             row.held_bytes = 0
+            row.reserved_bytes = None
+            row.reserved_at = None
+            # An operator asserting the consumer is dead is also asserting it
+            # holds no exclusive window (self.ai#78).
+            row.lease_mode = LEASE_MODE_SHARED
             row.lease_state = LEASE_STATE_STEADY
             row.updated_at = now
             try:
@@ -639,6 +956,11 @@ class VramLeasesTable:
             if not row:
                 return None
             row.held_bytes = 0
+            row.reserved_bytes = None
+            row.reserved_at = None
+            # Its pod is confirmed gone, so it holds no exclusive window either
+            # (self.ai#78).
+            row.lease_mode = LEASE_MODE_SHARED
             row.lease_state = LEASE_STATE_STEADY
             row.updated_at = now
             try:
@@ -656,8 +978,27 @@ class VramLeasesTable:
     # ---- R1-AC3: capacity queries (read-only, never write held) ----
 
     def total_held(self) -> int:
-        """Sum of held_bytes across all consumers (stale ones included — a stale
-        consumer's held is never auto-freed, so it still counts as held)."""
+        """Sum of EFFECTIVE held across all consumers — measured, or a live
+        reservation where that is larger (self.ai#76). Stale consumers included:
+        a stale consumer's held is never auto-freed, so it still counts.
+
+        This is the number capacity decisions are made against, so it is the one
+        that must never under-report. A reservation that has not yet shown up on
+        the card is still VRAM core has promised away."""
+        with get_db() as db:
+            now = int(time.time())
+            rows = db.query(VramConsumer).all()
+            return sum(_effective_held(r, now) for r in rows)
+
+    def total_measured_held(self) -> int:
+        """Sum of MEASURED held only, ignoring reservations (self.ai#76).
+
+        Used for the card-occupancy reconciliation in
+        ``record_device_occupancy``: unattributed overhead is the gap between
+        what the DEVICE reports in use and what consumers have actually been
+        observed holding. Counting a not-yet-allocated reservation there would
+        shrink the overhead term by VRAM that is not on the card yet, and free
+        capacity would drift upward — the wrong direction."""
         with get_db() as db:
             rows = db.query(VramConsumer).all()
             return sum(r.held_bytes or 0 for r in rows)
@@ -676,9 +1017,24 @@ class VramLeasesTable:
             return max((r.total_capacity_bytes or 0 for r in rows), default=0)
 
     def free_capacity(self) -> int:
-        """Free = known total capacity − total held. The number R3's grant
-        decision reads. Never negative."""
-        return max(0, self.total_capacity() - self.total_held())
+        """Free = total capacity − total held − unattributed overhead. The number
+        R3's grant decision reads. Never negative.
+
+        The overhead term (self.ai#74) is VRAM the card is genuinely using that
+        no consumer reports as its own releasable held — CUDA contexts, and any
+        process that is not a registered consumer. Without it, free was computed
+        purely from the ledger and therefore counted that memory as grantable.
+        It is 0 whenever no consumer has reported a fresh card reading, so this
+        degrades exactly to the previous arithmetic rather than guessing.
+
+        Note the asymmetry, which is deliberate: the held sum updates the instant
+        a release is confirmed, while the overhead updates only on a poll. That
+        is what keeps R3's reclamation loop responsive — it re-reads this each
+        round and must see a confirmed release immediately."""
+        return max(
+            0,
+            self.total_capacity() - self.total_held() - self.unattributed_overhead(),
+        )
 
     def capacity_summary(self) -> CapacitySummary:
         """Total capacity, total held, free, plus a per-consumer breakdown with
@@ -687,7 +1043,7 @@ class VramLeasesTable:
             now = int(time.time())
             rows = db.query(VramConsumer).order_by(VramConsumer.consumer_id.asc()).all()
             total_cap = max((r.total_capacity_bytes or 0 for r in rows), default=0)
-            held = sum(r.held_bytes or 0 for r in rows)
+            held = sum(_effective_held(r, now) for r in rows)
             consumers = []
             for r in rows:
                 base = VramConsumerModel.model_validate(r).model_dump()
@@ -698,12 +1054,19 @@ class VramLeasesTable:
                         is_stale=_is_stale(r.last_reported_at, now),
                     )
                 )
-            return CapacitySummary(
-                total_capacity_bytes=total_cap,
-                total_held_bytes=held,
-                free_bytes=max(0, total_cap - held),
-                consumers=consumers,
-            )
+        # Outside the session above: device_occupancy() opens its own. The
+        # overhead is subtracted here for the same reason free_capacity() does
+        # it, so the operator view and the grant decision never disagree.
+        occ = self.device_occupancy()
+        overhead = occ.unattributed_bytes if occ is not None else 0
+        return CapacitySummary(
+            total_capacity_bytes=total_cap,
+            total_held_bytes=held,
+            free_bytes=max(0, total_cap - held - overhead),
+            consumers=consumers,
+            device_occupancy=occ,
+            unattributed_bytes=overhead,
+        )
 
 
 VramLeases = VramLeasesTable()

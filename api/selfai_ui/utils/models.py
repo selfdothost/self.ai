@@ -13,6 +13,9 @@ from selfai_ui.models.functions import Functions
 from selfai_ui.models.models import Models
 from selfai_ui.routers import anthropic, llamolotl, ollama, openai
 from selfai_ui.utils.access_control import has_access
+from selfai_ui.utils.model_context import inherited_context_fields, upstream_context_fields
+from selfai_ui.utils.model_modalities import apply_derived_capabilities, architecture_fields
+from selfai_ui.utils.model_versions import attach_lines_to_models
 from selfai_ui.utils.plugin import load_function_module_by_id
 
 logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
@@ -30,6 +33,11 @@ async def get_all_base_models(request: Request):
     if request.app.state.config.ENABLE_OPENAI_API:
         openai_models = await openai.get_all_models(request)
         openai_models = openai_models["data"]
+        for model in openai_models:
+            # Gateways publish the served window under different names
+            # (OpenRouter's context_length, vLLM's max_model_len); normalize the
+            # unambiguous ones and leave the rest with no field (self.ai#87).
+            model.update(upstream_context_fields(model, model.get("openai")))
 
     if request.app.state.config.ENABLE_OLLAMA_API:
         ollama_models = await ollama.get_all_models(request)
@@ -41,6 +49,7 @@ async def get_all_base_models(request: Request):
                 "created": int(time.time()),
                 "owned_by": "ollama",
                 "ollama": model,
+                **upstream_context_fields(model),
             }
             for model in ollama_models["models"]
         ]
@@ -56,6 +65,11 @@ async def get_all_base_models(request: Request):
                 "owned_by": "llamolotl",
                 "llamolotl": model,
                 "status": model.get("status", "unloaded"),
+                **inherited_context_fields(model),
+                # Which modalities the model accepts, carried up from the
+                # transport so `capabilities.vision` can be derived from it
+                # below (self.ai#139).
+                **architecture_fields(model),
             }
             for model in llamolotl_result.get("data", [])
         ]
@@ -138,6 +152,15 @@ async def get_all_models(request):
             pipe = None
             action_ids = []
             base_status = None
+            # A workspace model is a prompt/params wrapper — it is served by the
+            # same backend process as its base, so it is served with the same
+            # window (self.ai#87).
+            base_context_fields = {}
+            # Same reasoning for modalities (self.ai#139): a prompt/params
+            # wrapper over a text-only base is still text-only, and leaving it
+            # undeclared puts it straight back on the client's "assume vision"
+            # default — the exact failure #139 is about.
+            base_architecture = {}
 
             for model in models:
                 if custom_model.base_model_id == model["id"] or custom_model.base_model_id == model["id"].split(":")[0]:
@@ -145,6 +168,8 @@ async def get_all_models(request):
                     if "pipe" in model:
                         pipe = model["pipe"]
                     base_status = model.get("status")
+                    base_context_fields = inherited_context_fields(model)
+                    base_architecture = architecture_fields(model)
                     break
 
             if custom_model.meta:
@@ -163,9 +188,23 @@ async def get_all_models(request):
                     "preset": True,
                     **({"pipe": pipe} if pipe is not None else {}),
                     **({"status": base_status} if base_status is not None else {}),
+                    **base_context_fields,
+                    **base_architecture,
                     "action_ids": action_ids,
                 }
             )
+
+    # Everything the backend already knew about a model but nothing ever read:
+    # `capabilities.vision` from `architecture.input_modalities` (self.ai#139).
+    # Runs AFTER the workspace-row merge above, because a row that names
+    # `vision` explicitly is an admin override and must survive this.
+    models = apply_derived_capabilities(models)
+
+    # A model line appears once, with its versions inside it (self.ai#131,
+    # Decision 10). Skipped entirely when self.corpus is off: the surface
+    # degrades to today's flat list rather than carrying empty scaffolding.
+    if request.app.state.config.ENABLE_SELF_CORPUS:
+        models = attach_lines_to_models(models)
 
     # Process action_ids to get the actions
     def get_action_items_from_module(function, module):

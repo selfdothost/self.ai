@@ -136,7 +136,11 @@ def test_ac1_request_carries_consumer_amount_and_priority(vram_db):
     # amount carried
     assert result.granted_bytes == 4 * GiB
     row = VramLeases.get("trainer")
-    assert row.held_bytes == 4 * GiB
+    # self.ai#76: a grant lands in reserved_bytes (the promise), not held_bytes
+    # (the consumer's own measurement, which the poller overwrites wholesale).
+    # The effective holding is the max of the two.
+    assert row.reserved_bytes == 4 * GiB
+    assert row.held_bytes == 0
     # priority carried — the request's priority (3), not the registration's (7),
     # is recorded on the row so a later grant reclaims it in the right order.
     assert result.priority == 3
@@ -180,8 +184,11 @@ def test_ac6_held_written_before_success_returns(vram_db):
     # By the time request_lease has returned success, the hold is already
     # committed to the registry (record_grant runs before the return).
     assert isinstance(result, LeaseGranted)
+    # The RESULT still reports the effective hold, so callers are unaffected...
     assert result.held_bytes == 6 * GiB
-    assert VramLeases.get("trainer").held_bytes == 6 * GiB
+    # ...but on the row it is a reservation until the consumer is observed
+    # holding it (self.ai#76).
+    assert VramLeases.get("trainer").reserved_bytes == 6 * GiB
     # Free capacity dropped by the granted amount.
     assert VramLeases.free_capacity() == CARD - 6 * GiB
 
@@ -215,7 +222,7 @@ def test_ac3_insufficient_free_asks_holders_ascending_priority(vram_db):
     asked_order = [c[0] for c in transport.calls]
     assert asked_order == ["holder.lo", "holder.hi"]
     # Grant landed only after the confirmed releases made room.
-    assert VramLeases.get("trainer").held_bytes == 18 * GiB
+    assert VramLeases.get("trainer").reserved_bytes == 18 * GiB
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +247,9 @@ def test_ac4_grant_relying_on_timed_out_release_does_not_succeed(vram_db):
     assert isinstance(result, LeaseDenied)
     # No phantom hold: the requester's held was never written.
     assert VramLeases.get("trainer").held_bytes == 0
+    # ...and no phantom RESERVATION either (self.ai#76) — otherwise the
+    # "no phantom hold on denial" guarantee would silently stop meaning anything.
+    assert not VramLeases.get("trainer").reserved_bytes
     # The holder's held is untouched and it is now stale (state unknown).
     holder = VramLeases.get("self.llamolotl")
     assert holder.held_bytes == 10 * GiB
@@ -290,6 +300,9 @@ def test_ac5_exhausted_denies_with_structured_reason_and_breakdown(vram_db):
     assert by_id["holder.b"].actually_released == 0
     # No phantom hold on denial.
     assert VramLeases.get("trainer").held_bytes == 0
+    # ...and no phantom RESERVATION either (self.ai#76) — otherwise the
+    # "no phantom hold on denial" guarantee would silently stop meaning anything.
+    assert not VramLeases.get("trainer").reserved_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +334,9 @@ def test_ac7_over_total_freeable_denied_regardless_of_priority(vram_db):
     assert transport.calls == []
     # No hold ever written to the requester across either attempt.
     assert VramLeases.get("trainer").held_bytes == 0
+    # ...and no phantom RESERVATION either (self.ai#76) — otherwise the
+    # "no phantom hold on denial" guarantee would silently stop meaning anything.
+    assert not VramLeases.get("trainer").reserved_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -381,7 +397,8 @@ def test_priority_gate_reclaims_only_strictly_lower(vram_db):
     # Only the strictly-lower holder was asked; the higher one never was.
     assert [c[0] for c in transport.calls] == ["lo"]
     assert VramLeases.get("hi").held_bytes == 8 * GiB  # untouched
-    assert VramLeases.get("mid").held_bytes == 12 * GiB
+    # The requester ("mid") holds a reservation, not a measurement (#76).
+    assert VramLeases.get("mid").reserved_bytes == 12 * GiB
 
 
 def test_priority_gate_equal_priority_peer_not_reclaimed(vram_db):

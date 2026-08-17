@@ -13,7 +13,10 @@ Read-at citations point into `api/selfai_ui/env.py` and `api/selfai_ui/config.py
 | Public base URL | `WEBUI_URL` | `http://localhost:3000` | config.py (`WEBUI_URL`) |
 | CORS origins | `CORS_ALLOW_ORIGIN` | empty (`[]`); `*` warns, not recommended | config.py (`CORS_ALLOW_ORIGIN`) |
 | Primary database | `DATABASE_URL` | `sqlite:///…/webui.db` (local) | env.py (`DATABASE_URL`) |
-| Vector store selector | `VECTOR_DB` | `chroma` (local) | config.py (`VECTOR_DB`) |
+| Data directory | `DATA_DIR` | `<backend>/data`; created at startup if missing, and write-probed | env.py (`DATA_DIR`) |
+| Vector store selector | `VECTOR_DB` | `sqlite-vec` (local, no extra service) | config.py (`VECTOR_DB`) |
+| sqlite-vec store path | `SQLITE_VEC_PATH` | `…/vector_db/sqlite_vec.db` | config.py (`SQLITE_VEC_PATH`) |
+| sqlite-vec vector width | `SQLITE_VEC_VECTOR_LENGTH` | `1536`; fixed once the store exists — changing it needs a re-index | config.py (`SQLITE_VEC_VECTOR_LENGTH`) |
 | pgvector DSN | `PGVECTOR_DB_URL` | falls back to `DATABASE_URL` | config.py (`PGVECTOR_DB_URL`) |
 | RAG embedding engine | `RAG_EMBEDDING_ENGINE` | empty (local model) — set `openai`/`ollama` on the API-only image | config.py (`RAG_EMBEDDING_ENGINE`) |
 | RAG embedding endpoint / key | `RAG_OPENAI_API_BASE_URL`, `RAG_OPENAI_API_KEY` | fall back to `OPENAI_API_*` | config.py (`RAG_OPENAI_API_*`) |

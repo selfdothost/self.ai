@@ -371,6 +371,45 @@ def resolve_collisions(pairs: list[tuple[str, dict]]) -> dict[str, dict]:
     return resolved
 
 
+def yield_names_to(tools: dict[str, dict], reserved: set[str]) -> dict[str, dict]:
+    """Qualify every tool in `tools` whose name is already claimed by `reserved`.
+
+    One-sided, and that is the whole point of it being separate from
+    `resolve_collisions`. That function qualifies EVERY holder of a shared name,
+    which is right when both holders are ours to rename. A caller-supplied tool
+    is not ours: the client dispatches the `tool_calls` we return against its own
+    registry, by name, so rewriting a client tool's name breaks the client with
+    no way for it to notice (self.ai#71). So `reserved` keeps its spelling bare
+    and our side yields, qualified by its owner through the same `collide_name`
+    a two-sided collision would use. Nothing is dropped, and a request carrying
+    no client tools passes through untouched.
+
+    Shallow-copies the tool dict for the same reason `resolve_collisions` does --
+    `callable` may be a `functools.partial` holding the live request.
+    """
+    if not reserved:
+        return tools
+
+    qualified: dict[str, dict] = {}
+    for name, tool in tools.items():
+        if name not in reserved:
+            qualified[name] = tool
+            continue
+        key = collide_name(tool.get("toolkit_id", "?"), name)
+        log.warning(
+            "tool name %r is claimed by a client-supplied tool on this request; "
+            "the server-side tool from %r is offered as %r instead",
+            name,
+            tool.get("toolkit_id", "?"),
+            key,
+        )
+        renamed = dict(tool)
+        if "spec" in renamed:
+            renamed["spec"] = _spec_renamed_to(renamed["spec"], key)
+        qualified[key] = renamed
+    return qualified
+
+
 def _spec_renamed_to(spec, key: str):
     """Return `spec` with its name set to `key`, whatever shape it arrives in.
 

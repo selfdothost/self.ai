@@ -96,7 +96,7 @@ there.
 | `PORT` | `8080` | Listen port (read by `api/start.sh`). |
 | `ENV` | `dev` | `dev` or `prod`. Also decides the default for secure session cookies. |
 | `CORS_ALLOW_ORIGIN` | empty | Semicolon-separated origins. `*` is accepted but logs a warning; only `http`/`https` schemes validate. |
-| `DATA_DIR` | `<backend>/data` | Uploads, caches, embedded vector store. |
+| `DATA_DIR` | `<backend>/data` | Uploads, caches, local vector store. Created at startup if missing, and checked for writability — a path that cannot be created or written to fails immediately with a message naming `DATA_DIR`, rather than surfacing later as a SQLite error. |
 | `GLOBAL_LOG_LEVEL` | `INFO` | Falls back to `INFO` on an unrecognised value. Per-source overrides exist as `<SOURCE>_LOG_LEVEL` (e.g. `RAG_LOG_LEVEL`). |
 | `SAFE_MODE` | `False` | Disables user-supplied functions/pipelines. |
 | `OFFLINE_MODE` | `false` | Sets `HF_HUB_OFFLINE=1`; disables model auto-update. |
@@ -111,10 +111,11 @@ there.
 | `DATABASE_POOL_MAX_OVERFLOW` | `0` | Extra connections above the pool size. |
 | `DATABASE_POOL_TIMEOUT` | `30` | Seconds to wait for a connection. |
 | `DATABASE_POOL_RECYCLE` | `3600` | Seconds before a connection is recycled. |
-| `VECTOR_DB` | `chroma` | One of `chroma`, `pgvector`, `milvus`, `qdrant`, `opensearch`. Environment-only. |
+| `VECTOR_DB` | `sqlite-vec` | One of `sqlite-vec`, `pgvector`, `milvus`, `qdrant`, `opensearch`. Environment-only. The `chroma` backend was removed; setting it now fails with an explanatory error rather than starting. |
 | `PGVECTOR_DB_URL` | falls back to `DATABASE_URL` | DSN for the pgvector store. |
 | `PGVECTOR_INITIALIZE_MAX_VECTOR_LENGTH` | `1536` | Column width created for embeddings. |
-| `CHROMA_HTTP_HOST` | empty | Set to use a remote Chroma server instead of the embedded one. |
+| `SQLITE_VEC_PATH` | `<DATA_DIR>/vector_db/sqlite_vec.db` | Where the sqlite-vec store file lives. |
+| `SQLITE_VEC_VECTOR_LENGTH` | `1536` | Vector width, fixed once the store is created. Shorter embeddings are zero-padded; changing it requires a re-index. |
 
 Other stores have their own variables: `QDRANT_URI`/`QDRANT_API_KEY`,
 `MILVUS_URI` (default `<DATA_DIR>/vector_db/milvus.db`), and `OPENSEARCH_URI`

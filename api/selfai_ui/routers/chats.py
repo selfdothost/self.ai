@@ -87,7 +87,11 @@ async def get_user_chat_list_by_user_id(
 @router.post("/new", response_model=Optional[ChatResponse])
 async def create_new_chat(form_data: ChatForm, user=Depends(get_verified_user)):
     try:
-        chat = Chats.insert_new_chat(user.id, form_data)
+        # `kind` names the surface that owns the conversation and is what keeps a
+        # tokenization session out of the chat sidebar (and vice versa). None --
+        # every request the chat client sends -- is ordinary chat, so this is not
+        # a behavioural change for that path.
+        chat = Chats.insert_new_chat(user.id, form_data, kind=form_data.kind)
         return ChatResponse(**chat.model_dump())
     except Exception as e:
         log.exception(e)

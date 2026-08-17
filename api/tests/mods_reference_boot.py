@@ -138,7 +138,8 @@ def ensure_reference_table(engine) -> None:
     Patches `config.ENABLED_MODS.value` (not the env var) for the duration of the
     upgrade, because the migration reads enablement from the already-imported
     `selfai_ui.config` module, not from the environment, once config is loaded
-    (`b7e1c0ffee42.py:_enabled_mods`).
+    (`migrations/util.py:enabled_mods` -- shared by every mod-owned revision
+    since self.ai#85 P0; it used to be a copy inside each one).
     """
     if _reference_table_name() in sa_inspect(engine).get_table_names():
         return

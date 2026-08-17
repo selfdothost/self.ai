@@ -18,11 +18,15 @@ from fastapi import (
     UploadFile,
     status,
 )
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
-from pydub import AudioSegment
-from pydub.utils import mediainfo
 
+from selfai_ui.audio.craft_voice import (
+    craft_voice_uuid,
+    is_craft_voice,
+    resolve_blend_recipe,
+    synthesize_via_speak,
+)
 from selfai_ui.config import (
     CACHE_DIR,
     WHISPER_MODEL_AUTO_UPDATE,
@@ -33,6 +37,15 @@ from selfai_ui.env import (
     DEVICE_TYPE,
     ENABLE_FORWARD_USER_INFO_HEADERS,
     SRC_LOG_LEVELS,
+)
+from selfai_ui.models.voices import Voices
+from selfai_ui.utils.access_control import has_access
+from selfai_ui.utils.audio_ffmpeg import (
+    compress_to_opus,
+    probe_audio_stream,
+)
+from selfai_ui.utils.audio_ffmpeg import (
+    convert_mp4_to_wav as ffmpeg_convert_mp4_to_wav,
 )
 from selfai_ui.utils.auth import get_admin_user, get_verified_user
 from selfai_ui.utils.service_auth import (
@@ -100,7 +113,7 @@ def is_mp4_audio(file_path):
         print(f"File not found: {file_path}")
         return False
 
-    info = mediainfo(file_path)
+    info = probe_audio_stream(file_path)
     if info.get("codec_name") == "aac" and info.get("codec_type") == "audio" and info.get("codec_tag_string") == "mp4a":
         return True
     return False
@@ -108,9 +121,8 @@ def is_mp4_audio(file_path):
 
 def convert_mp4_to_wav(file_path, output_path):
     """Convert MP4 audio file to WAV format."""
-    audio = AudioSegment.from_file(file_path, format="mp4")
-    audio.export(output_path, format="wav")
-    print(f"Converted {file_path} to {output_path}")
+    ffmpeg_convert_mp4_to_wav(file_path, output_path)
+    log.debug("Converted %s to %s", file_path, output_path)
 
 
 class FasterWhisperUnavailable(RuntimeError):
@@ -296,6 +308,43 @@ async def speech(request: Request, user=Depends(get_verified_user)):
     except Exception as e:
         log.exception(e)
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    # Crafted (Workshop) voice: a ``craft:<uuid>`` voice — e.g. a Workspace Model's
+    # attached voice — is reference-based, so it bypasses the engine proxies below
+    # and synthesises through self.speak's Chatterbox blend/clone. Runs regardless
+    # of TTS_ENGINE (the crafted voice IS the engine choice for this request).
+    if is_craft_voice((payload or {}).get("voice")):
+        voice = Voices.get_voice_by_id(id=craft_voice_uuid(payload["voice"]))
+        if not voice:
+            raise HTTPException(status_code=404, detail="Voice not found.")
+        if not (
+            user.role == "admin"
+            or voice.user_id == user.id
+            or has_access(user.id, "read", voice.access_control)
+        ):
+            raise HTTPException(status_code=403, detail="You do not have access to this voice.")
+        text = (payload.get("input") or "").strip()
+        if not text:
+            raise HTTPException(status_code=400, detail="No text to synthesize.")
+        references = resolve_blend_recipe(voice)
+        if not references:
+            raise HTTPException(
+                status_code=400,
+                detail="Add a sample to this voice before using it in chat.",
+            )
+        audio_bytes, _media_type = await synthesize_via_speak(
+            request, references, text, response_format="mp3"
+        )
+        # Cache like the engine paths (key already includes the request body/voice).
+        try:
+            async with aiofiles.open(file_path, "wb") as f:
+                await f.write(audio_bytes)
+            async with aiofiles.open(file_body_path, "w") as f:
+                await f.write(json.dumps(payload))
+        except Exception as e:
+            log.warning("speech: could not cache crafted-voice audio (%r)", e)
+            return Response(content=audio_bytes, media_type="audio/mpeg")
+        return FileResponse(file_path)
 
     if request.app.state.config.TTS_ENGINE == "openai":
         payload["model"] = request.app.state.config.TTS_MODEL
@@ -586,10 +635,14 @@ def transcribe(request: Request, file_path):
 def compress_audio(file_path):
     if os.path.getsize(file_path) > MAX_FILE_SIZE:
         file_dir = os.path.dirname(file_path)
-        audio = AudioSegment.from_file(file_path)
-        audio = audio.set_frame_rate(16000).set_channels(1)  # Compress audio
-        compressed_path = f"{file_dir}/{id}_compressed.opus"
-        audio.export(compressed_path, format="opus", bitrate="32k")
+        # NOTE: this filename previously interpolated `{id}` -- the Python
+        # builtin, not a variable -- producing paths like
+        # "<built-in function id>_compressed.opus". Harmless only because the
+        # path is used immediately and never looked up again. Now derived from
+        # the source file, which is what was plainly intended.
+        stem = os.path.splitext(os.path.basename(file_path))[0]
+        compressed_path = f"{file_dir}/{stem}_compressed.opus"
+        compress_to_opus(file_path, compressed_path, sample_rate=16000, channels=1, bitrate="32k")
         log.debug(f"Compressed audio to {compressed_path}")
 
         if os.path.getsize(compressed_path) > MAX_FILE_SIZE:  # Still larger than MAX_FILE_SIZE after compression

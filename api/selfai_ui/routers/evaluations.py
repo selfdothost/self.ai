@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import re
+import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -808,6 +809,133 @@ async def get_lang_test_details(job_id: str, user=Depends(get_admin_user)):
 
 
 ############################
+# Task Discovery
+############################
+
+# Both harnesses have always served their own task list — self.code-eval at
+# GET /api/tasks (scope tasks:read) and self.language-eval likewise — and until
+# now nothing called either one. The client shipped a hardcoded array instead,
+# which drifted badly: 30 code + 14 language options against 23 MultiPL-E
+# languages and 13,418 vendored task YAMLs (self.ai#89).
+#
+# The harness caches its own discovery after the first call, but language-eval's
+# payload is large (TaskManager indexes every vendored YAML), so re-fetching it
+# on every picker open is wasteful. A short TTL is enough to make repeat opens
+# cheap while keeping a newly-added task from being hidden for long — which
+# matters once custom tasks become addable at runtime (self.ai#91).
+EVAL_TASKS_CACHE_TTL_SECONDS = 60
+
+# eval_type -> (fetched_at, payload)
+_eval_tasks_cache: dict[str, tuple[float, list[dict]]] = {}
+
+_EVAL_TASK_SOURCES = {
+    "code-eval": (CODE_EVAL_API_URL, CODE_EVAL_AUDIENCE),
+    "language-eval": (LANGUAGE_EVAL_API_URL, LANGUAGE_EVAL_AUDIENCE),
+}
+
+
+@router.get("/tasks")
+async def get_eval_tasks(eval_type: str = "code-eval", user=Depends(get_admin_user)):
+    """List the benchmarks the named harness can actually run.
+
+    Returns the harness's own `[{name, category}]` payload. The category is
+    included per item, so a caller can group without a second round trip —
+    which is why `/api/tasks/categories` is deliberately not proxied as well.
+
+    An unreachable or erroring harness raises rather than returning `[]`. An
+    empty list is a meaningful answer here — it means the harness discovered no
+    tasks, which is a real and previously-seen failure mode (a signal raised at
+    import time in a vendored metric emptied code-eval's registry). Collapsing
+    a transport failure into that same empty list would make an outage
+    indistinguishable from a broken harness.
+    """
+    return await fetch_harness_tasks(eval_type)
+
+
+async def fetch_harness_tasks(eval_type: str) -> list[dict]:
+    """Fetch (and cache) a harness's task list.
+
+    Extracted from the route so the custom-eval catalog can reuse it to reject a
+    registration that would shadow a built-in task name (self.ai#91). Raises the
+    same HTTPExceptions the route does — a caller that cannot reach the harness
+    must not conclude "no built-ins exist" and admit the shadowing name.
+    """
+    source = _EVAL_TASK_SOURCES.get(eval_type)
+    if source is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unknown eval_type '{eval_type}' (expected one of: {', '.join(_EVAL_TASK_SOURCES)})",
+        )
+    base_url, audience = source
+
+    cached = _eval_tasks_cache.get(eval_type)
+    if cached and (time.time() - cached[0]) < EVAL_TASKS_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                f"{base_url}/api/tasks",
+                headers={TICKET_HEADER: mint_service_ticket(audience, "tasks:read")},
+            )
+    except Exception as e:
+        log.warning(f"Failed to reach {eval_type} for task discovery: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Could not reach the {eval_type} harness to list its benchmarks.",
+        )
+
+    if resp.status_code != 200:
+        log.warning(f"{eval_type} task discovery returned HTTP {resp.status_code}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"The {eval_type} harness returned HTTP {resp.status_code} listing its benchmarks.",
+        )
+
+    tasks = _sanitize_value(resp.json())
+    _eval_tasks_cache[eval_type] = (time.time(), tasks)
+    return tasks
+
+
+@router.get("/languages")
+async def get_eval_languages(user=Depends(get_admin_user)):
+    """List code-eval's MultiPL-E languages: built-in plus registered.
+
+    code-eval only — language-eval has no equivalent concept. MultiPL-E's
+    language set became runtime-extensible in self.code-eval#6/#7, so the client
+    can no longer carry a static list: it drifted to 14 entries against 23
+    built-ins, and a language registered at runtime would never appear at all.
+
+    Fails closed for the same reason as `/tasks`: an unreachable harness raises
+    rather than returning an empty set. Here it matters more, not less — an
+    empty language list rendered as "no languages available" would look like a
+    deliberate answer, when `builtin` can never legitimately be empty.
+    """
+    base_url, audience = _EVAL_TASK_SOURCES["code-eval"]
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                f"{base_url}/api/languages",
+                headers={TICKET_HEADER: mint_service_ticket(audience, "tasks:read")},
+            )
+    except Exception as e:
+        log.warning(f"Failed to reach code-eval for language discovery: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Could not reach the code-eval harness to list its languages.",
+        )
+
+    if resp.status_code != 200:
+        log.warning(f"code-eval language discovery returned HTTP {resp.status_code}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"The code-eval harness returned HTTP {resp.status_code} listing its languages.",
+        )
+
+    return _sanitize_value(resp.json())
+
+
+############################
 # Evaluation Jobs
 ############################
 
@@ -826,7 +954,7 @@ async def create_eval_job(
     user=Depends(get_verified_user),
 ):
     if user.role != "admin" and not has_permission(
-        user.id, "workspace.evaluations", request.app.state.config.USER_PERMISSIONS
+        user.id, "studio.evaluations", request.app.state.config.USER_PERMISSIONS
     ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

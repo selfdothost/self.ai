@@ -60,6 +60,7 @@ from selfai_ui.env import SRC_LOG_LEVELS
 from selfai_ui.models.vram_leases import VramLeases
 from selfai_ui.utils.service_auth import TICKET_HEADER, mint_service_ticket
 from selfai_ui.utils.vram_broker import ReleaseOutcome, ReleaseResponse
+from selfai_ui.utils.vram_state_source import parse_device_occupancy
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS.get("MAIN", logging.INFO))
@@ -167,7 +168,11 @@ class LlamolotlReleaseTransport:
         return str(urls[0]).rstrip("/")
 
     async def request_release(
-        self, consumer_id: str, amount_bytes: int, timeout_seconds: float
+        self,
+        consumer_id: str,
+        amount_bytes: int,
+        timeout_seconds: float,
+        force: bool = False,
     ) -> ReleaseResponse:
         base = self._resolve_control_base()
         if base is None:
@@ -194,7 +199,17 @@ class LlamolotlReleaseTransport:
             return ReleaseResponse(outcome=ReleaseOutcome.TIMEOUT)
 
         endpoint = f"{base}{RELEASE_PATH}"
-        body = {"target_bytes": int(amount_bytes), "timeout_seconds": float(timeout_seconds)}
+        # ``force`` (admin e-stop) is threaded through for wire-contract symmetry
+        # with the other transports. Default False → the cooperative body is
+        # unchanged apart from the explicit ``force`` flag. NOTE the e-stop's
+        # llamolotl leg does NOT come through here — it invokes the unload-all
+        # models helper directly (routers/vram_leases.py); this passthrough keeps
+        # the transport uniform for any future forceful release routed via it.
+        body = {
+            "target_bytes": int(amount_bytes),
+            "timeout_seconds": float(timeout_seconds),
+            "force": bool(force),
+        }
 
         try:
             async with self._client_factory(timeout_seconds) as client:
@@ -444,6 +459,27 @@ class LlamolotlVramStateSource:
             self._parse_held(consumer_id, resp),
             self._parse_loaded_model(consumer_id, resp),
         )
+
+    async def read_full(self, consumer_id: str):
+        """ONE GET, every figure the poller relays: ``(held_bytes,
+        loaded_model_id, device_used_bytes, device_total_bytes)`` (self.ai#74).
+
+        The card-occupancy pair is a DIFFERENT quantity from ``held_bytes`` and
+        is never summed with it — see ``models/vram_leases.py``. self.llamolotl
+        is the consumer best placed to report it (it already shells out to
+        ``nvidia-smi``, which sees the whole device), but until it emits the
+        field these parse to ``None`` and the poller relays nothing, leaving
+        ``free_capacity()`` on its pure-ledger fallback."""
+        resp = await self._fetch_state(consumer_id)
+        if resp is None:
+            return (None, None, None, None)
+        held = self._parse_held(consumer_id, resp)
+        loaded = self._parse_loaded_model(consumer_id, resp)
+        try:
+            device_used, device_total = parse_device_occupancy(resp.json())
+        except Exception:
+            device_used, device_total = (None, None)
+        return (held, loaded, device_used, device_total)
 
     def _parse_held(self, consumer_id: str, resp) -> Optional[int]:
         """Defensively read the self-reported held figure from the reply. Any

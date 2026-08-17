@@ -231,9 +231,23 @@ class UsersTable:
             return None
 
     def update_user_oauth_sub_by_id(self, id: str, oauth_sub: str) -> Optional[UserModel]:
+        """Link a user row to an OIDC identity, stamping ``updated_at``.
+
+        The stamp is the audit trail for account linking (self.ai#113). ~45 crew
+        persona accounts are created programmatically and then merged onto their
+        OIDC identity on first Keycloak login; without this there is no record of
+        *when* — or whether — a given persona ever linked. ``created_at`` is when
+        the row was made and ``last_active_at`` moves on every request, so
+        neither answers "did this account merge, and when".
+
+        Deliberately NOT applied to the sibling updaters, which also leave
+        ``updated_at`` alone. That is not an oversight to sweep up: bumping it in
+        ``update_user_last_active_by_id`` would rewrite the column on every
+        request and destroy the very signal this adds.
+        """
         try:
             with get_db() as db:
-                db.query(User).filter_by(id=id).update({"oauth_sub": oauth_sub})
+                db.query(User).filter_by(id=id).update({"oauth_sub": oauth_sub, "updated_at": int(time.time())})
                 db.commit()
 
                 user = db.query(User).filter_by(id=id).first()

@@ -51,7 +51,15 @@ LLAMOLOTL_CONSUMER_ID = "self.llamolotl"
 # training + curator are VRAM-exclusive against inference (curator per G-CUR: it
 # loads its own curation models, can't share llama-server's); eval windows are
 # deliberately NOT here — eval coexists (the substitute branch).
-GPU_EXCLUSIVE_WINDOW_JOB_TYPES = frozenset({"training", "curator"})
+# `publish` joins these on a measurement, not a guess (self.ai#136): a publish
+# merge runs through llamolotl's pipeline, which loads the base at fp16 with
+# device_map="auto" (self.llamolotl api/merge_lora.py:51-52), so it holds
+# roughly the fp16 footprint of the base on the card. A resident chat model
+# routinely holds most of the rest of the 4090, so sharing would bet that the
+# sum fits on every publish, with an OOM inside llamolotl as the losing
+# outcome. Inference is locked out for the length of a merge — the same trade
+# curation already makes, for the same reason.
+GPU_EXCLUSIVE_WINDOW_JOB_TYPES = frozenset({"training", "curator", "publish"})
 
 
 def _active_exclusive_window_type() -> Optional[str]:

@@ -59,10 +59,25 @@ def run_migrations_offline() -> None:
 def run_migrations_online() -> None:
     """Run migrations in 'online' mode.
 
-    In this scenario we need to create an Engine
-    and associate a connection with the context.
+    Honours a caller-supplied connection via `config.attributes["connection"]`
+    — the standard Alembic recipe. Without it there is no way to migrate
+    anything but the live database, because `DB_URL` above overwrites
+    `sqlalchemy.url` unconditionally from the process-wide `DATABASE_URL`.
 
+    self.ai#93's restore needs exactly that: an archive taken at an older
+    revision is loaded into a throwaway staging schema at *that* revision and
+    then migrated forward to head, so the chain's own data migrations transform
+    the archived rows instead of the restore guessing at what they would have
+    done. Passing a connection keeps that per-call, rather than mutating
+    `DATABASE_URL` global state inside a serving process.
     """
+    connection = config.attributes.get("connection")
+    if connection is not None:
+        context.configure(connection=connection, target_metadata=target_metadata)
+        with context.begin_transaction():
+            context.run_migrations()
+        return
+
     connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",

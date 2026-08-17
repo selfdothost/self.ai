@@ -158,7 +158,9 @@ def test_release_exclusive_restores_normal_grants(vram_db):
 
     granted = asyncio.run(broker.request_lease("other", 4 * GiB))
     assert isinstance(granted, LeaseGranted)
-    assert VramLeases.get("other").held_bytes == 4 * GiB
+    # self.ai#76: the requester's new hold is a RESERVATION until the consumer
+    # is observed holding it; held_bytes stays the measurement.
+    assert VramLeases.get("other").reserved_bytes == 4 * GiB
 
 
 def test_acquire_fails_when_holder_cannot_be_cleared(vram_db):

@@ -47,7 +47,7 @@ async def get_prompt_list(user=Depends(get_verified_user)):
 @router.post("/create", response_model=Optional[PromptModel])
 async def create_new_prompt(request: Request, form_data: PromptForm, user=Depends(get_verified_user)):
     if user.role != "admin" and not has_permission(
-        user.id, "workspace.prompts", request.app.state.config.USER_PERMISSIONS
+        user.id, "studio.prompts", request.app.state.config.USER_PERMISSIONS
     ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

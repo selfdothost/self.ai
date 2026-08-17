@@ -121,7 +121,11 @@ class SketchReleaseTransport:
         return text.rstrip("/")
 
     async def request_release(
-        self, consumer_id: str, amount_bytes: int, timeout_seconds: float
+        self,
+        consumer_id: str,
+        amount_bytes: int,
+        timeout_seconds: float,
+        force: bool = False,
     ) -> ReleaseResponse:
         base = self._resolve_control_base()
         if base is None:
@@ -148,7 +152,15 @@ class SketchReleaseTransport:
             return ReleaseResponse(outcome=ReleaseOutcome.TIMEOUT)
 
         endpoint = f"{base}{RELEASE_PATH}"
-        body = {"target_bytes": int(amount_bytes), "timeout_seconds": float(timeout_seconds)}
+        # ``force`` (admin e-stop) is forwarded to self.sketch's shim, which maps
+        # a release onto ComfyUI ``/free`` (already forceful). Default False →
+        # the cooperative body is unchanged apart from the explicit ``force``
+        # flag the cooperative broker path never sets.
+        body = {
+            "target_bytes": int(amount_bytes),
+            "timeout_seconds": float(timeout_seconds),
+            "force": bool(force),
+        }
 
         try:
             async with self._client_factory(timeout_seconds) as client:

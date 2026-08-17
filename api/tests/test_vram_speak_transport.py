@@ -157,7 +157,12 @@ def test_released_status_maps_to_confirmed_with_new_held(monkeypatch):
     assert len(client.posted) == 1
     call = client.posted[0]
     assert call["url"] == f"http://self-speak:8880{RELEASE_PATH}"
-    assert call["json"] == {"target_bytes": 4 * GiB, "timeout_seconds": 1.0}
+    # Default (cooperative) release carries force=False explicitly.
+    assert call["json"] == {
+        "target_bytes": 4 * GiB,
+        "timeout_seconds": 1.0,
+        "force": False,
+    }
     # Ticket minted for the speak audience with system:write.
     assert minted == [("self.speak", RELEASE_SCOPE)]
 
@@ -458,11 +463,56 @@ def test_dispatcher_routes_speak_to_speak_transport(monkeypatch):
     assert speak_client.posted[0]["json"] == {
         "target_bytes": 512 * 1024 * 1024,
         "timeout_seconds": 2.0,
+        "force": False,
     }
     assert speak_minted == [("self.speak", RELEASE_SCOPE)]
     # The llamolotl transport must be completely untouched.
     assert llamolotl_client.posted == []
     assert ll_minted == []
+
+
+def test_force_true_is_forwarded_in_release_body(monkeypatch):
+    # Admin e-stop: force=True must appear in the POST body so self.speak skips
+    # its drain-wait and unloads both engines immediately.
+    client = FakeClient(
+        response=FakeResponse(200, {"status": "released", "freed_bytes": 4 * GiB})
+    )
+    minted = []
+    transport = _make_transport(
+        "http://self-speak:8880", {"self.speak": 10 * GiB}, client, monkeypatch, minted
+    )
+
+    resp = asyncio.run(
+        transport.request_release("self.speak", 4 * GiB, 1.0, force=True)
+    )
+
+    assert resp.outcome == ReleaseOutcome.CONFIRMED
+    assert client.posted[0]["json"] == {
+        "target_bytes": 4 * GiB,
+        "timeout_seconds": 1.0,
+        "force": True,
+    }
+
+
+def test_dispatcher_forwards_force_to_speak_transport(monkeypatch):
+    # The consumer-aware dispatcher must forward force through to the per-consumer
+    # transport (the e-stop calls the dispatcher, not each transport directly).
+    speak_client = FakeClient(
+        response=FakeResponse(200, {"status": "released", "freed_bytes": 1 * GiB})
+    )
+    llamolotl_client = FakeClient(
+        response=FakeResponse(200, {"status": "released", "freed_bytes": 4 * GiB})
+    )
+    speak_minted, ll_minted = [], []
+    dispatcher = _make_dispatcher(
+        monkeypatch, speak_client, llamolotl_client, speak_minted, ll_minted
+    )
+
+    asyncio.run(
+        dispatcher.request_release("self.speak", 1 * GiB, 2.0, force=True)
+    )
+
+    assert speak_client.posted[0]["json"]["force"] is True
 
 
 if __name__ == "__main__":  # pragma: no cover

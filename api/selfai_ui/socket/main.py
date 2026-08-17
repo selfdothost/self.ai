@@ -4,7 +4,13 @@ import sys
 import time
 
 import socketio
+from socketio.exceptions import ConnectionRefusedError as SocketConnectionRefused
 
+from selfai_ui.config import (
+    API_KEY_ALLOWED_ENDPOINTS,
+    ENABLE_API_KEY,
+    ENABLE_API_KEY_ENDPOINT_RESTRICTIONS,
+)
 from selfai_ui.env import (
     ENABLE_WEBSOCKET_SUPPORT,
     GLOBAL_LOG_LEVEL,
@@ -142,23 +148,109 @@ async def usage(sid, data):
     await sio.emit("usage", {"models": await get_models_in_use()})
 
 
+#: The path this Socket.IO server is mounted at (`app.mount("/ws", socket_app)`
+#: plus the `socketio_path` above). It is the allowlist entry an operator adds
+#: to API_KEY_ALLOWED_ENDPOINTS to permit API-key attach when endpoint
+#: restrictions are switched on -- see `resolve_socket_user`.
+SOCKET_PATH = "/ws/socket.io"
+
+#: What a caller must send to authenticate, quoted back on refusal.
+_CREDENTIAL_HINT = "send auth={'token': '<session jwt>'} or auth={'api_key': 'sk-...'}"
+
+
+def resolve_socket_user(auth):
+    """Resolve the user behind a Socket.IO `auth` payload.
+
+    Attach auth is not inference auth (self.ai#81): a crew captain Pod is cattle
+    -- a fresh Pod per session, a dozen-plus identities -- so it cannot depend on
+    a human signing in to paste a session JWT. It already carries an `sk-` API
+    key for inference, which mint can issue and rotate unattended, so that same
+    key is what it should be able to attach with. This accepts either credential:
+
+    - ``auth["api_key"]`` -- what crew-code sends when its `apiKey` field is set
+      (remote-attach.ts). Previously ignored outright, which is why the API-key
+      path was refused at connect.
+    - ``auth["token"]`` -- a session JWT (the browser path, unchanged), or an
+      ``sk-`` key, since a caller that only has one credential slot will put it
+      there. `decode_token` is a bare `jwt.decode`, so an `sk-` string reaching
+      it could only ever fail; routing it to the API-key path instead is strictly
+      more useful.
+
+    Returns ``(user, refusal)``. On success ``refusal`` is None; on failure
+    ``user`` is None and ``refusal`` is a ``(code, message)`` pair -- a stable
+    code to branch on and a sentence a human can act on. A bare rejection is
+    indistinguishable from a network fault or a wrong URL, which is most of the
+    debugging cost in a fleet.
+
+    API-key attach honours the same two switches the HTTP path does
+    (`utils/auth.get_current_user`): ENABLE_API_KEY, and -- because a socket the
+    allowlist cannot name would silently widen an operator's deliberate
+    narrowing -- API_KEY_ALLOWED_ENDPOINTS, matched against SOCKET_PATH. JWT
+    attach is unaffected by both, exactly as on HTTP.
+    """
+    if not auth:
+        return None, ("auth_required", f"no credential supplied: {_CREDENTIAL_HINT}")
+
+    api_key = auth.get("api_key")
+    token = auth.get("token")
+
+    if not api_key and isinstance(token, str) and token.startswith("sk-"):
+        api_key, token = token, None
+
+    if api_key:
+        if not ENABLE_API_KEY.value:
+            return None, (
+                "api_key_disabled",
+                "api key authentication is disabled on this server (ENABLE_API_KEY=False)",
+            )
+
+        if ENABLE_API_KEY_ENDPOINT_RESTRICTIONS.value:
+            allowed = [path.strip() for path in str(API_KEY_ALLOWED_ENDPOINTS.value).split(",")]
+            if SOCKET_PATH not in allowed:
+                return None, (
+                    "api_key_endpoint_restricted",
+                    f"api key authentication is not permitted for {SOCKET_PATH}; "
+                    f"add it to API_KEY_ALLOWED_ENDPOINTS to allow socket attach",
+                )
+
+        user = Users.get_user_by_api_key(api_key)
+        if user is None:
+            return None, ("invalid_api_key", "api key is not recognised")
+
+        Users.update_user_last_active_by_id(user.id)
+        return user, None
+
+    if not token:
+        return None, ("auth_required", f"no credential supplied: {_CREDENTIAL_HINT}")
+
+    data = decode_token(token)
+    if data is None or "id" not in data:
+        return None, ("invalid_token", "session token is invalid or has expired")
+
+    user = Users.get_user_by_id(data["id"])
+    if user is None:
+        return None, ("unknown_user", "token is well-formed but names no known user")
+
+    return user, None
+
+
 @sio.event
 async def connect(sid, environ, auth):
-    user = None
-    if auth and "token" in auth:
-        data = decode_token(auth["token"])
-        if data is not None and "id" in data:
-            user = Users.get_user_by_id(data["id"])
+    user, refusal = resolve_socket_user(auth)
 
-    # Refuse a connection that carries no valid token. Returning False is the
-    # documented rejection: with always_connect=True the server sends CONNECT
-    # then an immediate DISCONNECT and drops the session, so an anonymous or
-    # invalid-token client never reaches any event handler -- core's or a mod's.
-    # A mod that registers a namespace on this server therefore inherits this
-    # gate for free; that inheritance is the reason mods do not mount their own
+    # Refuse a connection that carries no valid credential. Raising socket.io's
+    # ConnectionRefusedError is the documented rejection and carries the reason:
+    # with always_connect=True the server sends CONNECT then an immediate
+    # DISCONNECT whose payload is the exception's error_args, so the client is
+    # told *why* rather than seeing a bare drop. An anonymous or invalid-
+    # credential client never reaches any event handler -- core's or a mod's. A
+    # mod that registers a namespace on this server therefore inherits this gate
+    # for free; that inheritance is the reason mods do not mount their own
     # websocket stacks (see the mods contract, Decision 2).
     if user is None:
-        return False
+        code, message = refusal
+        log.info("socket connect refused (sid=%s): %s -- %s", sid, code, message)
+        raise SocketConnectionRefused(message, {"code": code})
 
     await SESSION_POOL.aset(sid, user.model_dump())
     existing_sids = await USER_POOL.aget(user.id)
@@ -177,15 +269,12 @@ async def connect(sid, environ, auth):
 async def user_join(sid, data):
 
     auth = data["auth"] if "auth" in data else None
-    if not auth or "token" not in auth:
-        return
-
-    data = decode_token(auth["token"])
-    if data is None or "id" not in data:
-        return
-
-    user = Users.get_user_by_id(data["id"])
-    if not user:
+    user, refusal = resolve_socket_user(auth)
+    if user is None:
+        # An event handler has no refusal packet to raise, and the ack shape is
+        # the client's contract, so this stays a silent return -- but the reason
+        # is logged rather than lost.
+        log.info("socket user-join refused (sid=%s): %s -- %s", sid, *refusal)
         return
 
     await SESSION_POOL.aset(sid, user.model_dump())
@@ -210,15 +299,9 @@ async def user_join(sid, data):
 @sio.on("join-channels")
 async def join_channel(sid, data):
     auth = data["auth"] if "auth" in data else None
-    if not auth or "token" not in auth:
-        return
-
-    data = decode_token(auth["token"])
-    if data is None or "id" not in data:
-        return
-
-    user = Users.get_user_by_id(data["id"])
-    if not user:
+    user, refusal = resolve_socket_user(auth)
+    if user is None:
+        log.info("socket join-channels refused (sid=%s): %s -- %s", sid, *refusal)
         return
 
     # Join all the channels
@@ -415,9 +498,11 @@ def install_namespace_auth(namespace: str) -> None:
     any Engine.IO client could connect to a mod namespace the operator believed
     was gated.
 
-    This registers a `connect` handler on `namespace` that runs the same token
-    decode as the default namespace and returns False for an anonymous or
-    invalid-token client, so the mod's namespace is refused identically. The
+    This registers a `connect` handler on `namespace` that runs the same
+    credential resolution as the default namespace (`resolve_socket_user` --
+    session JWT or `sk-` API key) and refuses an anonymous or invalid-credential
+    client with the same coded reason, so the mod's namespace behaves identically
+    to core's: a mod gains API-key attach for free, and cannot drift. The
     authenticated sid is recorded into SESSION_POOL/USER_POOL under the same
     keys the default namespace uses, so `emit_to_user(namespace=...)` and a mod
     handler's `get_user_id_from_session_pool(sid)` both see the identity core
@@ -425,13 +510,11 @@ def install_namespace_auth(namespace: str) -> None:
     """
 
     async def _connect(sid, environ, auth):
-        user = None
-        if auth and "token" in auth:
-            data = decode_token(auth["token"])
-            if data is not None and "id" in data:
-                user = Users.get_user_by_id(data["id"])
+        user, refusal = resolve_socket_user(auth)
         if user is None:
-            return False
+            code, message = refusal
+            log.info("socket connect refused on %s (sid=%s): %s -- %s", namespace, sid, code, message)
+            raise SocketConnectionRefused(message, {"code": code})
         await SESSION_POOL.aset(sid, user.model_dump())
         existing = await USER_POOL.aget(user.id)
         await USER_POOL.aset(user.id, (existing or []) + [sid])

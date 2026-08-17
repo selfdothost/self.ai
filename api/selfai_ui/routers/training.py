@@ -199,7 +199,7 @@ async def create_course(
     user=Depends(get_verified_user),
 ):
     if user.role != "admin" and not has_permission(
-        user.id, "workspace.training", request.app.state.config.USER_PERMISSIONS
+        user.id, "studio.training", request.app.state.config.USER_PERMISSIONS
     ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

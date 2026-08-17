@@ -204,6 +204,40 @@ class CuratorJobTable:
             log.exception(e)
             raise
 
+    def requeue_for_next_window(self, id: str, reason: str) -> Optional[CuratorJobModel]:
+        """Put a stopped run back in the queue for the next curator window.
+
+        Used when an operator takes the GPU back — a VRAM e-stop, or a run that
+        overran its window (self.ai#88). Curation work is restartable and often
+        long, so the default is to keep it queued rather than make the admin
+        rebuild every pipeline by hand after clearing the card.
+
+        ``curator_job_id`` and ``curator_url_idx`` are CLEARED, which
+        ``update_job_status`` cannot do (it skips ``None`` fields). That matters:
+        the remote run was cancelled and self.curator's job records are per-run,
+        so leaving the old id attached would make the next sync poll a dead job
+        and immediately mark this one failed. Clearing them makes the next
+        dispatch start a fresh run from the same stored ``pipeline_config``.
+
+        ``scheduled_for`` is left alone: a job with a schedule goes back to
+        waiting for it, one without is picked up by the next window."""
+        try:
+            with get_db() as db:
+                db.query(CuratorJob).filter_by(id=id).update(
+                    {
+                        "status": "queued",
+                        "curator_job_id": None,
+                        "curator_url_idx": None,
+                        "error_message": str(reason),
+                        "updated_at": int(time.time()),
+                    }
+                )
+                db.commit()
+                return self.get_job_by_id(id=id)
+        except Exception as e:
+            log.exception(e)
+            return None
+
     def update_created_knowledge_id(self, id: str, knowledge_id: str) -> bool:
         """
         Update the created_knowledge_id of a CuratorJob.

@@ -468,3 +468,274 @@ def convert_payload_openai_to_anthropic(
             log.debug(f"Dropping {param}: no Anthropic equivalent")
 
     return payload
+
+
+##########################################
+#
+# Anthropic -> OpenAI (INBOUND: we are the provider)
+#
+# The mirror of everything above. The functions before this point translate a
+# request self.ai is *sending* to Anthropic; these translate a request an
+# Anthropic-native client is sending *to* self.ai, so it can be served from the
+# ordinary chat-completions path like any other request. Nothing here talks to
+# Anthropic -- the target may be a local llamolotl model.
+#
+##########################################
+
+# Anthropic request fields with no OpenAI equivalent. Dropped rather than
+# rejected: an Anthropic SDK sets several of these by default, and 400-ing a
+# request over a field we are simply not able to honor would make the endpoint
+# unusable with the very clients it exists for.
+ANTHROPIC_INBOUND_IGNORED_PARAMS = (
+    "metadata",
+    "thinking",
+    "output_config",
+    "container",
+    "mcp_servers",
+    "service_tier",
+    "betas",
+)
+
+
+def _openai_image_part(source: dict) -> dict | None:
+    """Anthropic image `source` -> OpenAI image_url part. Inverse of _anthropic_image_block."""
+    source_type = source.get("type")
+
+    if source_type == "base64":
+        data = source.get("data")
+        if not data:
+            return None
+        media_type = source.get("media_type") or "image/png"
+        return {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{data}"}}
+
+    if source_type == "url":
+        url = source.get("url")
+        return {"type": "image_url", "image_url": {"url": url}} if url else None
+
+    log.debug(f"Dropping image block with unsupported source type: {source_type}")
+    return None
+
+
+def _anthropic_system_text(system) -> str:
+    """Anthropic `system` (string or text-block list) -> one string.
+
+    Joined with a blank line, matching how convert_messages_openai_to_anthropic
+    splits a system prompt apart in the other direction.
+    """
+    if system is None:
+        return ""
+    if isinstance(system, str):
+        return system
+
+    parts = [
+        block.get("text") or ""
+        for block in system
+        if isinstance(block, dict) and block.get("type") == "text" and block.get("text")
+    ]
+    return "\n\n".join(parts)
+
+
+def _openai_tool_result_content(content) -> str:
+    """Anthropic tool_result `content` -> the string OpenAI's `tool` role expects."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    # A block list: keep the text, and serialize anything else rather than dropping
+    # it silently -- a tool that returned an image still returned *something*, and a
+    # model that sees nothing at all cannot tell a failed call from an empty one.
+    parts = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append(block)
+        elif isinstance(block, dict):
+            if block.get("type") == "text":
+                parts.append(block.get("text") or "")
+            else:
+                parts.append(json.dumps(block))
+    return "".join(parts)
+
+
+def convert_messages_anthropic_to_openai(messages: list[dict], system=None) -> list[dict]:
+    """
+    Fold an Anthropic (messages, system) pair into a single OpenAI messages array.
+
+    The three structural differences, each inverted:
+
+    * `system` is a top-level field on Anthropic and a leading message on OpenAI.
+    * `tool_result` blocks ride on a *user* turn in Anthropic; OpenAI wants each one
+      as its own `tool`-role message. A user turn carrying both tool results and
+      text therefore emits several messages -- the tool ones first, so the results
+      sit adjacent to the assistant turn that requested them.
+    * `tool_use` blocks are assistant content in Anthropic and a sibling
+      `tool_calls` array in OpenAI.
+
+    `thinking` blocks are dropped: they are the upstream model's reasoning, they are
+    not replayable to a different model, and echoing them back as visible content
+    would put reasoning text into the prompt as if the assistant had said it.
+    """
+    converted: list[dict] = []
+
+    if system_text := _anthropic_system_text(system):
+        converted.append({"role": "system", "content": system_text})
+
+    for message in messages or []:
+        role = message.get("role")
+        content = message.get("content")
+
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}] if content else []
+
+        if role == "assistant":
+            parts: list[dict] = []
+            tool_calls: list[dict] = []
+            for block in content or []:
+                block_type = block.get("type")
+                if block_type == "text":
+                    if text := block.get("text"):
+                        parts.append({"type": "text", "text": text})
+                elif block_type == "tool_use":
+                    tool_calls.append(
+                        {
+                            "id": block.get("id"),
+                            "type": "function",
+                            "function": {
+                                "name": block.get("name"),
+                                "arguments": json.dumps(block.get("input") or {}),
+                            },
+                        }
+                    )
+                elif block_type in ("thinking", "redacted_thinking"):
+                    continue
+                else:
+                    log.debug(f"Dropping unsupported assistant block type: {block_type}")
+
+            # OpenAI wants a plain string when the turn is text-only; the multipart
+            # form is only meaningful for user turns with images.
+            assistant: dict = {"role": "assistant", "content": "".join(p["text"] for p in parts) or None}
+            if tool_calls:
+                assistant["tool_calls"] = tool_calls
+            if assistant["content"] or tool_calls:
+                converted.append(assistant)
+            continue
+
+        # user (and anything unrecognized, treated as user)
+        tool_messages: list[dict] = []
+        parts = []
+        for block in content or []:
+            block_type = block.get("type")
+            if block_type == "text":
+                if text := block.get("text"):
+                    parts.append({"type": "text", "text": text})
+            elif block_type == "image":
+                if part := _openai_image_part(block.get("source") or {}):
+                    parts.append(part)
+            elif block_type == "tool_result":
+                tool_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": block.get("tool_use_id"),
+                        "content": _openai_tool_result_content(block.get("content")),
+                    }
+                )
+            else:
+                log.debug(f"Dropping unsupported user block type: {block_type}")
+
+        converted.extend(tool_messages)
+        if parts:
+            # Collapse to a bare string when there is nothing but text -- some
+            # backends behind this path only accept the simple form.
+            if all(part["type"] == "text" for part in parts):
+                converted.append({"role": "user", "content": "".join(p["text"] for p in parts)})
+            else:
+                converted.append({"role": "user", "content": parts})
+
+    return converted
+
+
+def convert_tools_anthropic_to_openai(tools: list[dict]) -> list[dict]:
+    """Flat Anthropic tool -> OpenAI ``{"type":"function","function":{...}}``.
+
+    Server-side tool entries (``{"type": "web_search_20260209", ...}``) are skipped:
+    they name capabilities that run on Anthropic's infrastructure, which self.ai
+    cannot execute on the client's behalf. Passing them through as function tools
+    would advertise a tool that can never return a result.
+    """
+    converted = []
+    for tool in tools or []:
+        name = tool.get("name")
+        if not name:
+            continue
+        if tool.get("type") and "input_schema" not in tool:
+            log.debug(f"Dropping server-side tool with no local implementation: {tool.get('type')}")
+            continue
+        converted.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": tool.get("description") or "",
+                    "parameters": tool.get("input_schema") or {"type": "object", "properties": {}},
+                },
+            }
+        )
+    return converted
+
+
+def convert_tool_choice_anthropic_to_openai(tool_choice):
+    """Inverse of convert_tool_choice_openai_to_anthropic."""
+    if not isinstance(tool_choice, dict):
+        return None
+
+    choice_type = tool_choice.get("type")
+    if choice_type == "auto":
+        return "auto"
+    if choice_type == "none":
+        return "none"
+    if choice_type == "any":
+        return "required"
+    if choice_type == "tool" and (name := tool_choice.get("name")):
+        return {"type": "function", "function": {"name": name}}
+    return None
+
+
+def convert_payload_anthropic_to_openai(anthropic_payload: dict) -> dict:
+    """
+    Convert an inbound Anthropic Messages request to an OpenAI chat-completions payload.
+
+    `max_tokens` is required on Anthropic and optional on OpenAI, so it always
+    carries across. `top_k` has no OpenAI equivalent and is dropped rather than
+    passed through under a name the downstream backend would ignore or reject.
+    """
+    payload: dict = {
+        "model": anthropic_payload.get("model"),
+        "messages": convert_messages_anthropic_to_openai(
+            anthropic_payload.get("messages") or [],
+            anthropic_payload.get("system"),
+        ),
+        "stream": bool(anthropic_payload.get("stream", False)),
+    }
+
+    if (max_tokens := anthropic_payload.get("max_tokens")) is not None:
+        payload["max_tokens"] = max_tokens
+
+    if tools := convert_tools_anthropic_to_openai(anthropic_payload.get("tools")):
+        payload["tools"] = tools
+        if (tool_choice := convert_tool_choice_anthropic_to_openai(anthropic_payload.get("tool_choice"))) is not None:
+            payload["tool_choice"] = tool_choice
+
+    if stop_sequences := anthropic_payload.get("stop_sequences"):
+        payload["stop"] = list(stop_sequences)
+
+    for param in ("temperature", "top_p"):
+        if (value := anthropic_payload.get(param)) is not None:
+            payload[param] = value
+
+    if anthropic_payload.get("top_k") is not None:
+        log.debug("Dropping top_k: no OpenAI chat-completions equivalent")
+
+    for param in ANTHROPIC_INBOUND_IGNORED_PARAMS:
+        if param in anthropic_payload:
+            log.debug(f"Ignoring inbound Anthropic field with no OpenAI equivalent: {param}")
+
+    return payload

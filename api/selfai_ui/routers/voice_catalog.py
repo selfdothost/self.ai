@@ -61,6 +61,7 @@ from selfai_ui.audio.connections import (
     AudioConnectionType,
     connection_display_label,
 )
+from selfai_ui.audio.craft_voice import CRAFT_PREFIX
 from selfai_ui.audio.voice_catalog import (
     aggregate_voice_catalogs,
     build_voice_catalog,
@@ -74,6 +75,7 @@ from selfai_ui.env import (
     AIOHTTP_CLIENT_TIMEOUT_OPENAI_MODEL_LIST,
     SRC_LOG_LEVELS,
 )
+from selfai_ui.models.voices import Voices
 from selfai_ui.utils.auth import get_admin_user, get_verified_user
 
 log = logging.getLogger(__name__)
@@ -356,7 +358,22 @@ async def list_selectable_voices(request: Request, user=Depends(get_verified_use
     management action — the same posture as the transcribe ``GET /models/selectable``.
     """
     catalog = await _aggregate_catalog(request)
-    return filter_enabled_voices(catalog, _enabled_map(request))
+    result = filter_enabled_voices(catalog, _enabled_map(request))
+
+    # Append the user's crafted Workshop voices (owner + read-shared) as selectable
+    # TTS voices, namespaced ``craft:<id>`` so the /speech router routes them to
+    # Chatterbox. These are the USER's own voices, not admin-curated engine voices,
+    # so they bypass the AUDIO_TTS_ENABLED_VOICES enablement gate above. Lets a
+    # crafted/blended voice be attached to a Workspace Model and spoken in chat.
+    try:
+        for v in Voices.get_voices_by_user_id(user.id, "read"):
+            result["voices"].append(
+                {"id": f"{CRAFT_PREFIX}{v.id}", "name": v.name, "source": "workshop"}
+            )
+    except Exception as e:  # never let crafted-voice listing break the engine catalog
+        log.warning("selectable: could not append crafted voices (%r)", e)
+
+    return result
 
 
 class VoiceEnabledForm(BaseModel):

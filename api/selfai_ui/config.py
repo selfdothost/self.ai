@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Generic, Optional, TypeVar
 from urllib.parse import urlparse
 
-import chromadb
 import requests
 from pydantic import BaseModel
 from sqlalchemy import JSON, Column, DateTime, Integer, func
@@ -41,22 +40,201 @@ logging.getLogger("uvicorn.access").addFilter(EndpointFilter())
 ####################################
 
 
-# Function to run the alembic migrations
+class MigrationError(RuntimeError):
+    """The schema is not at head, so this process must not serve.
+
+    Its own type so the boot failure is greppable and cannot be confused with
+    an unrelated import error in the same module.
+    """
+
+
+def _alembic_config():
+    """The runner config, built the one way this codebase builds it."""
+    from alembic.config import Config as AlembicConfig
+
+    cfg = AlembicConfig(SELFAI_UI_DIR / "alembic.ini")
+    # Set the script location dynamically
+    cfg.set_main_option("script_location", str(SELFAI_UI_DIR / "migrations"))
+    return cfg
+
+
+def _stamped_revisions(engine) -> list[str]:
+    """Every revision id currently recorded in `alembic_version`.
+
+    A list, not a scalar: once mods own branch-labelled lineages the table holds
+    one row per branch. Returns empty for a database that has never been
+    migrated -- the table simply does not exist yet.
+    """
+    from sqlalchemy import inspect as sa_inspect
+    from sqlalchemy import text
+
+    with engine.connect() as connection:
+        if not sa_inspect(connection).has_table("alembic_version"):
+            return []
+        return [row[0] for row in connection.execute(text("select version_num from alembic_version"))]
+
+
+def _prune_orphaned_mod_stamps(alembic_cfg) -> list[str]:
+    """Drop `alembic_version` rows naming revisions nothing can resolve.
+
+    P1 slice 1 of the mod-owned-revisions work (self.ai#85), and the prerequisite
+    for the rest of it. **Inert until mod locations are actually configured** --
+    with only core's directory in play every stamp resolves, so this finds
+    nothing and changes nothing.
+
+    WHY IT HAS TO EXIST BEFORE MODS OWN REVISIONS. Verified on self.ai#86 against
+    the pinned Alembic: a stamped revision whose file is gone makes
+    `upgrade heads` raise `Can't locate revision identified by '<rev>'`, and
+
+      * branch targeting does NOT contain it -- `upgrade <branch>@head` fails
+        identically, because Alembic resolves the entire revision map before
+        doing anything; and
+      * core's own migrations are blocked too, so the whole tenant's schema
+        freezes, not just the removed mod's.
+
+    Under the strict boot from self.ai#82 that is a refusal to serve. So without
+    this, `rm -rf` on a mod directory would be a tenant outage recoverable only
+    by hand-editing `alembic_version` in production.
+
+    WHY PRUNING IS SAFE, which is the part worth checking rather than assuming.
+    An unresolvable stamp cannot be a core revision:
+
+      * core's revisions ship inside the image, so its directory is whole by
+        construction;
+      * a missing revision in the MIDDLE of core's chain leaves a dangling
+        `down_revision`, and `ScriptDirectory.from_config` raises before this
+        function is reached; and
+      * a missing revision at the END of core's chain would not dangle -- but a
+        core revision file disappearing fails CI outright, via the `removed`
+        assertion in `tests/test_toolspec_roundtrip.py`
+        (`test_no_alembic_revision_was_introduced_for_toolspec`).
+
+    So a stamp that resolves to nothing came from a mod location that is no
+    longer installed. Note this is ownership by *inference*, not by bookkeeping:
+    `Script.path` can tell us which location a revision came from only while its
+    file still exists, which is exactly not the case for an orphan. The
+    inference above is what makes a `(revision -> mod)` tracking table
+    unnecessary.
+
+    Returns the pruned revision ids. Logs at ERROR, not INFO: deleting a row
+    from `alembic_version` is not routine, and the operator should see it even
+    though the boot succeeds.
+    """
+    from alembic.script import ScriptDirectory
+    from sqlalchemy import create_engine, text
+
+    engine = create_engine(DATABASE_URL)
+    try:
+        stamped = _stamped_revisions(engine)
+        if not stamped:
+            return []
+
+        # Building the ScriptDirectory is itself the dangling-chain check.
+        script = ScriptDirectory.from_config(alembic_cfg)
+        known = {revision.revision for revision in script.walk_revisions()}
+
+        orphans = [rev for rev in stamped if rev not in known]
+        if not orphans:
+            return []
+
+        log.error(
+            "migrations: %d stamped revision(s) resolve to nothing and will be pruned "
+            "from alembic_version: %s. This is expected when a mod has been uninstalled; "
+            "if it is not, a revision file has gone missing and the image is wrong.",
+            len(orphans),
+            sorted(orphans),
+        )
+        with engine.begin() as connection:
+            for revision in orphans:
+                connection.execute(
+                    text("delete from alembic_version where version_num = :rev"),
+                    {"rev": revision},
+                )
+        return sorted(orphans)
+    finally:
+        engine.dispose()
+
+
+def _assert_at_head(alembic_cfg) -> None:
+    """Confirm the database really is at head after the upgrade returned.
+
+    `command.upgrade` returning is not the same fact as "the schema is at
+    head": a revision that no-ops on its own gate, an interrupted run, or a
+    database pointed somewhere other than the one just migrated all leave a
+    process that believes it migrated. This reads the answer back out of the
+    database instead of inferring it from control flow -- the same posture the
+    mods work takes about verifying through the surface rather than the code
+    path that produced it.
+    """
+    from alembic.runtime.migration import MigrationContext
+    from alembic.script import ScriptDirectory
+    from sqlalchemy import create_engine
+
+    heads = set(ScriptDirectory.from_config(alembic_cfg).get_heads())
+
+    engine = create_engine(DATABASE_URL)
+    try:
+        with engine.connect() as connection:
+            current = MigrationContext.configure(connection).get_current_revision()
+    finally:
+        engine.dispose()
+
+    if current not in heads:
+        raise MigrationError(
+            f"database is at revision {current!r}, expected one of {sorted(heads)!r}. "
+            f"Refusing to serve on a schema that is not at head."
+        )
+
+    log.info("migrations: database at head (%s)", current)
+
+
 def run_migrations():
-    print("Running migrations")
+    """Upgrade to head at boot, and fail the boot if that does not happen.
+
+    self.ai#82. This used to swallow every exception into
+    `print(f"Error: {e}")` and continue, so a failed migration produced a pod
+    that was Running, Ready, and serving against an absent or half-built
+    schema. Nothing downstream checked, and stdout is not a signal anyone
+    monitors -- the symptom surfaced instead as whatever degraded path the
+    consumer happened to have.
+
+    That is not hypothetical. `benchmark_config` never got created in
+    production, so `BenchmarkConfigs.get_by_benchmark()` returned None for
+    every benchmark, so `_fits_in_window()` took its `if not cfg: return True`
+    branch, and **every GPU-window fit check passed unconditionally** on a
+    single shared 4090 -- a safety gate silently degraded to always-yes, with a
+    green pod and no alert anywhere (self.chat#26).
+
+    So a failure here is now a boot failure. A CrashLoopBackOff is a signal an
+    operator already watches; a Ready pod serving a broken schema is not.
+
+    **There is deliberately no opt-out flag.** A `MIGRATIONS_STRICT=false` knob
+    would be set once during an incident and never unset, which recreates
+    exactly the silent degradation this replaces. A genuine need for one should
+    arrive as its own reviewed change with a stated reason.
+
+    Consequence worth knowing: a database that is unreachable at boot now
+    crash-loops the pod instead of starting it broken. That is the intended
+    trade -- Kubernetes retries, and a pod that cannot reach its database has
+    nothing useful to serve.
+
+    Orphaned stamps are pruned first (self.ai#85 P1 slice 1). That step is inert
+    today and stays inert until mod locations are configured; it exists before
+    the change that creates the hazard rather than after it. See
+    `_prune_orphaned_mod_stamps`.
+    """
+    log.info("migrations: upgrading to head")
     try:
         from alembic import command
-        from alembic.config import Config
 
-        alembic_cfg = Config(SELFAI_UI_DIR / "alembic.ini")
-
-        # Set the script location dynamically
-        migrations_path = SELFAI_UI_DIR / "migrations"
-        alembic_cfg.set_main_option("script_location", str(migrations_path))
-
+        alembic_cfg = _alembic_config()
+        _prune_orphaned_mod_stamps(alembic_cfg)
         command.upgrade(alembic_cfg, "head")
-    except Exception as e:
-        print(f"Error: {e}")
+    except Exception as exc:
+        log.exception("migrations: upgrade to head FAILED -- refusing to serve")
+        raise MigrationError(f"alembic upgrade to head failed: {exc}") from exc
+
+    _assert_at_head(alembic_cfg)
 
 
 run_migrations()
@@ -243,12 +421,36 @@ class PersistentConfig(Generic[T]):
         return super().__getattribute__(item)
 
     def update(self):
+        """Adopt the database's value for this entry.
+
+        Gated on ENABLE_PERSISTENT_CONFIG (self.ai#95). The gate in __init__
+        only covers **boot**; this method is called by `save_config()` for every
+        registered entry, which is reachable from `POST /configs/import`. Left
+        ungated, an admin uploading a JSON file could override env- and
+        vault-sourced configuration at runtime, and the override would then
+        silently disappear on the next pod restart when boot-gating took back
+        over. With the flag off, env is authoritative — including here.
+        """
+        if not ENABLE_PERSISTENT_CONFIG:
+            return
         new_value = get_config_value(self.config_path)
         if new_value is not None:
             self.value = new_value
             log.info(f"Updated {self.env_name} to new value {self.value}")
 
     def save(self):
+        """Persist this entry's value to the config table.
+
+        Gated on ENABLE_PERSISTENT_CONFIG (self.ai#95). With the flag off,
+        `self.value` *is* the env/vault value and the database copy is ignored
+        on read — so writing it is pure leak for zero benefit. Every save()
+        used to widen a secret's blast radius from "OpenBao + pod env" to
+        "OpenBao + pod env + a Postgres table + every JSON any admin ever
+        exported".
+        """
+        if not ENABLE_PERSISTENT_CONFIG:
+            log.debug(f"Not saving '{self.env_name}': ENABLE_PERSISTENT_CONFIG is False, env is authoritative")
+            return
         log.info(f"Saving '{self.env_name}' to the database")
         path_parts = self.config_path.split(".")
         sub_config = CONFIG_DATA
@@ -705,6 +907,21 @@ CURATOR_API_CONFIGS = PersistentConfig(
     {},
 )
 
+# self.curator VRAM-lease CONTROL base — the pod the GPU-lease broker GETs
+# /api/system/vram-state from and POSTs /api/system/vram-release to (self.ai#88).
+# Its own config key, mirroring SKETCH_CONTROL_BASE_URL, rather than reusing
+# CURATOR_BASE_URLS: that is a LIST of job-API endpoints an admin can repoint at
+# will, and aiming a VRAM e-stop (which kills a running pipeline) at whatever
+# happens to be first in an admin-editable list is not a decision to inherit.
+# self.curator serves job API and control on the same port today, so the default
+# matches CURATOR_BASE_URL's default — but the two can diverge without the
+# e-stop silently following.
+CURATOR_CONTROL_BASE_URL = PersistentConfig(
+    "CURATOR_CONTROL_BASE_URL",
+    "curator.control_base_url",
+    os.environ.get("CURATOR_CONTROL_BASE_URL", "http://self-curator:8094"),
+)
+
 ####################################
 # SELF.CORPUS
 ####################################
@@ -1001,24 +1218,60 @@ DEFAULT_USER_ROLE = PersistentConfig(
     os.getenv("DEFAULT_USER_ROLE", "pending"),
 )
 
-USER_PERMISSIONS_WORKSPACE_MODELS_ACCESS = (
-    os.environ.get("USER_PERMISSIONS_WORKSPACE_MODELS_ACCESS", "False").lower() == "true"
+# Studio (formerly Workspace) — Phase 0 of the Tokenization Studio programme.
+# See context/plans/build-site-studio-rename-permissions.md and the treasuremap
+# selfai/gitlab-profile:context/treasuremaps/2026-08-11-tokenization-studio.md
+# (Decision 1).
+#
+# NO MANIFEST CHANGE ACCOMPANIES THIS RENAME, and that is deliberate rather than
+# an oversight: no `WORKSPACE` string appears anywhere under `manifests/`, so
+# nothing was overriding these and every default below stays `False` exactly as
+# it was. Renaming the env keys therefore orphans no configured value. If a
+# `USER_PERMISSIONS_STUDIO_*_ACCESS` env is ever added to a manifest, it is a
+# new grant, not a restoration.
+USER_PERMISSIONS_STUDIO_MODELS_ACCESS = (
+    os.environ.get("USER_PERMISSIONS_STUDIO_MODELS_ACCESS", "False").lower() == "true"
 )
 
-USER_PERMISSIONS_WORKSPACE_KNOWLEDGE_ACCESS = (
-    os.environ.get("USER_PERMISSIONS_WORKSPACE_KNOWLEDGE_ACCESS", "False").lower() == "true"
+USER_PERMISSIONS_STUDIO_KNOWLEDGE_ACCESS = (
+    os.environ.get("USER_PERMISSIONS_STUDIO_KNOWLEDGE_ACCESS", "False").lower() == "true"
 )
 
-USER_PERMISSIONS_WORKSPACE_PROMPTS_ACCESS = (
-    os.environ.get("USER_PERMISSIONS_WORKSPACE_PROMPTS_ACCESS", "False").lower() == "true"
+# Sound Studio: gates the Voices Studio tab + voice creation (studio.voices).
+USER_PERMISSIONS_STUDIO_VOICES_ACCESS = (
+    os.environ.get("USER_PERMISSIONS_STUDIO_VOICES_ACCESS", "False").lower() == "true"
 )
 
-USER_PERMISSIONS_WORKSPACE_TRAINING_ACCESS = (
-    os.environ.get("USER_PERMISSIONS_WORKSPACE_TRAINING_ACCESS", "False").lower() == "true"
+USER_PERMISSIONS_STUDIO_PROMPTS_ACCESS = (
+    os.environ.get("USER_PERMISSIONS_STUDIO_PROMPTS_ACCESS", "False").lower() == "true"
 )
 
-USER_PERMISSIONS_WORKSPACE_TOOLS_ACCESS = (
-    os.environ.get("USER_PERMISSIONS_WORKSPACE_TOOLS_ACCESS", "False").lower() == "true"
+USER_PERMISSIONS_STUDIO_TRAINING_ACCESS = (
+    os.environ.get("USER_PERMISSIONS_STUDIO_TRAINING_ACCESS", "False").lower() == "true"
+)
+
+USER_PERMISSIONS_STUDIO_TOOLS_ACCESS = (
+    os.environ.get("USER_PERMISSIONS_STUDIO_TOOLS_ACCESS", "False").lower() == "true"
+)
+
+# self.ai#131: gates publishing a model line -- merging its accumulated
+# adapters into the base and producing a new base GGUF. Deliberately separate
+# from studio.training, which gates fitting an adapter: a bake costs an adapter
+# and a publish costs several GB and a GPU window, so holding one must not imply
+# the other. Defaults False like every sibling; this is a new grant.
+USER_PERMISSIONS_STUDIO_PUBLISH_ACCESS = (
+    os.environ.get("USER_PERMISSIONS_STUDIO_PUBLISH_ACCESS", "False").lower() == "true"
+)
+
+# Tokenization Studio (Phase 2). Admits an artist to /studio/tokenization AND to
+# queueing tokenization jobs from it -- queueing is deliberately NOT separately
+# gated (treasuremap Decision 11). What stays separate is defining job WINDOWS
+# (an operator act) and creating/queueing the existing training courses. The
+# boundary is who may change the rules, not who may consume capacity under them;
+# neither implies the other in either direction. Independent of studio.publish
+# above for the same reason: neither implies the other.
+USER_PERMISSIONS_STUDIO_TOKENIZATION_ACCESS = (
+    os.environ.get("USER_PERMISSIONS_STUDIO_TOKENIZATION_ACCESS", "False").lower() == "true"
 )
 
 USER_PERMISSIONS_CHAT_FILE_UPLOAD = os.environ.get("USER_PERMISSIONS_CHAT_FILE_UPLOAD", "True").lower() == "true"
@@ -1042,12 +1295,29 @@ USER_PERMISSIONS = PersistentConfig(
     "USER_PERMISSIONS",
     "user.permissions",
     {
-        "workspace": {
-            "models": USER_PERMISSIONS_WORKSPACE_MODELS_ACCESS,
-            "knowledge": USER_PERMISSIONS_WORKSPACE_KNOWLEDGE_ACCESS,
-            "prompts": USER_PERMISSIONS_WORKSPACE_PROMPTS_ACCESS,
-            "training": USER_PERMISSIONS_WORKSPACE_TRAINING_ACCESS,
-            "tools": USER_PERMISSIONS_WORKSPACE_TOOLS_ACCESS,
+        # Renamed from "workspace" (Phase 0). Stored group blobs are rekeyed by
+        # the Alembic revision that accompanies this, and has_permission carries
+        # a transitional fallback for any group not yet migrated -- without both,
+        # every non-admin silently loses all Studio access on deploy, because
+        # has_permission denies on a missing level and every default here is
+        # False. The six children and their defaults are unchanged; this renames
+        # a key and loosens nothing.
+        "studio": {
+            "models": USER_PERMISSIONS_STUDIO_MODELS_ACCESS,
+            "knowledge": USER_PERMISSIONS_STUDIO_KNOWLEDGE_ACCESS,
+            "voices": USER_PERMISSIONS_STUDIO_VOICES_ACCESS,
+            "prompts": USER_PERMISSIONS_STUDIO_PROMPTS_ACCESS,
+            "training": USER_PERMISSIONS_STUDIO_TRAINING_ACCESS,
+            "tools": USER_PERMISSIONS_STUDIO_TOOLS_ACCESS,
+            "publish": USER_PERMISSIONS_STUDIO_PUBLISH_ACCESS,
+            # Must be declared HERE, not only enforced at the call site. The
+            # default blob feeds `get_permissions` as well as `has_permission`
+            # (see build-site-studio-rename-permissions.md T-003 as corrected),
+            # and `get_permissions` builds the object the client gates its
+            # navigation on -- so a key missing from this dict is invisible to
+            # the client even for a group that has been granted it. That is the
+            # same silent failure `evaluations` still has today (self.ai#133).
+            "tokenization": USER_PERMISSIONS_STUDIO_TOKENIZATION_ACCESS,
         },
         "chat": {
             "file_upload": USER_PERMISSIONS_CHAT_FILE_UPLOAD,
@@ -1373,24 +1643,24 @@ Responses from models: {{responses}}"""
 # Vector Database
 ####################################
 
-VECTOR_DB = os.environ.get("VECTOR_DB", "chroma")
+VECTOR_DB = os.environ.get("VECTOR_DB", "sqlite-vec")
 
-# Chroma
-CHROMA_DATA_PATH = f"{DATA_DIR}/vector_db"
-CHROMA_TENANT = os.environ.get("CHROMA_TENANT", chromadb.DEFAULT_TENANT)
-CHROMA_DATABASE = os.environ.get("CHROMA_DATABASE", chromadb.DEFAULT_DATABASE)
-CHROMA_HTTP_HOST = os.environ.get("CHROMA_HTTP_HOST", "")
-CHROMA_HTTP_PORT = int(os.environ.get("CHROMA_HTTP_PORT", "8000"))
-CHROMA_CLIENT_AUTH_PROVIDER = os.environ.get("CHROMA_CLIENT_AUTH_PROVIDER", "")
-CHROMA_CLIENT_AUTH_CREDENTIALS = os.environ.get("CHROMA_CLIENT_AUTH_CREDENTIALS", "")
-# Comma-separated list of header=value pairs
-CHROMA_HTTP_HEADERS = os.environ.get("CHROMA_HTTP_HEADERS", "")
-if CHROMA_HTTP_HEADERS:
-    CHROMA_HTTP_HEADERS = dict([pair.split("=") for pair in CHROMA_HTTP_HEADERS.split(",")])
-else:
-    CHROMA_HTTP_HEADERS = None
-CHROMA_HTTP_SSL = os.environ.get("CHROMA_HTTP_SSL", "false").lower() == "true"
-# this uses the model defined in the Dockerfile ENV variable. If you dont use docker or docker based deployments such as k8s, the default embedding model will be used (sentence-transformers/all-MiniLM-L6-v2)
+# sqlite-vec — the zero-configuration default, replacing ChromaDB.
+#
+# Chroma was the inherited default and cost 41 transitive packages (~98MB:
+# onnxruntime, tokenizers, the OpenTelemetry stack, a Kubernetes client) plus a
+# from-source chroma-hnswlib build, to serve single-user local installs. It was
+# also dead weight in the yard, which runs VECTOR_DB=pgvector and shipped all of
+# it anyway. sqlite-vec (MIT/Apache-2.0) is a loadable extension for the SQLite
+# Python already links: no extra service for the single-container quickstart.
+#
+# The store lives beside the old chroma directory rather than inside it -- there
+# is no in-place migration between the two formats, so an existing install
+# re-indexes rather than silently reading a store that isn't there.
+SQLITE_VEC_PATH = os.environ.get("SQLITE_VEC_PATH", f"{DATA_DIR}/vector_db/sqlite_vec.db")
+# Fixed for the life of the vec0 table. Shorter embeddings are zero-padded
+# (cosine-safe); anything longer is a hard error rather than a silent truncation.
+SQLITE_VEC_VECTOR_LENGTH = int(os.environ.get("SQLITE_VEC_VECTOR_LENGTH", "1536"))
 
 # Milvus
 
@@ -1414,6 +1684,29 @@ if VECTOR_DB == "pgvector" and not PGVECTOR_DB_URL.startswith("postgres"):
         "Pgvector requires setting PGVECTOR_DB_URL or using Postgres with vector extension as the primary database."
     )
 PGVECTOR_INITIALIZE_MAX_VECTOR_LENGTH = int(os.environ.get("PGVECTOR_INITIALIZE_MAX_VECTOR_LENGTH", "1536"))
+
+# Vector index on document_chunk: OPT-IN, default OFF (self.ai#62).
+#
+# This used to be created unconditionally with a hardcoded lists = 100. Measured
+# on yard-pg 2026-07-23: document_chunk held 174 rows, the planner chose a seq
+# scan every time, and the index was 4792 kB -- roughly 72% of the table's total
+# footprint -- for a structure nothing read, re-maintained on every insert.
+# Top-10 results were byte-identical against a forced exact scan, so this was
+# dead weight rather than a correctness problem.
+#
+# lists = 100 is also simply wrong at that cardinality: pgvector's guidance is
+# ~rows/1000, i.e. lists = 1 for 174 rows. At this size the right answer is no
+# vector index at all, so it now has to be asked for.
+#
+# When document_chunk does outgrow a seq scan (~10k rows), prefer HNSW over
+# ivfflat: better recall/latency, and it does not need the table populated
+# before it is built. That is a bigger change than re-enabling this flag.
+PGVECTOR_CREATE_VECTOR_INDEX = (
+    os.environ.get("PGVECTOR_CREATE_VECTOR_INDEX", "false").lower() == "true"
+)
+# Only consulted when the index is enabled. Size it from the row count
+# (~rows/1000) rather than leaving it at the inherited default.
+PGVECTOR_IVFFLAT_LISTS = int(os.environ.get("PGVECTOR_IVFFLAT_LISTS", "100"))
 
 ####################################
 # Information Retrieval (RAG)

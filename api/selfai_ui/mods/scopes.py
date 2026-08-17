@@ -4,7 +4,7 @@ The whole design rests on one property of core's existing checker:
 `has_permission(user_id, key, defaults)` splits a dotted key and walks a nested
 boolean dict of the user's group permissions, falling back to instance
 defaults. A scope named `mods.crew.session.connect` is therefore evaluated by
-exactly the same code path as `workspace.models`, with **no change to that
+exactly the same code path as `studio.models`, with **no change to that
 function and no mods-specific branch anywhere in it**.
 
 That is not a convenience. If mod scopes needed their own resolver, they would

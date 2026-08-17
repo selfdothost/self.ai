@@ -358,10 +358,12 @@ def drive(test_app, authenticated_admin, test_admin, db_session, monkeypatch):
         captured = {"round_payloads": []}
         rounds = {"n": 0}
 
-        async def spy_buffered(request, form_data, messages, openai_tools, admin_tools, extra_params, user):
+        async def spy_buffered(request, form_data, messages, openai_tools, admin_tools, extra_params, user, **kwargs):
             captured["openai_tools"] = openai_tools
             captured["admin_tools"] = admin_tools
-            return await real_buffered(request, form_data, messages, openai_tools, admin_tools, extra_params, user)
+            return await real_buffered(
+                request, form_data, messages, openai_tools, admin_tools, extra_params, user, **kwargs
+            )
 
         async def fake_completion(request, payload, user, **kwargs):
             captured["round_payloads"].append(payload)

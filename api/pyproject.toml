@@ -10,7 +10,7 @@
 # this file only wires up the gate.
 
 [tool.ruff]
-target-version = "py311"
+target-version = "py313"
 # black==24.8.0 is already a pinned dependency (see requirements.txt /
 # requirements-api.txt) and owns formatting; ruff's own formatter is
 # black-compatible and not invoked here — this config is lint (`ruff check`)

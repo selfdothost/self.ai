@@ -1,8 +1,34 @@
 import json
+import logging
 from typing import Any, Dict, List, Optional
 
 from selfai_ui.models.groups import Groups
 from selfai_ui.models.users import UserModel, Users
+
+log = logging.getLogger(__name__)
+
+# Phase 0 of the Tokenization Studio programme renamed the `workspace` permission
+# group to `studio`. An Alembic revision rekeys every stored group blob, but a
+# group written before that migration -- or restored from an older backup -- still
+# says `workspace`, and has_permission denies on a missing level of the hierarchy.
+# Without this fallback every such group loses all Studio access at once, with no
+# exception and no log line: the navigation simply stops rendering.
+#
+# TWO functions consume this, and both are needed: `has_permission` is the
+# server-side gate, and `get_permissions` builds the object the CLIENT reads to
+# decide what to render. Fixing only the first leaves the API permitting calls
+# the UI never offers a way to make.
+#
+# REMOVAL: delete this constant, _resolve_permission's fallback branch, AND
+# get_permissions' fold_renamed_group once
+# the debug line below has stopped appearing in production for a full release
+# cycle -- target is the release AFTER the one carrying the rename, i.e. the
+# first release in which no unmigrated group has been observed. Do not remove it
+# in the same release as the rename; the migration and this fallback are what
+# make the rename safe to land in either order.
+# Decision record: selfai/gitlab-profile
+# context/treasuremaps/2026-08-11-tokenization-studio.md, Decision 1.
+_RENAMED_PERMISSION_GROUP = ("studio", "workspace")
 
 
 def get_permissions(
@@ -29,13 +55,56 @@ def get_permissions(
                     permissions[key] = permissions[key] or value
         return permissions
 
+    def fold_renamed_group(group_permissions: Dict[str, Any], group_id: Optional[str] = None) -> Dict[str, Any]:
+        """Move a pre-rename `workspace` block onto `studio` before combining.
+
+        `has_permission` gets its own fallback (`_resolve_permission` below).
+        This function is the SECOND traversal of the same blobs and needs its
+        own, because it is the one the CLIENT reads: `routers/auths.py` calls
+        `get_permissions()` on signin, signup and session to build the
+        `permissions` object self.chat stores as `$user.permissions` and gates
+        every Studio navigation entry on.
+
+        Without this, the two halves disagree for a group the migration never
+        reached. `combine_permissions` merges the group's blob OVER the
+        defaults, and the defaults now carry a full `studio` block of `False`,
+        so both keys survive side by side and the all-`False` one is the one
+        with the name the client looks up:
+
+            {"studio":    {"models": False, ...},   <- from defaults, wins
+             "workspace": {"models": True, ...}}    <- the real grant, ignored
+
+        The API would then permit a call that the UI never renders a way to
+        make -- the same silent lockout the rename guards against, moved to a
+        worse place to find it.
+
+        Same rule as the Alembic revision and `_resolve_permission`: `studio`
+        wins when both are present, and the stale key is dropped from the
+        result so the client is never handed both.
+        """
+        new_name, old_name = _RENAMED_PERMISSION_GROUP
+        if not isinstance(group_permissions, dict) or old_name not in group_permissions:
+            return group_permissions
+
+        folded = {key: value for key, value in group_permissions.items() if key != old_name}
+        if new_name not in folded:
+            folded[new_name] = group_permissions[old_name]
+            log.debug(
+                "group %s carries the pre-rename '%s' permission key; folding it onto '%s' "
+                "for this response. The group predates the Studio rekey migration.",
+                group_id if group_id is not None else "<unknown>",
+                old_name,
+                new_name,
+            )
+        return folded
+
     user_groups = Groups.get_groups_by_member_id(user_id)
 
     # deep copy default permissions to avoid modifying the original dict
     permissions = json.loads(json.dumps(default_permissions))
 
     for group in user_groups:
-        group_permissions = group.permissions
+        group_permissions = fold_renamed_group(group.permissions, getattr(group, "id", None))
         permissions = combine_permissions(permissions, group_permissions)
 
     return permissions
@@ -56,11 +125,43 @@ def has_permission(
     def get_permission(permissions: Dict[str, bool], keys: List[str]) -> bool:
         """Traverse permissions dict using a list of keys (from dot-split permission_key)."""
         for key in keys:
-            if key not in permissions:
+            if not isinstance(permissions, dict) or key not in permissions:
                 return False  # If any part of the hierarchy is missing, deny access
             permissions = permissions[key]  # Go one level deeper
 
         return bool(permissions)  # Return the boolean at the final level
+
+    def _resolve_permission(
+        permissions: Dict[str, Any],
+        keys: List[str],
+        group_id: Optional[str] = None,
+    ) -> bool:
+        """
+        Traverse `permissions`, retrying once under the pre-rename group name.
+
+        The fallback is scoped to the FIRST segment and to the single literal
+        `studio` -> `workspace`; `chat.*`, `features.*` and `mods.*` are
+        untouched, and no key outside the renamed group can be turned from a
+        deny into an allow by it.
+
+        It fires on a MISSING key, never on a falsy one. A blob that has
+        `studio` uses it and never consults `workspace`, including when the
+        value there is explicitly False -- otherwise a permission an admin had
+        deliberately turned off would be resurrected by the stale half of a
+        half-migrated blob.
+        """
+        new_name, old_name = _RENAMED_PERMISSION_GROUP
+        if keys and keys[0] == new_name and isinstance(permissions, dict) and new_name not in permissions:
+            if old_name in permissions:
+                log.debug(
+                    "permission %s resolved via the pre-rename '%s' key on group %s; "
+                    "this group predates the Studio rekey migration",
+                    ".".join(keys),
+                    old_name,
+                    group_id if group_id is not None else "<default blob>",
+                )
+                return get_permission(permissions, [old_name, *keys[1:]])
+        return get_permission(permissions, keys)
 
     permission_hierarchy = permission_key.split(".")
 
@@ -69,11 +170,11 @@ def has_permission(
 
     for group in user_groups:
         group_permissions = group.permissions
-        if get_permission(group_permissions, permission_hierarchy):
+        if _resolve_permission(group_permissions, permission_hierarchy, group.id):
             return True
 
     # Check default permissions afterwards if the group permissions don't allow it
-    return get_permission(default_permissions, permission_hierarchy)
+    return _resolve_permission(default_permissions, permission_hierarchy)
 
 
 def has_access(

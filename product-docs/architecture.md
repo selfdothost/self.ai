@@ -83,7 +83,7 @@ Filters and tools are covered in [Extending self.ai](extending.md).
 | What | Where it lives |
 | --- | --- |
 | Users, chats, knowledge metadata, tools, functions, config | Postgres |
-| Vector embeddings | pgvector in Postgres (Chroma and Milvus backends also exist) |
+| Vector embeddings | pgvector in Postgres; sqlite-vec for single-container installs (Milvus, Qdrant and OpenSearch backends also exist) |
 | Uploaded files and cache | A local volume on the API server |
 | Session state, websocket pub/sub | The configured cache backend |
 | Model weights | A volume mounted into the inference service |

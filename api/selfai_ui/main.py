@@ -20,7 +20,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_swagger_ui_html
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy import text
@@ -86,6 +86,7 @@ from selfai_ui.config import (
     CORS_ALLOW_ORIGIN,
     CURATOR_API_CONFIGS,
     CURATOR_BASE_URLS,
+    CURATOR_CONTROL_BASE_URL,
     DEEP_RESEARCH_CONCURRENCY,
     DEEP_RESEARCH_MAX_CHARS_PER_PAGE,
     DEEP_RESEARCH_MAX_CRAWL_DELAY_SECONDS,
@@ -284,12 +285,15 @@ from selfai_ui.routers import (
     audio,
     audio_connections,
     auths,
+    backups,
     benchmarks,
     channels,
     chats,
     code_eval,
     configs,
     curator,
+    custom_evals,
+    database,
     evaluations,
     files,
     folders,
@@ -299,9 +303,12 @@ from selfai_ui.routers import (
     knowledge,
     language_eval,
     llamolotl,
+    mcp_proxy,
     memories,
     mod_assets,
     mod_frontend_manifest,
+    model_versions,
+    model_weights,
     models,
     mods,
     ollama,
@@ -312,12 +319,14 @@ from selfai_ui.routers import (
     retrieval,
     system,
     tasks,
+    tokenization,
     tools,
     training,
     transcribe,
     users,
     utils,
     voice_catalog,
+    voices,
     vram_leases,
     windows,
 )
@@ -353,14 +362,25 @@ from selfai_ui.utils.middleware import (
     process_chat_payload,
     process_chat_response,
 )
+from selfai_ui.utils.model_context import inherited_context_fields
 from selfai_ui.utils.models import (
     check_model_access,
     get_all_base_models,
     get_all_models,
 )
 from selfai_ui.utils.oauth import oauth_manager
+from selfai_ui.utils.payload import convert_payload_anthropic_to_openai
+from selfai_ui.utils.response import (
+    convert_response_openai_to_anthropic,
+    convert_streaming_response_openai_to_anthropic,
+)
 from selfai_ui.utils.security_headers import SecurityHeadersMiddleware
 from selfai_ui.utils.service_auth import TICKET_HEADER, mint_service_ticket
+from selfai_ui.utils.tokenization import (
+    TokenizationParamError,
+    assert_model_can_tokenize,
+    resolve_logprobs_request,
+)
 
 if SAFE_MODE:
     print("SAFE MODE ENABLED")
@@ -410,12 +430,17 @@ async def lifespan(app: FastAPI):
     # background tasks below. boot_mods contains its own per-mod failure
     # isolation, so a broken mod cannot stop the app coming up.
     mods_result = _boot_mods(app)
+    # MUST follow _boot_mods: the SPA catch-all is registered at import time and
+    # would otherwise shadow every mod route mounted just above (self.ai#119).
+    _move_spa_mount_last(app)
     asyncio.create_task(periodic_usage_pool_cleanup())
     asyncio.create_task(_resume_crawl_jobs(app.state))
     asyncio.create_task(_run_gpu_queue(app.state))
     _register_llamolotl_vram_consumer()
     _register_speak_vram_consumer()
     _register_sketch_vram_consumer()
+    _register_curator_vram_consumer()
+    _register_publish_vram_consumer()
     # Single consumer-aware dispatcher owning the llamolotl, speak AND sketch
     # transports — the broker has one global transport and does not route by
     # consumer_id, so this REPLACES a separate llamolotl install (which the
@@ -425,12 +450,16 @@ async def lifespan(app: FastAPI):
     # reaper off the broker, not the transport, so it is unaffected by this
     # dispatcher.
     _install_speak_release_transport(app.state)
+    # R5 force-reap capability. Installed LAST of the broker wiring so the
+    # trusted target map is in place before any grant can escalate (self.ai#75).
+    _install_pod_reaper()
     # R6 consumer VRAM state poller — relays each consumer's real held VRAM into
     # the registry via heartbeat(), closing the drift gap live validation found.
     asyncio.create_task(_run_vram_poller(app.state))
     asyncio.create_task(_ensure_curator_classifier_models(app.state))
     asyncio.create_task(_backfill_self_corpus_repos(app.state))
     asyncio.create_task(_run_model_integrity_sweep(app.state))
+    asyncio.create_task(_fail_interrupted_backup_jobs())
     yield
     _drain_mods(mods_result)
 
@@ -442,6 +471,40 @@ def _register_browse_reference_profiles() -> None:
     from selfai_ui.browse.reference_profiles import register_reference_profiles
 
     register_reference_profiles()
+
+
+def _move_spa_mount_last(app: FastAPI) -> None:
+    """Push the SPA catch-all to the END of the route table, after mod routers.
+
+    Starlette matches routes in REGISTRATION ORDER, and the SPA mount is
+    ``Mount("/")`` -- it matches every path. It is registered at IMPORT time
+    (bottom of this module, guarded by ``os.path.exists(FRONTEND_BUILD_DIR)``),
+    while mod routers are mounted during the LIFESPAN by ``boot_mods``. So every
+    mod route landed after the catch-all and was shadowed by it.
+
+    The symptom is method-dependent and both halves are nasty:
+      * POST /<mod-prefix>/... -> 405, because StaticFiles allows GET/HEAD only.
+      * GET  /<mod-prefix>/... -> 200 with index.html, so a caller expecting JSON
+        gets a web page and fails somewhere unrelated.
+
+    This only bites when the API also serves the frontend -- i.e. the COMBINED
+    IMAGE, which is the deployment we recommend for getting started. The split
+    deployment (separate selfai-api / selfai-chat pods) has no frontend build in
+    the API pod, takes the ``else`` branch, and was never affected.
+
+    Reordering rather than moving the mount keeps behaviour identical for every
+    setup that has no mods: same routes, same mount, only the position changes.
+    Idempotent, and a no-op when the SPA is not mounted at all.
+
+    self.ai#119.
+    """
+    routes = app.router.routes
+    spa = [r for r in routes if getattr(r, "name", "") == "spa-static-files"]
+    for route in spa:
+        routes.remove(route)
+        routes.append(route)
+    if spa:
+        log.info("mods: SPA catch-all moved after mod routes (%d mount(s))", len(spa))
 
 
 def _boot_mods(app: FastAPI):
@@ -475,6 +538,15 @@ async def _resume_crawl_jobs(app_state) -> None:
     from selfai_ui.routers.retrieval import resume_crawl_jobs_on_startup
 
     await resume_crawl_jobs_on_startup(app_state)
+
+
+async def _fail_interrupted_backup_jobs() -> None:
+    """Backup jobs hold no checkpoint, so a restart mid-run leaves a row on
+    `running` forever — which reads in the UI as "still working" rather than
+    "this never finished". Fail them explicitly at startup (self.ai#93)."""
+    from selfai_ui.utils.backup import fail_interrupted_jobs
+
+    await fail_interrupted_jobs()
 
 
 async def _backfill_self_corpus_repos(app_state) -> None:
@@ -593,13 +665,19 @@ def _register_llamolotl_vram_consumer() -> None:
         )
         log.info(
             "vram-lease: registered %s (capacity %d bytes, priority %d, "
-            "force-reap %s)",
+            "pod identity %s)",
             _LLAMOLOTL_AUDIENCE,
             capacity_bytes,
             LLAMOLOTL_VRAM_LEASE_PRIORITY,
-            "armed (pod identity configured)"
+            # NOT "force-reap armed": this function only writes a registry
+            # row. Whether force-reap can actually fire depends on the broker
+            # having a reaper AND a trusted target installed, which
+            # _install_pod_reaper() reports separately. Claiming "armed" here is
+            # what made self.ai#75 (set_reaper had zero callers) invisible for
+            # weeks while the log said otherwise.
+            "configured"
             if pod_identity_configured
-            else "ineligible (no pod identity configured)",
+            else "not configured (never force-reap eligible)",
         )
     except Exception as e:
         # Registration is best-effort at boot: a registry/DB hiccup must not
@@ -695,6 +773,10 @@ async def _run_vram_poller(app_state) -> None:
         for _audience, _attr in (
             (_SPEAK_AUDIENCE, "TTS_CONTROL_BASE_URL"),
             (_SKETCH_AUDIENCE, "SKETCH_CONTROL_BASE_URL"),
+            # self.curator joins them (self.ai#88): it serves the same pull-based
+            # GET /api/system/vram-state, and its held is the figure that decides
+            # whether core thinks a curation run's VRAM is free to hand out.
+            (_CURATOR_AUDIENCE, "CURATOR_CONTROL_BASE_URL"),
         ):
             _base = getattr(cfg, _attr, None) if cfg else None
             if _base and str(_base).strip():
@@ -848,6 +930,218 @@ def _register_sketch_vram_consumer() -> None:
         log.warning("vram-lease: self.sketch registration failed: %r", e)
 
 
+def _register_curator_vram_consumer() -> None:
+    """Config-driven registration of self.curator in the VRAM lease registry at
+    startup (self.ai#88) — a same-shape analogue of the three hooks above.
+
+    self.curator was the last GPU pod on the shared 4090 the broker could not
+    see. Unregistered, its curation runs were an INVISIBLE hold: ``free_capacity()``
+    counted the VRAM a NeMo Curator pipeline had resident as free and core would
+    grant it to llamolotl/speak/sketch, which is how you OOM a card that the
+    ledger says has room.
+
+    ``CURATOR_VRAM_LEASE_PRIORITY`` is 8 in the manifest — below llamolotl's 10
+    so curation never pre-empts the inference brain, above self.speak (5) and
+    self.sketch (3) so a curator window can actually clear voices and image
+    generation off the card rather than merely being scheduled alongside them.
+
+    If ``CURATOR_VRAM_CAPACITY_BYTES`` is unset/blank/malformed the consumer is
+    simply not registered and we log that it's unconfigured — self.ai must boot
+    fine on deployments with no self.curator, so this never raises out of the
+    lifespan."""
+    from selfai_ui.env import (
+        CURATOR_VRAM_CAPACITY_BYTES,
+        CURATOR_VRAM_LEASE_PRIORITY,
+    )
+
+    raw = (CURATOR_VRAM_CAPACITY_BYTES or "").strip()
+    if not raw:
+        log.info(
+            "vram-lease: CURATOR_VRAM_CAPACITY_BYTES unset — skipping self.curator "
+            "registration (lease broker unconfigured for curator)"
+        )
+        return
+
+    try:
+        capacity_bytes = int(raw)
+    except ValueError:
+        log.warning(
+            "vram-lease: CURATOR_VRAM_CAPACITY_BYTES=%r is not an integer — "
+            "skipping self.curator registration",
+            raw,
+        )
+        return
+
+    try:
+        from selfai_ui.models.vram_leases import (
+            VramConsumerRegisterForm,
+            VramLeases,
+        )
+
+        VramLeases.register(
+            VramConsumerRegisterForm(
+                consumer_id=_CURATOR_AUDIENCE,
+                total_capacity_bytes=capacity_bytes,
+                priority=CURATOR_VRAM_LEASE_PRIORITY,
+                held_bytes=_existing_vram_held(_CURATOR_AUDIENCE),
+            )
+        )
+        log.info(
+            "vram-lease: registered %s (capacity %d bytes, priority %d)",
+            _CURATOR_AUDIENCE,
+            capacity_bytes,
+            CURATOR_VRAM_LEASE_PRIORITY,
+        )
+    except Exception as e:
+        log.warning("vram-lease: self.curator registration failed: %r", e)
+
+
+def _register_publish_vram_consumer() -> None:
+    """Config-driven registration of self.publish in the VRAM lease registry at
+    startup (self.ai#136) — the fifth hook, and the one whose consumer is not a
+    pod.
+
+    A publish merges adapters into a base through self.llamolotl's pipeline,
+    which loads the base at fp16 with ``device_map="auto"``
+    (``api/merge_lora.py:51-52``). That hold lands in a pipeline SUBPROCESS
+    inside the llamolotl pod — not in llama-server, and not in anything the
+    ``self.llamolotl`` row accounts for. Unregistered, a running publish is an
+    invisible hold of most of the card: ``free_capacity()`` counts it as free
+    and core grants it away, which is how you OOM a card the ledger says has
+    room. That is the same failure self.curator's registration closed.
+
+    It gets its OWN consumer id rather than borrowing llamolotl's because the
+    acquire is exclusive: registering as ``self.llamolotl`` would mark the
+    serving process the exclusive holder while the serving process is exactly
+    what has to release its VRAM first.
+
+    ``PUBLISH_VRAM_LEASE_PRIORITY`` is 8 in the manifest — the same tier as
+    self.curator, since a publish is the same kind of act: a scheduled,
+    window-gated job that must be able to clear self.speak (5) and self.sketch
+    (3) off the card without casually pre-empting the inference brain at
+    llamolotl's 10.
+
+    If ``PUBLISH_VRAM_CAPACITY_BYTES`` is unset/blank/malformed the consumer is
+    simply not registered and we log that it is unconfigured. That is the state
+    every deployment was in before this hook existed, and
+    ``gpu_queue._publish_is_lease_consumer()`` reports False for it, so
+    publishes dispatch without a lease exactly as they did — this never raises
+    out of the lifespan."""
+    from selfai_ui.env import (
+        PUBLISH_VRAM_CAPACITY_BYTES,
+        PUBLISH_VRAM_LEASE_PRIORITY,
+    )
+
+    raw = (PUBLISH_VRAM_CAPACITY_BYTES or "").strip()
+    if not raw:
+        log.info("vram-lease: PUBLISH_VRAM_CAPACITY_BYTES unset — self.publish not registered")
+        return
+
+    try:
+        capacity_bytes = int(raw)
+    except ValueError:
+        log.warning(
+            "vram-lease: PUBLISH_VRAM_CAPACITY_BYTES=%r is not an integer — "
+            "skipping self.publish registration",
+            raw,
+        )
+        return
+
+    try:
+        from selfai_ui.models.vram_leases import (
+            VramConsumerRegisterForm,
+            VramLeases,
+        )
+
+        VramLeases.register(
+            VramConsumerRegisterForm(
+                consumer_id=_PUBLISH_AUDIENCE,
+                total_capacity_bytes=capacity_bytes,
+                priority=PUBLISH_VRAM_LEASE_PRIORITY,
+                held_bytes=_existing_vram_held(_PUBLISH_AUDIENCE),
+            )
+        )
+        log.info(
+            "vram-lease: registered %s (capacity %d bytes, priority %d)",
+            _PUBLISH_AUDIENCE,
+            capacity_bytes,
+            PUBLISH_VRAM_LEASE_PRIORITY,
+        )
+    except Exception as e:
+        log.warning("vram-lease: self.publish registration failed: %r", e)
+
+
+def _install_pod_reaper() -> None:
+    """Install the R5 force-reap capability on the VRAM broker (self.ai#75).
+
+    This is the wiring whose ABSENCE was self.ai#75: ``set_reaper()`` had zero
+    callers anywhere in the repo, so ``VramBroker._reaper`` was permanently None
+    and the whole force-reap escalation in ``_decide_lease`` was unreachable —
+    while the deployment carried a pods:delete ServiceAccount for it and the boot
+    log claimed it was armed. Nothing could fire.
+
+    Two things are installed together, deliberately:
+
+    * the concrete ``KubernetesPodReaper`` (in-cluster ServiceAccount creds), and
+    * the TRUSTED ``{consumer_id: (namespace, selector)}`` target map, built here
+      from core's own environment.
+
+    The target map is the security half (#79). ``_decide_lease`` used to aim the
+    reaper using the consumer's REGISTRY ROW, and ``/vram-leases/register`` is
+    gated on a shared-secret service ticket with no caller identity — so any mesh
+    service could have re-registered a consumer with a selector pointing at
+    another pod in the namespace and had a grant delete it. Sourcing the target
+    from env removes the redirect; a consumer with no env-configured identity is
+    simply never reap-eligible, the same opt-in as before.
+
+    Best-effort, like the neighbouring wrappers: a wiring failure must never stop
+    the app coming up. With nothing configured we log it and leave the broker
+    exactly as it was — reaper-less, escalation skipped, R5 inert.
+    """
+    from selfai_ui.env import (
+        CURATOR_K8S_NAMESPACE,
+        CURATOR_K8S_POD_SELECTOR,
+        LLAMOLOTL_K8S_NAMESPACE,
+        LLAMOLOTL_K8S_POD_SELECTOR,
+    )
+
+    targets = {}
+    for _audience, _ns, _sel in (
+        (_LLAMOLOTL_AUDIENCE, LLAMOLOTL_K8S_NAMESPACE, LLAMOLOTL_K8S_POD_SELECTOR),
+        # self.curator (self.ai#88). Same opt-in contract: both blank leaves it
+        # registered but never reap-eligible. Worth configuring — a curation pod
+        # whose pipeline has wedged is exactly the stale-holder case R5 exists
+        # for, and it is the one consumer whose work is restartable, so losing
+        # the pod costs a requeue rather than a live conversation.
+        (_CURATOR_AUDIENCE, CURATOR_K8S_NAMESPACE, CURATOR_K8S_POD_SELECTOR),
+    ):
+        namespace = (_ns or "").strip()
+        selector = (_sel or "").strip()
+        if namespace and selector:
+            targets[_audience] = (namespace, selector)
+
+    if not targets:
+        log.info(
+            "vram-reap: no consumer has an env-configured pod identity — NOT "
+            "installing the force-reap capability (R5 stays inert)"
+        )
+        return
+
+    try:
+        from selfai_ui.utils.vram_broker import VramBroker
+        from selfai_ui.utils.vram_k8s import KubernetesPodReaper
+
+        VramBroker.set_reap_targets(targets)
+        VramBroker.set_reaper(KubernetesPodReaper())
+        log.info(
+            "vram-reap: force-reap capability ARMED on VramBroker for %s "
+            "(k8s pod-delete via core's ServiceAccount)",
+            sorted(targets),
+        )
+    except Exception as e:
+        log.warning("vram-reap: installing the force-reap capability failed: %r", e)
+
+
 def _install_speak_release_transport(app_state) -> None:
     """Install a consumer-aware release-transport dispatcher on the VRAM broker
     that keeps BOTH self.llamolotl and self.speak reachable through the broker's
@@ -871,6 +1165,7 @@ def _install_speak_release_transport(app_state) -> None:
     Best-effort: a wiring hiccup must not stop the app coming up."""
     try:
         from selfai_ui.utils.vram_broker import VramBroker
+        from selfai_ui.utils.vram_curator import CuratorReleaseTransport
         from selfai_ui.utils.vram_llamolotl import LlamolotlReleaseTransport
         from selfai_ui.utils.vram_sketch import SketchReleaseTransport
         from selfai_ui.utils.vram_speak import (
@@ -882,11 +1177,20 @@ def _install_speak_release_transport(app_state) -> None:
             speak_transport=SpeakReleaseTransport(app_state=app_state),
             llamolotl_transport=LlamolotlReleaseTransport(app_state=app_state),
             sketch_transport=SketchReleaseTransport(app_state=app_state),
+            # Wired through the map rather than a fourth positional branch
+            # (self.ai#88): the dispatcher's else-fallthrough routes anything
+            # unrecognised to self.llamolotl, so a consumer added without its own
+            # branch silently POSTs its release to llamolotl's endpoint. This is
+            # also what puts self.curator inside the system-wide e-stop, which
+            # fans out over exactly these transports with force=True.
+            extra_transports={
+                _CURATOR_AUDIENCE: CuratorReleaseTransport(app_state=app_state),
+            },
         )
         VramBroker.set_transport(dispatcher)
         log.info(
             "vram-lease: installed consumer-aware release transport "
-            "(self.llamolotl + self.speak + self.sketch) on VramBroker"
+            "(self.llamolotl + self.speak + self.sketch + self.curator) on VramBroker"
         )
     except Exception as e:
         log.warning("vram-lease: installing consumer-aware release transport failed: %r", e)
@@ -917,6 +1221,20 @@ _SPEAK_AUDIENCE = "self.speak"
 # (Color epic Phase 2b). Must match SketchReleaseTransport.SKETCH_AUDIENCE and
 # the ComfyUI shim's SERVICE_AUTH_AUDIENCE.
 _SKETCH_AUDIENCE = "self.sketch"
+
+# The self.curator service identity — the registry consumer_id for the
+# self.curator VRAM lease and the audience core mints release tickets against
+# (self.ai#88). Must match vram_curator.CURATOR_AUDIENCE, routers/curator.py's
+# and gpu_queue.py's CURATOR_AUDIENCE, and self.curator's own
+# SERVICE_AUTH_AUDIENCE.
+_CURATOR_AUDIENCE = "self.curator"
+
+# The publish consumer id (self.ai#136). Unlike the four above it names an
+# ACTIVITY, not a service: the VRAM is held by a pipeline subprocess inside
+# self.llamolotl's pod, and no process ever authenticates as this. Core is the
+# only thing that registers, acquires and releases it, so there is no
+# SERVICE_AUTH_AUDIENCE to match — only gpu_queue.py's PUBLISH_AUDIENCE.
+_PUBLISH_AUDIENCE = "self.publish"
 
 
 async def _ensure_curator_classifier_models(app_state) -> None:
@@ -1016,6 +1334,7 @@ app.state.config = AppConfig()
 
 app.state.config.ENABLE_CURATOR_API = ENABLE_CURATOR_API
 app.state.config.CURATOR_BASE_URLS = CURATOR_BASE_URLS
+app.state.config.CURATOR_CONTROL_BASE_URL = CURATOR_CONTROL_BASE_URL
 app.state.config.CURATOR_API_CONFIGS = CURATOR_API_CONFIGS
 
 ########################################
@@ -1506,14 +1825,27 @@ app.include_router(windows.router, prefix="/api/windows", tags=["windows"])
 app.include_router(vram_leases.router, prefix="/api/vram-leases", tags=["vram-leases"])
 app.include_router(benchmarks.router, prefix="/api/benchmarks", tags=["benchmarks"])
 app.include_router(queue.router, prefix="/api", tags=["queue"])
+app.include_router(backups.router, prefix="/api/backups", tags=["backups"])
 app.include_router(llamolotl.router, prefix="/llamolotl", tags=["llamolotl"])
 app.include_router(ollama.router, prefix="/ollama", tags=["ollama"])
 app.include_router(openai.router, prefix="/openai", tags=["openai"])
 app.include_router(anthropic.router, prefix="/anthropic", tags=["anthropic"])
 
+# MCP front door (self.ai#25): <your-host>/mcp/{server} proxies
+# Streamable-HTTP MCP traffic to backends behind self.ai auth. No prefix — the
+# route names its full /mcp/{server} path. First backend is the dead-simple
+# `echo` server; the real crew-system servers wire in behind the same paths.
+# NOTE: if API_KEY_ENDPOINT_RESTRICTIONS is on, /mcp/* must be in
+# API_KEY_ALLOWED_ENDPOINTS (the trailing /* is a prefix match -- the plain
+# path "/mcp" never matches, since every real route is "/mcp/{server}") or
+# sk- callers 403 while JWT/cookie callers work. See _path_is_allowed in
+# utils/auth.py (selfai/gitlab-profile#30).
+app.include_router(mcp_proxy.router, tags=["mcp"])
+
 
 app.include_router(pipelines.router, prefix="/api/v1/pipelines", tags=["pipelines"])
 app.include_router(tasks.router, prefix="/api/v1/tasks", tags=["tasks"])
+app.include_router(tokenization.router, prefix="/api/v1/tokenization", tags=["tokenization"])
 app.include_router(images.router, prefix="/api/v1/images", tags=["images"])
 app.include_router(audio.router, prefix="/api/v1/audio", tags=["audio"])
 app.include_router(
@@ -1526,6 +1858,11 @@ app.include_router(voice_catalog.router, prefix="/api/v1/voice-catalog", tags=["
 app.include_router(retrieval.router, prefix="/api/v1/retrieval", tags=["retrieval"])
 
 app.include_router(configs.router, prefix="/api/v1/configs", tags=["configs"])
+
+# Connection/pool/schema readout for Admin > Settings > Database (#94). Read
+# only -- the backup concerns that used to live on that page are under
+# /api/backups now.
+app.include_router(database.router, prefix="/api/v1/db", tags=["database"])
 
 app.include_router(auths.router, prefix="/api/v1/auths", tags=["auths"])
 app.include_router(users.router, prefix="/api/v1/users", tags=["users"])
@@ -1550,7 +1887,14 @@ app.include_router(channels.router, prefix="/api/v1/channels", tags=["channels"]
 app.include_router(chats.router, prefix="/api/v1/chats", tags=["chats"])
 
 app.include_router(models.router, prefix="/api/v1/models", tags=["models"])
+app.include_router(
+    model_versions.router, prefix="/api/v1/model-lines", tags=["model-lines"]
+)
+app.include_router(
+    model_weights.router, prefix="/api/v1/model-weights", tags=["model-weights"]
+)
 app.include_router(knowledge.router, prefix="/api/v1/knowledge", tags=["knowledge"])
+app.include_router(voices.router, prefix="/api/v1/voices", tags=["voices"])
 app.include_router(training.router, prefix="/api/v1/training", tags=["training"])
 app.include_router(prompts.router, prefix="/api/v1/prompts", tags=["prompts"])
 app.include_router(tools.router, prefix="/api/v1/tools", tags=["tools"])
@@ -1561,6 +1905,7 @@ app.include_router(groups.router, prefix="/api/v1/groups", tags=["groups"])
 app.include_router(files.router, prefix="/api/v1/files", tags=["files"])
 app.include_router(functions.router, prefix="/api/v1/functions", tags=["functions"])
 app.include_router(evaluations.router, prefix="/api/v1/evaluations", tags=["evaluations"])
+app.include_router(custom_evals.router, prefix="/api/v1/evaluations/custom", tags=["evaluations"])
 app.include_router(utils.router, prefix="/api/v1/utils", tags=["utils"])
 app.include_router(system.router, prefix="/api/system", tags=["system"])
 
@@ -1574,6 +1919,26 @@ app.include_router(system.router, prefix="/api/system", tags=["system"])
 
 @app.get("/api/models")
 async def get_models(request: Request, user=Depends(get_verified_user)):
+    """Models this user may call, one entry per model.
+
+    **Context budgeting (self.ai#87).** Entries carry two optional integer
+    fields a caller can budget a context window against:
+
+    - `context_length` — tokens one request may use, prompt plus generation.
+      This is the window the model is *served* with, not the context its
+      weights were trained to; for locally served models the two routinely
+      differ by an order of magnitude. Present for `unloaded` models too, since
+      that is the normal state and clients build their model table before
+      anything is loaded.
+    - `max_output_tokens` — a cap on generated tokens, when the backend sets one
+      below the window itself.
+
+    Either field is **omitted when it is not known** — for models behind an
+    external API that publishes no such number, for instance. Omitted means
+    "unknown, apply your own policy"; it never means unlimited. A field that is
+    present is a value to rely on, not a hint.
+    """
+
     def get_filtered_models(models, user):
         filtered_models = []
         for model in models:
@@ -1633,7 +1998,10 @@ async def get_public_models(request: Request):
     model. The response is deliberately minimal: no `info` (params/meta
     lineage such as `hf_repo`, connection details), no per-backend raw
     payload (`openai`/`ollama`/`llamolotl`), no user/ownership data —
-    just enough to populate a free-tier model picker.
+    just enough to populate a free-tier model picker, plus the context
+    fields `/api/models` publishes (`context_length`, `max_output_tokens`),
+    which a free-tier client has to budget against just as much (self.ai#87)
+    and which say nothing about lineage or connections.
     """
     models = await get_all_models(request)
 
@@ -1658,6 +2026,7 @@ async def get_public_models(request: Request):
                 "object": model.get("object", "model"),
                 "created": model.get("created"),
                 "owned_by": model.get("owned_by"),
+                **inherited_context_fields(model),
             }
         )
 
@@ -1812,9 +2181,47 @@ async def chat_completion(
             # sends is dropped unless it is named here.
             "web_crawl_kb_id": form_data.pop("web_crawl_kb_id", None),
         }
+
+        # T-301 (LR/R1). Bound `top_logprobs` HERE, at the core boundary, so an
+        # absurd value fails with a reason instead of being clamped silently by
+        # llama.cpp's `std::min(max_probs, n_probs_request)` -- which succeeds
+        # and returns a smaller set than was asked for, saying nothing.
+        #
+        # Returns None for every request that did not ask for logprobs, which is
+        # all ordinary chat: nothing is added to those payloads and nothing about
+        # them changes. The resolved settings ride on `metadata` rather than the
+        # payload so the relay can echo them to the client without sending them
+        # back upstream as a parameter.
+        try:
+            logprobs_settings = resolve_logprobs_request(form_data)
+        except TokenizationParamError as e:
+            # 400 with the reason as the detail, raised explicitly rather than
+            # left to the generic handler below: that one wraps the exception as
+            # `str(e)`, which is fine for a bare message but is the same
+            # collapse the self.ai#35 comment further down warns about. The
+            # client shows this text to an artist, so it should arrive intact.
+            raise HTTPException(status_code=400, detail=str(e))
+        if logprobs_settings is not None:
+            # T-302 (LR/R1-AC5). Refuse rather than downgrade: a session that
+            # silently answers without distributions looks like a broken feature
+            # rather than an unsupported model.
+            try:
+                assert_model_can_tokenize(model)
+            except TokenizationParamError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            metadata["logprobs_settings"] = logprobs_settings
+
         form_data["metadata"] = metadata
 
         form_data, events = await process_chat_payload(request, form_data, metadata, user, model)
+    except HTTPException:
+        # A downstream handler already chose a status and, increasingly, a
+        # MACHINE-READABLE detail body. Collapsing that into 400 + str(e)
+        # destroys both: `str()` on a Starlette HTTPException renders
+        # "503: {'detail': ..., 'gpu_locked_by': 'training'}" -- the status
+        # becomes a prefix inside a string and the dict becomes a Python repr.
+        # See the paired handler below for the self.ai#35 case this broke.
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1842,6 +2249,19 @@ async def chat_completion(
                 pass  # never break eval inference
 
         return await process_chat_response(request, response, form_data, user, events, metadata, tasks)
+    except HTTPException:
+        # self.ai#35: the GPU-window lease checkpoint (utils/lease_admission)
+        # refuses local generation with HTTPException(503, detail={"detail": ...,
+        # "gpu_locked_by": "training"}) so a caller can tell "GPU policy" from
+        # "llamolotl is down". Re-wrapping it as 400 + str(e) turned BOTH of
+        # those signals into one opaque string -- measured live 2026-08-04
+        # against an active training window, this endpoint answered
+        #   400 {"detail": "503: {'detail': 'GPU dedicated to the active
+        #        training window ...', 'gpu_locked_by': 'training'}"}
+        # while /llamolotl/chat/completions, which does not re-wrap, correctly
+        # answered 503 with the structured body. Pass HTTPExceptions through
+        # untouched; only non-HTTP exceptions become a 400.
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1852,6 +2272,190 @@ async def chat_completion(
 # Alias for chat_completion (Legacy)
 generate_chat_completions = chat_completion
 generate_chat_completion = chat_completion
+
+
+# Anthropic's documented status -> error.type pairing. An Anthropic SDK reads
+# error.type, not the prose message, to decide whether a failure is retryable.
+ANTHROPIC_ERROR_TYPES = {
+    400: "invalid_request_error",
+    401: "authentication_error",
+    403: "permission_error",
+    404: "not_found_error",
+    413: "request_too_large",
+    429: "rate_limit_error",
+    500: "api_error",
+    529: "overloaded_error",
+}
+
+
+def _anthropic_error(status_code: int, detail) -> JSONResponse:
+    """Render an error in the Anthropic envelope, preserving a structured detail.
+
+    self.ai#103 is the cautionary case in the other direction: a structured body
+    (the VRAM router's "needs an estimated N MiB") collapsed into a bare status
+    string and became undiagnosable. A dict detail is kept whole under `detail`
+    here for exactly that reason.
+    """
+    if isinstance(detail, dict):
+        message = detail.get("detail") or json.dumps(detail)
+    else:
+        message = str(detail)
+
+    error = {"type": ANTHROPIC_ERROR_TYPES.get(status_code, "api_error"), "message": message}
+    if isinstance(detail, dict):
+        error["detail"] = detail
+
+    return JSONResponse(status_code=status_code, content={"type": "error", "error": error})
+
+
+@app.post("/v1/messages")
+async def anthropic_messages(
+    request: Request,
+    form_data: dict,
+    user=Depends(get_verified_user),
+):
+    """Serve the Anthropic Messages API from self.ai's own model catalog (self.ai#112).
+
+    **This is the inbound direction, and it is not `/anthropic/*`.** The router
+    mounted at `/anthropic` is an *outbound adapter* -- OpenAI shape in, Anthropic
+    upstream out -- so despite the name it cannot serve a client that speaks
+    Anthropic natively. This endpoint is its mirror: Anthropic shape in, converted
+    to OpenAI, handed to the ordinary chat-completions path, and converted back on
+    the way out.
+
+    Because the request goes through `chat_completion` rather than around it, the
+    `model` is a **self.ai catalog id**, not an Anthropic one, and it may resolve to
+    anything self.ai serves -- a local llamolotl model, an opencode/Zen gateway,
+    Anthropic itself. Per-user model access control, the GPU-window checkpoint, and
+    the persistence path all apply unchanged, because they are that function's job
+    and not re-implemented here.
+
+    Not implemented, deliberately (see the issue): server-side tools, `thinking`
+    blocks, and the wider Messages surface. `thinking` is the load-bearing omission
+    -- a thinking block carries a signature only the originating model can produce,
+    so reasoning from a local model cannot be re-emitted as one that an SDK will
+    accept. Reasoning is dropped rather than forged.
+    """
+    if not request.app.state.MODELS:
+        await get_all_models(request)
+
+    model_id = form_data.get("model")
+    if not model_id:
+        return _anthropic_error(400, "field required: model")
+    if model_id not in request.app.state.MODELS:
+        # chat_completion answers 400 "Model not found" for this; Anthropic clients
+        # expect 404, and a wrong model id is by far the most common way this
+        # endpoint is misconfigured, so it is worth naming precisely.
+        return _anthropic_error(404, f"model: {model_id}")
+    if form_data.get("max_tokens") is None:
+        # Required on Anthropic, optional on OpenAI -- so the conversion would
+        # silently succeed and the client would get a reply it considers invalid.
+        return _anthropic_error(400, "field required: max_tokens")
+
+    openai_payload = convert_payload_anthropic_to_openai(form_data)
+    stream = openai_payload.get("stream", False)
+
+    try:
+        response = await chat_completion(request, openai_payload, user)
+    except HTTPException as e:
+        return _anthropic_error(e.status_code, e.detail)
+
+    if stream:
+        return StreamingResponse(
+            convert_streaming_response_openai_to_anthropic(response, model=model_id),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+            background=getattr(response, "background", None),
+        )
+
+    if not isinstance(response, dict):
+        # A non-streaming request that came back as a stream anyway. Rather than
+        # hand the client a body it cannot parse, drain it through the same
+        # converter and let it build the message.
+        return StreamingResponse(
+            convert_streaming_response_openai_to_anthropic(response, model=model_id),
+            media_type="text/event-stream",
+            background=getattr(response, "background", None),
+        )
+
+    return convert_response_openai_to_anthropic(response, model=model_id)
+
+
+def _anthropic_created_at(created):
+    """``created`` as an RFC-3339 string, or None when it cannot be one.
+
+    The catalog is NOT type-uniform in this field and that is what broke this
+    endpoint: llamolotl models carry an int epoch, while every Anthropic-provider
+    entry carries an ISO-8601 STRING (``'2026-07-24T00:00:00Z'``). The original
+    guard tested truthiness rather than type, so those strings sailed past it
+    into ``datetime.fromtimestamp()`` and raised
+
+        TypeError: 'str' object cannot be interpreted as an integer
+
+    which surfaced as a bare HTTP 500 on the whole listing. Not for an edge-case
+    model either: any Anthropic model in the catalog poisoned the entire
+    response, and there are always ten. An Anthropic client pointed at self.ai
+    therefore could not discover ANY model -- the exact failure this endpoint
+    exists to prevent (self.ai#112), and a plausible cause of an agent CLI
+    falling back to a default context window and then overrunning ours.
+
+    Never raises. A malformed value costs one model its timestamp; it must not
+    cost the caller the catalog.
+    """
+    # Local import: this module has no top-level `datetime`/`UTC` (the one other
+    # user imports it inside its own function), and a module-scope NameError here
+    # would take the whole app down at import rather than one endpoint.
+    from datetime import UTC, datetime
+
+    if created is None or isinstance(created, bool):
+        return None
+    if isinstance(created, (int, float)):
+        try:
+            return datetime.fromtimestamp(created, UTC).isoformat().replace("+00:00", "Z")
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(created, str):
+        text = created.strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
+    return None
+
+
+@app.get("/v1/models")
+async def anthropic_list_models(request: Request, user=Depends(get_verified_user)):
+    """Anthropic-shaped model listing, so an Anthropic client pointed at self.ai
+    can discover what it may call (self.ai#112).
+
+    Same catalog and the same per-user access filtering as `/api/models` -- this
+    only reshapes it. Pagination fields are reported honestly rather than omitted:
+    the underlying listing is not paginated, so `has_more` is always false.
+    """
+    listing = await get_models(request, user)
+    models = listing.get("data") or []
+
+    data = [
+        {
+            "type": "model",
+            "id": model.get("id"),
+            "display_name": model.get("name") or model.get("id"),
+            "created_at": _anthropic_created_at(model.get("created")),
+        }
+        for model in models
+    ]
+
+    return {
+        "data": data,
+        "has_more": False,
+        "first_id": data[0]["id"] if data else None,
+        "last_id": data[-1]["id"] if data else None,
+    }
 
 
 @app.post("/api/completions")
@@ -1877,6 +2481,11 @@ async def text_completion(
             except Exception as e:
                 raise e
 
+    except HTTPException:
+        # Same passthrough as /api/chat/completions above -- notably this keeps
+        # check_model_access's 403 a 403 instead of reporting it as a 400 whose
+        # detail is the string "403: Model not found".
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1902,6 +2511,10 @@ async def text_completion(
                 pass  # never break eval inference
 
         return response
+    except HTTPException:
+        # self.ai#35: the lease checkpoint guards generate_completion too, so
+        # this endpoint flattened the GPU-window 503 exactly like the chat one.
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

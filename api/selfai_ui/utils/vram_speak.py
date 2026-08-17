@@ -136,7 +136,11 @@ class SpeakReleaseTransport:
         return text.rstrip("/")
 
     async def request_release(
-        self, consumer_id: str, amount_bytes: int, timeout_seconds: float
+        self,
+        consumer_id: str,
+        amount_bytes: int,
+        timeout_seconds: float,
+        force: bool = False,
     ) -> ReleaseResponse:
         base = self._resolve_control_base()
         if base is None:
@@ -163,7 +167,15 @@ class SpeakReleaseTransport:
             return ReleaseResponse(outcome=ReleaseOutcome.TIMEOUT)
 
         endpoint = f"{base}{RELEASE_PATH}"
-        body = {"target_bytes": int(amount_bytes), "timeout_seconds": float(timeout_seconds)}
+        # ``force`` (admin e-stop) tells self.speak to skip its drain-wait and
+        # unload BOTH engines (Kokoro + Chatterbox) immediately. Default False →
+        # the cooperative body is byte-for-byte unchanged apart from the extra
+        # explicit ``"force": false`` (the cooperative broker path never sets it).
+        body = {
+            "target_bytes": int(amount_bytes),
+            "timeout_seconds": float(timeout_seconds),
+            "force": bool(force),
+        }
 
         try:
             async with self._client_factory(timeout_seconds) as client:
@@ -308,24 +320,47 @@ class ConsumerAwareReleaseTransport:
     so the routing is unit-testable without importing the whole app; ``main.py``
     instantiates and installs it at the lifespan seam."""
 
-    def __init__(self, speak_transport, llamolotl_transport, sketch_transport=None):
+    def __init__(
+        self,
+        speak_transport,
+        llamolotl_transport,
+        sketch_transport=None,
+        extra_transports=None,
+    ):
         self._speak = speak_transport
         self._llamolotl = llamolotl_transport
         self._sketch = sketch_transport
+        # {consumer_id: transport} checked BEFORE the named branches and the
+        # fallthrough (self.ai#88). Every consumer added since llamolotl has
+        # needed its own hardcoded branch here, and forgetting one does not fail
+        # loudly — it silently routes that consumer's release to self.llamolotl's
+        # endpoint, the exact mis-route this class was written to prevent. A map
+        # lets a new consumer be wired at the seam in main.py with no edit here,
+        # so the sharp edge stops growing a new corner per consumer.
+        self._extra = dict(extra_transports or {})
 
     async def request_release(
-        self, consumer_id: str, amount_bytes: int, timeout_seconds: float
+        self,
+        consumer_id: str,
+        amount_bytes: int,
+        timeout_seconds: float,
+        force: bool = False,
     ) -> ReleaseResponse:
+        transport = self._extra.get(consumer_id)
+        if transport is not None:
+            return await transport.request_release(
+                consumer_id, amount_bytes, timeout_seconds, force=force
+            )
         if consumer_id == SPEAK_AUDIENCE:
             return await self._speak.request_release(
-                consumer_id, amount_bytes, timeout_seconds
+                consumer_id, amount_bytes, timeout_seconds, force=force
             )
         if consumer_id == SKETCH_AUDIENCE and self._sketch is not None:
             return await self._sketch.request_release(
-                consumer_id, amount_bytes, timeout_seconds
+                consumer_id, amount_bytes, timeout_seconds, force=force
             )
         return await self._llamolotl.request_release(
-            consumer_id, amount_bytes, timeout_seconds
+            consumer_id, amount_bytes, timeout_seconds, force=force
         )
 
 

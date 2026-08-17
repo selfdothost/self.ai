@@ -45,6 +45,7 @@ from selfai_ui.models.vram_leases import (
 )
 from selfai_ui.utils.vram_broker import (
     HOLDER_OUTCOME_DENIED,
+    HOLDER_OUTCOME_INELIGIBLE_NEVER_OBSERVED,
     HOLDER_OUTCOME_INELIGIBLE_NO_POD_IDENTITY,
     HOLDER_OUTCOME_REAP_FAILED,
     HOLDER_OUTCOME_REAPED,
@@ -95,15 +96,51 @@ def vram_db(tmp_path):
 
     original = vram_leases.get_db
     vram_leases.get_db = get_db
+    _TARGETS.clear()
     yield {"engine": engine, "file": str(db_file), "Session": Session}
+    _TARGETS.clear()
     vram_leases.get_db = original
     engine.dispose()
 
 
+# Trusted reap targets, mirroring what startup installs from env (self.ai#75).
+# Force-reap no longer aims using the consumer's REGISTRY ROW — that row is
+# writable by any mesh service via /vram-leases/register (#79) — so a test that
+# wants a holder to be reap-eligible has to install a target for it, exactly as
+# _install_pod_reaper() does at boot. _register() keeps doing both so every
+# existing case reads the same as before.
+_TARGETS: dict = {}
+
+
+def _broker(**kwargs):
+    """A broker with the trusted target map installed for whatever _register()
+    has been given a namespace+selector for."""
+    broker = VramBrokerImpl(**kwargs)
+    broker.set_reap_targets(dict(_TARGETS))
+    return broker
+
+
 def _register(
-    consumer_id, held, priority=0, capacity=CARD, namespace=None, selector=None
+    consumer_id,
+    held,
+    priority=0,
+    capacity=CARD,
+    namespace=None,
+    selector=None,
+    observed=True,
 ):
-    return VramLeases.register(
+    """Register a holder, and by default record that core has actually HEARD
+    from it at least once (self.ai#105).
+
+    ``register()`` deliberately does not set ``last_observed_at`` — registration
+    is core asserting a consumer exists from its own config, not the consumer
+    reporting. Every case in this file models a holder that reported healthily
+    and *then* went quiet, so the heartbeat here is what makes that pre-condition
+    true rather than accidental. Pass ``observed=False`` for the opposite case: a
+    consumer core has never once heard from, which R5 must refuse to reap."""
+    if namespace and selector:
+        _TARGETS[consumer_id] = (namespace, selector)
+    row = VramLeases.register(
         VramConsumerRegisterForm(
             consumer_id=consumer_id,
             total_capacity_bytes=capacity,
@@ -113,6 +150,9 @@ def _register(
             k8s_pod_selector=selector,
         )
     )
+    if observed:
+        VramLeases.heartbeat(consumer_id, held)
+    return row
 
 
 def _make_stale(consumer_id):
@@ -218,7 +258,7 @@ def test_ac1_explicit_denier_never_reaped_only_stale(vram_db):
 
     transport = MappedTransport(responses={"denier": _DENIED})
     reaper = FakeReaper(responses={"app=ghost": _reap_confirmed()})
-    broker = VramBrokerImpl(transport=transport, reaper=reaper)
+    broker = _broker(transport=transport, reaper=reaper)
 
     # free = 24 - 16 = 8 GiB. Request 16 GiB: cooperative reclamation asks the
     # denier (refused), then escalation reaps the stale ghost (8 GiB) -> 16 free.
@@ -252,7 +292,7 @@ def test_ac2_free_path_never_calls_reaper(vram_db):
     )
     _make_stale("ghost")
     reaper = FakeReaper(responses={"app=ghost": _reap_confirmed()})
-    broker = VramBrokerImpl(transport=MappedTransport(), reaper=reaper)
+    broker = _broker(transport=MappedTransport(), reaper=reaper)
 
     # free = 24 - 8 = 16 GiB; a 4 GiB request is satisfied straight from free.
     result = asyncio.run(broker.request_lease("trainer", 4 * GiB, priority=0))
@@ -277,7 +317,7 @@ def test_ac2_cooperative_reclamation_sufficient_never_calls_reaper(vram_db):
 
     transport = MappedTransport(responses={"coop": _confirmed(0)})  # frees its 8
     reaper = FakeReaper(responses={"app=ghost": _reap_confirmed()})
-    broker = VramBrokerImpl(transport=transport, reaper=reaper)
+    broker = _broker(transport=transport, reaper=reaper)
 
     # free = 24 - 16 = 8 GiB; request 12 GiB -> coop frees 8 -> 16 free -> grant,
     # before the escalation loop is ever entered. Requester priority 100 outranks
@@ -301,7 +341,7 @@ def test_ac2_no_reaper_installed_behaves_as_before_r5(vram_db):
         "ghost", held=10 * GiB, namespace="ns", selector="app=ghost"
     )
     _make_stale("ghost")
-    broker = VramBrokerImpl(transport=MappedTransport())  # reaper defaults to None
+    broker = _broker(transport=MappedTransport())  # reaper defaults to None
 
     # free = 14 GiB; request 20 GiB needs the stale holder — with no reaper it is
     # unreachable, so this is denied up front and no holder appears in breakdown.
@@ -328,7 +368,7 @@ def test_ac5_confirmed_reap_clears_held_and_grant_retries(vram_db):
     _make_stale("ghost")
 
     reaper = FakeReaper(responses={"app=ghost": _reap_confirmed(pods_deleted=1)})
-    broker = VramBrokerImpl(transport=MappedTransport(), reaper=reaper)
+    broker = _broker(transport=MappedTransport(), reaper=reaper)
 
     # free = 14 GiB; request 20 GiB. No non-stale holders to ask, so cooperative
     # reclamation is a no-op; the escalation reaps the stale ghost (10 GiB) ->
@@ -338,8 +378,9 @@ def test_ac5_confirmed_reap_clears_held_and_grant_retries(vram_db):
 
     assert isinstance(result, LeaseGranted)
     assert result.granted_bytes == 20 * GiB
-    # The requester's hold is written to the registry before success returns.
-    assert VramLeases.get("trainer").held_bytes == 20 * GiB
+    # The requester's hold is written to the registry before success returns —
+    # as a reservation, since nothing has been observed on the card yet (#76).
+    assert VramLeases.get("trainer").reserved_bytes == 20 * GiB
 
     # The stale holder's held was cleared via record_reaped_release: held->0,
     # lease_state back to steady (same mechanism reconcile uses).
@@ -370,7 +411,7 @@ def test_ac6_failed_reap_falls_through_to_structured_denial(vram_db):
     reaper = FakeReaper(
         responses={"app=ghost": _reap_failed("RBAC denied (HTTP 403)")}
     )
-    broker = VramBrokerImpl(transport=MappedTransport(), reaper=reaper)
+    broker = _broker(transport=MappedTransport(), reaper=reaper)
 
     # free = 14 GiB; request 20 GiB. The only capacity is the stale ghost's, but
     # its reap FAILS -> nothing is freed -> structured denial. Requester priority
@@ -410,7 +451,7 @@ def test_ac7_no_pod_identity_stale_holder_never_reaped(vram_db):
     _make_stale("ghost")
 
     reaper = FakeReaper(responses={"app=ghost": _reap_confirmed()})
-    broker = VramBrokerImpl(transport=MappedTransport(), reaper=reaper)
+    broker = _broker(transport=MappedTransport(), reaper=reaper)
 
     # free = 24 - 14 = 10 GiB; request 18 GiB. The no-identity holder is asked
     # first (lower priority) and recorded ineligible WITHOUT a reap; the ghost is
@@ -462,7 +503,7 @@ def test_ac8_denial_breakdown_distinguishes_reap_outcomes(vram_db):
             "app=ghostB": _reap_failed("k8s API error (HTTP 500)"),
         }
     )
-    broker = VramBrokerImpl(transport=transport, reaper=reaper)
+    broker = _broker(transport=transport, reaper=reaper)
 
     # free = 24 - 12 = 12 GiB; request 22 GiB. coop denies (0 freed), ghostA is
     # reaped (+4 -> 16 free), ghostB reap fails (0) -> still short of 22 -> DENY,
@@ -682,3 +723,269 @@ def test_reaper_logs_are_distinguishable_vram_reap_prefix(vram_db, caplog):
     assert all("vram-reap:" in m for m in messages)
     # ... and never masquerades as a cooperative vram-broker: release.
     assert not any("vram-broker:" in m for m in messages)
+
+
+# ---------------------------------------------------------------------------
+# self.ai#75/#79 — the reap target comes from core's trusted config, and a
+#                  registration can NEVER redirect a pod deletion
+# ---------------------------------------------------------------------------
+
+
+def test_registry_row_cannot_redirect_the_reaper(vram_db):
+    """A holder's registry row carries k8s_namespace/k8s_pod_selector, and
+    /vram-leases/register is gated on a shared-secret ticket with NO caller
+    identity (#79) — so any mesh service could rewrite them. If the broker aimed
+    with those fields, that would be an arbitrary-pod-delete primitive inside the
+    namespace. It must aim with core's trusted map instead."""
+    _register("trainer", held=0)
+    # Registered with the LEGITIMATE identity, so a trusted target is installed.
+    _register("ghost", held=10 * GiB, namespace="ns", selector="app=ghost")
+    _make_stale("ghost")
+
+    # Now simulate a hostile/mistaken re-registration pointing the row at core
+    # itself. The trusted map is untouched by this.
+    VramLeases.register(
+        VramConsumerRegisterForm(
+            consumer_id="ghost",
+            total_capacity_bytes=CARD,
+            held_bytes=10 * GiB,
+            k8s_namespace="self-ai",
+            k8s_pod_selector="app.kubernetes.io/name=selfai-api",
+        )
+    )
+    _make_stale("ghost")
+
+    reaper = FakeReaper(responses={"app=ghost": _reap_confirmed(pods_deleted=1)})
+    broker = _broker(transport=MappedTransport(), reaper=reaper)
+
+    asyncio.run(broker.request_lease("trainer", 20 * GiB, priority=100))
+
+    # The reaper was aimed at the CONFIGURED selector, never the row's.
+    assert reaper.reaped_selectors == ["app=ghost"]
+    assert "app.kubernetes.io/name=selfai-api" not in reaper.reaped_selectors
+
+
+def test_holder_with_no_trusted_target_is_never_reaped(vram_db):
+    """R5-AC7 opt-in, now sourced from config: a stale holder core has no
+    configured identity for is ineligible even though its ROW names one."""
+    _register("trainer", held=0)
+    # Straight to the registry, bypassing _register, so NO trusted target exists.
+    VramLeases.register(
+        VramConsumerRegisterForm(
+            consumer_id="ghost",
+            total_capacity_bytes=CARD,
+            held_bytes=10 * GiB,
+            k8s_namespace="ns",
+            k8s_pod_selector="app=ghost",
+        )
+    )
+    _make_stale("ghost")
+
+    reaper = FakeReaper(responses={"app=ghost": _reap_confirmed()})
+    broker = _broker(transport=MappedTransport(), reaper=reaper)
+
+    result = asyncio.run(broker.request_lease("trainer", 20 * GiB, priority=100))
+
+    assert reaper.reaped_selectors == []
+    assert isinstance(result, LeaseDenied)
+    assert VramLeases.get("ghost").held_bytes == 10 * GiB
+
+
+def test_set_reap_targets_drops_half_formed_entries(vram_db):
+    """A partial target is not something to aim a pod deletion with."""
+    broker = VramBrokerImpl()
+    broker.set_reap_targets(
+        {
+            "good": ("ns", "app=good"),
+            "blank-ns": ("", "app=x"),
+            "blank-sel": ("ns", "   "),
+            "none": None,
+        }
+    )
+    assert broker._reap_target_for("good") == ("ns", "app=good")
+    assert broker._reap_target_for("blank-ns") is None
+    assert broker._reap_target_for("blank-sel") is None
+    assert broker._reap_target_for("none") is None
+    assert broker._reap_target_for("never-registered") is None
+
+
+def test_broker_with_no_targets_installed_reaps_nothing(vram_db):
+    """Safe default: a reaper present but no targets installed must reap nothing
+    rather than fall back to the registry row."""
+    _register("trainer", held=0)
+    _register("ghost", held=10 * GiB, namespace="ns", selector="app=ghost")
+    _make_stale("ghost")
+
+    reaper = FakeReaper(responses={"app=ghost": _reap_confirmed()})
+    broker = VramBrokerImpl(transport=MappedTransport(), reaper=reaper)  # no targets
+
+    result = asyncio.run(broker.request_lease("trainer", 20 * GiB, priority=100))
+
+    assert reaper.reaped_selectors == []
+    assert isinstance(result, LeaseDenied)
+
+
+# ---------------------------------------------------------------------------
+# self.ai#105 — a consumer core has NEVER heard from is not a reap target
+#
+# `last_reported_at` cannot tell "registered at boot and never reachable" apart
+# from "reported healthily, then died": register() writes it, so both simply age
+# past the staleness bound. Force-reap DELETES A POD, so it must not act on that
+# ambiguity — the first case is a rollout-ordering gap (the consumer probably is
+# not deployed yet), and deleting its pod turns that gap into destroyed work.
+#
+# Concretely, this is the self.curator case: core registers it from its own
+# manifest env, polls an endpoint that 404s until self.curator ships, and about
+# two minutes later has a stale, pod-identified, reap-eligible consumer that was
+# never once reachable.
+# ---------------------------------------------------------------------------
+
+
+def test_a_never_observed_consumer_is_never_reaped(vram_db):
+    """The regression test for self.ai#105: registered, given a pod identity,
+    aged into stale, and STILL not a reap target — because nothing has ever come
+    back from it."""
+    _register("trainer", held=0)
+    _register(
+        "newborn",
+        held=10 * GiB,
+        priority=1,
+        namespace="ns",
+        selector="app=newborn",
+        observed=False,          # <- never once heard from
+    )
+    _make_stale("newborn")
+
+    reaper = FakeReaper(responses={"app=newborn": _reap_confirmed()})
+    broker = _broker(transport=MappedTransport(), reaper=reaper)
+
+    result = asyncio.run(broker.request_lease("trainer", 18 * GiB, priority=100))
+
+    # The reaper was never even consulted for it.
+    assert reaper.reaped_selectors == []
+    assert "newborn" not in [c[0] for c in reaper.calls]
+    # Its held is untouched — a refusal to reap is not a refusal to account.
+    newborn = VramLeases.get("newborn")
+    assert newborn.held_bytes == 10 * GiB
+    assert VramLeases.effective_state(newborn) == LEASE_STATE_STALE
+    # And the grant is denied rather than silently satisfied from capacity the
+    # escalation declined to reclaim.
+    assert isinstance(result, LeaseDenied)
+
+
+def test_never_observed_is_distinguishable_from_no_pod_identity(vram_db):
+    """Two different refusals with two different fixes: one is 'an operator chose
+    not to opt this consumer in', the other is 'this consumer has never been
+    reachable'. Collapsing them would send someone to check the wrong config.
+
+    Shaped like the AC7 test: the refused holder is asked FIRST (lower priority)
+    and a second, genuinely reapable holder supplies the shortfall — otherwise
+    the request is denied up front by the freeable arithmetic and the escalation
+    loop never runs to record an outcome at all."""
+    _register("trainer", held=0)
+    _register(
+        "newborn",
+        held=4 * GiB,
+        priority=1,
+        namespace="ns",
+        selector="app=newborn",
+        observed=False,          # <- never once heard from
+    )
+    _make_stale("newborn")
+    # A properly-observed stale holder that IS reapable, providing the capacity.
+    _register(
+        "ghost", held=10 * GiB, priority=2, namespace="ns", selector="app=ghost"
+    )
+    _make_stale("ghost")
+
+    reaper = FakeReaper(responses={"app=ghost": _reap_confirmed()})
+    broker = _broker(transport=MappedTransport(), reaper=reaper)
+
+    result = asyncio.run(broker.request_lease("trainer", 18 * GiB, priority=100))
+
+    assert isinstance(result, LeaseGranted)
+    # The never-observed holder was never passed to the reaper; the ghost was.
+    assert reaper.reaped_selectors == ["app=ghost"]
+    by_id = {h.consumer_id: h for h in result.reclaimed}
+    assert by_id["newborn"].outcome == HOLDER_OUTCOME_INELIGIBLE_NEVER_OBSERVED
+    assert by_id["newborn"].outcome != HOLDER_OUTCOME_INELIGIBLE_NO_POD_IDENTITY
+    assert by_id["newborn"].actually_released == 0
+    assert "never observed" in by_id["newborn"].reason
+    # Its held is untouched — refusing to reap is not refusing to account.
+    assert VramLeases.get("newborn").held_bytes == 4 * GiB
+
+
+def test_one_heartbeat_makes_a_stale_holder_reapable_again(vram_db):
+    """The guard is about evidence, not a permanent exemption. Once a consumer
+    has proven it exists, going quiet later is an ordinary fault and R5 behaves
+    exactly as it always did."""
+    _register("trainer", held=0)
+    _register(
+        "newborn",
+        held=10 * GiB,
+        priority=1,
+        namespace="ns",
+        selector="app=newborn",
+        observed=False,
+    )
+    # One real observation arrives ...
+    VramLeases.heartbeat("newborn", 10 * GiB)
+    # ... and only THEN does it go quiet.
+    _make_stale("newborn")
+
+    reaper = FakeReaper(responses={"app=newborn": _reap_confirmed()})
+    broker = _broker(transport=MappedTransport(), reaper=reaper)
+
+    result = asyncio.run(broker.request_lease("trainer", 18 * GiB, priority=100))
+
+    assert reaper.reaped_selectors == ["app=newborn"]
+    assert isinstance(result, LeaseGranted)
+
+
+def test_registration_alone_is_not_an_observation(vram_db):
+    """The distinction the whole fix rests on. If register() ever started writing
+    last_observed_at, the guard would silently become a no-op and #105 would
+    reopen with no failing test to catch it."""
+    _register("newborn", held=GiB, observed=False)
+    assert VramLeases.get("newborn").last_observed_at is None
+    # Re-registering (what a core restart does) must not manufacture evidence.
+    _register("newborn", held=GiB, observed=False)
+    assert VramLeases.get("newborn").last_observed_at is None
+    # A heartbeat is what counts.
+    VramLeases.heartbeat("newborn", GiB)
+    assert VramLeases.get("newborn").last_observed_at is not None
+
+
+def test_a_confirmed_release_also_counts_as_observation(vram_db):
+    """A consumer that answered a release request has demonstrably been reached,
+    which is the same evidence a heartbeat provides."""
+    _register("newborn", held=4 * GiB, observed=False)
+    assert VramLeases.get("newborn").last_observed_at is None
+
+    VramLeases.record_confirmed_release("newborn", 0)
+
+    assert VramLeases.get("newborn").last_observed_at is not None
+
+
+def test_never_observed_capacity_is_not_counted_as_freeable(vram_db):
+    """AC7 honesty: if the escalation will refuse to reclaim it, the up-front
+    'can this request ever be satisfied' arithmetic must not count it either —
+    otherwise the grant passes that check and fails later, less legibly."""
+    _register("trainer", held=0)
+    _register(
+        "newborn",
+        held=20 * GiB,
+        priority=1,
+        namespace="ns",
+        selector="app=newborn",
+        observed=False,
+    )
+    _make_stale("newborn")
+
+    broker = _broker(transport=MappedTransport(), reaper=FakeReaper(responses={}))
+    # free = 4 GiB. Only the never-observed holder's 20 GiB could cover 18 GiB,
+    # and it is not reclaimable — so this is denied up front.
+    result = asyncio.run(broker.request_lease("trainer", 18 * GiB, priority=100))
+
+    assert isinstance(result, LeaseDenied)
+    assert result.freeable_bytes < 18 * GiB

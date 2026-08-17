@@ -776,3 +776,68 @@ def test_empty_search_returns_unfoldered_set(authenticated_user):
     assert foldered not in search_ids, "foldered chat leaked into empty-search results"
     # Same unfoldered membership as the recent-list default.
     assert search_ids == set(_recent_chat_ids(authenticated_user))
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 X-3 wire: `kind` separates a surface's history from ordinary chat.
+#
+# These are ENDPOINT tests on purpose. The form-level tests in
+# test_chat_kind_separation.py validate ChatForm, and the model-level ones
+# validate the column and the filter -- but both passed while the router still
+# called insert_new_chat() WITHOUT the kind, which is exactly the gap that made
+# T-201 look unblocked when it was not. Only a round-trip through the endpoint
+# catches a missing pass-through.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.tier0
+def test_created_chat_defaults_to_ordinary_chat(authenticated_user):
+    """No kind sent -- every request the chat client makes -- is ordinary chat."""
+    resp = authenticated_user.post(
+        "/api/v1/chats/new",
+        json={"chat": {"title": "Plain", "messages": []}},
+    )
+    assert resp.status_code == 200
+    assert resp.json().get("kind") is None
+
+
+@pytest.mark.tier0
+def test_a_declared_kind_is_persisted_through_the_endpoint(authenticated_user):
+    """THE PASS-THROUGH GUARD. Drop `kind=form_data.kind` in the router and this
+    is the only test that fails."""
+    resp = authenticated_user.post(
+        "/api/v1/chats/new",
+        json={"chat": {"title": "Session", "messages": []}, "kind": "tokenization"},
+    )
+    assert resp.status_code == 200
+    assert resp.json().get("kind") == "tokenization"
+
+
+@pytest.mark.tier0
+def test_a_session_does_not_appear_in_the_chat_list(authenticated_user):
+    """The point of the column, end to end: the chat sidebar's list must not
+    show another surface's conversations."""
+    authenticated_user.post(
+        "/api/v1/chats/new",
+        json={"chat": {"title": "Ordinary", "messages": []}},
+    )
+    authenticated_user.post(
+        "/api/v1/chats/new",
+        json={"chat": {"title": "Session", "messages": []}, "kind": "tokenization"},
+    )
+
+    resp = authenticated_user.get("/api/v1/chats/")
+    assert resp.status_code == 200
+    titles = [c.get("title") for c in resp.json()]
+    assert "Ordinary" in titles
+    assert "Session" not in titles, "a tokenization session leaked into the chat list"
+
+
+@pytest.mark.tier0
+def test_an_unknown_kind_is_rejected_at_the_endpoint(authenticated_user):
+    """A kind matching no surface's query would orphan the chat in the UI."""
+    resp = authenticated_user.post(
+        "/api/v1/chats/new",
+        json={"chat": {"title": "Bad", "messages": []}, "kind": "not-a-surface"},
+    )
+    assert resp.status_code == 422

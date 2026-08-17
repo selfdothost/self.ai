@@ -10,7 +10,7 @@
 # Result: a few-hundred-MB image, not multi-GB. Build context is this backend
 # directory; nothing here builds on the bastion (CI + kaniko -> container.home).
 
-FROM python:3.11-slim-bookworm AS base
+FROM python:3.13-slim-bookworm AS base
 
 ENV ENV=prod \
     PORT=8080 \
@@ -21,8 +21,7 @@ ENV ENV=prod \
 ENV ENABLE_OLLAMA_API=False \
     ENABLE_OPENAI_API=False \
     SCARF_NO_ANALYTICS=true \
-    DO_NOT_TRACK=true \
-    ANONYMIZED_TELEMETRY=false
+    DO_NOT_TRACK=true
 
 # Caches live under the data volume; no models are baked at build time.
 ENV SENTENCE_TRANSFORMERS_HOME="/app/backend/data/cache/embedding/models" \
@@ -33,13 +32,16 @@ ENV SENTENCE_TRANSFORMERS_HOME="/app/backend/data/cache/embedding/models" \
 WORKDIR /app/backend
 
 # Minimal system deps: a build toolchain for the few sdist-only wheels, pandoc
-# for document parsing, curl+jq for the healthcheck, ffmpeg for pydub's
-# mediainfo()/ffprobe call in audio.py's is_mp4_audio() check (the STT-forward
-# path to self.transcribe crashed with "No such file or directory: 'ffprobe'"
-# on any mp4/AAC browser recording -- this image previously shipped with no
-# ffmpeg at all, on the assumption STT was fully externalized and wouldn't
-# need it locally; that assumption was wrong, the mp4-detection probe runs
-# regardless of engine). Still NO libsm6/libxext6 (those were for OCR/cv2,
+# for document parsing, curl+jq for the healthcheck, ffmpeg/ffprobe for
+# utils/audio_ffmpeg.py, which audio.py uses to probe and transcode uploads
+# (the STT-forward path to self.transcribe crashed with "No such file or
+# directory: 'ffprobe'" on any mp4/AAC browser recording -- this image
+# previously shipped with no ffmpeg at all, on the assumption STT was fully
+# externalized and wouldn't need it locally; that assumption was wrong, the
+# mp4-detection probe runs regardless of engine). These binaries are now
+# called DIRECTLY rather than through pydub, which was only ever a wrapper
+# around them (#106) -- so ffmpeg is a harder requirement than before, not a
+# softer one. Still NO libsm6/libxext6 (those were for OCR/cv2,
 # dropped) and NO CUDA -- this stays torch-free.
 # TODO(slim): move to a multi-stage build to drop build-essential from runtime.
 RUN apt-get update && \
@@ -73,8 +75,17 @@ COPY requirements-api.txt ./requirements-api.txt
 # THE BUILD if the wiring can't produce a bearer header -- so a mismatched tree
 # can never reach a pod. Unit tests inject a fake k8s client and never exercise
 # this, which is why it only ever surfaced live (T-007).
+#
+# `--only-binary numpy` is the regression guard for self.ai#108. numpy publishes
+# no 1.x wheel for cp313, so ANY dependency that re-caps numpy<2 silently drops
+# a ~50s source compile back into every image build -- slow, and invisible
+# unless someone reads the trace. With this flag that situation fails the build
+# outright ("numpy has no usable wheels") instead of quietly costing a minute.
+# Scoped to numpy alone: langdetect and red-black-tree-mod still build from
+# source here (both fast, pure-python sdists) and are deliberately left alone.
+# chroma-hnswlib used to be the slow one; it left with the chromadb backend.
 RUN pip3 install --no-cache-dir uv && \
-    uv pip install --system --no-cache -r requirements-api.txt && \
+    uv pip install --system --no-cache --only-binary numpy -r requirements-api.txt && \
     pip3 install --no-cache-dir --force-reinstall --no-deps "kubernetes_asyncio>=35.0.0" && \
     mkdir -p /tmp/sa-assert && \
     printf 'build-assert-token' > /tmp/sa-assert/token && \

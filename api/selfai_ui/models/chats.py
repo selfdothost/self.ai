@@ -2,7 +2,7 @@ import time
 import uuid
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy import JSON, BigInteger, Boolean, Column, String, Text, and_, or_, text
 
 from selfai_ui.internal.db import Base, get_db
@@ -31,6 +31,22 @@ class Chat(Base):
     meta = Column(JSON, server_default="{}")
     folder_id = Column(Text, nullable=True)
 
+    # Which surface owns this conversation. NULL means ordinary chat -- every
+    # row that existed before this column, and every row the chat path still
+    # writes -- so the default costs no backfill and changes no behaviour.
+    #
+    # A COLUMN rather than a `meta` key, deliberately. Every list filter here
+    # (folder_id, archived, pinned) is a column because the lists are paginated
+    # server-side: filtering on a JSON key needs a dialect-specific expression
+    # and PostgreSQL and SQLite differ, while filtering in Python after the
+    # query silently breaks skip/limit, returning short pages rather than an
+    # error. See self.chat `context/plans/build-site-tokenization-shell.md`,
+    # finding A.
+    #
+    # A KIND rather than a boolean, so the next surface needing its own history
+    # does not add another column.
+    kind = Column(Text, nullable=True)
+
 
 class ChatModel(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -49,6 +65,7 @@ class ChatModel(BaseModel):
 
     meta: dict = {}
     folder_id: Optional[str] = None
+    kind: Optional[str] = None
 
 
 ####################
@@ -56,8 +73,32 @@ class ChatModel(BaseModel):
 ####################
 
 
+#: The surfaces allowed to own a conversation. `None` (ordinary chat) is always
+#: permitted and is not listed here.
+#:
+#: An ALLOWLIST rather than a free string, because `kind` is a filter column: an
+#: unvalidated value would let a client write junk that matches no surface's
+#: query, making the chat invisible in its own list with no way to get it back
+#: from the UI. Scoped to the caller's own rows, so this is robustness rather
+#: than a cross-user concern -- but a self-inflicted orphan is still a bug, and
+#: a typo'd kind would produce one silently.
+KNOWN_CHAT_KINDS = frozenset({"tokenization"})
+
+
 class ChatForm(BaseModel):
     chat: dict
+    #: Which surface owns this conversation; omitted means ordinary chat.
+    kind: Optional[str] = None
+
+    @field_validator("kind")
+    @classmethod
+    def _known_kind(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and value not in KNOWN_CHAT_KINDS:
+            raise ValueError(
+                f"unknown chat kind {value!r}; expected null or one of "
+                f"{sorted(KNOWN_CHAT_KINDS)}"
+            )
+        return value
 
 
 class ChatImportForm(ChatForm):
@@ -87,6 +128,7 @@ class ChatResponse(BaseModel):
     pinned: Optional[bool] = False
     meta: dict = {}
     folder_id: Optional[str] = None
+    kind: Optional[str] = None
 
 
 class ChatTitleIdResponse(BaseModel):
@@ -97,7 +139,12 @@ class ChatTitleIdResponse(BaseModel):
 
 
 class ChatTable:
-    def insert_new_chat(self, user_id: str, form_data: ChatForm) -> Optional[ChatModel]:
+    def insert_new_chat(
+        self, user_id: str, form_data: ChatForm, kind: Optional[str] = None
+    ) -> Optional[ChatModel]:
+        """`kind` names the surface that owns the conversation; None is ordinary
+        chat. Defaulting to None keeps every existing caller -- including the
+        whole chat path -- writing exactly the rows it wrote before."""
         with get_db() as db:
             id = str(uuid.uuid4())
             chat = ChatModel(
@@ -106,6 +153,7 @@ class ChatTable:
                     "user_id": user_id,
                     "title": (form_data.chat["title"] if "title" in form_data.chat else "New Chat"),
                     "chat": form_data.chat,
+                    "kind": kind,
                     "created_at": int(time.time()),
                     "updated_at": int(time.time()),
                 }
@@ -366,6 +414,10 @@ class ChatTable:
     ) -> list[ChatModel]:
         with get_db() as db:
             query = db.query(Chat).filter_by(user_id=user_id).filter_by(folder_id=None)
+            # Ordinary chat only. `kind IS NULL` rather than `kind != 'x'` so a
+            # surface added later is excluded by default instead of leaking into
+            # the chat sidebar until someone remembers to extend this.
+            query = query.filter(Chat.kind.is_(None))
             if not include_archived:
                 query = query.filter_by(archived=False)
 
@@ -379,6 +431,41 @@ class ChatTable:
             all_chats = query.all()
             return [ChatModel.model_validate(chat) for chat in all_chats]
 
+    def get_chat_list_by_user_id_and_kind(
+        self,
+        user_id: str,
+        kind: str,
+        include_archived: bool = False,
+        skip: int = 0,
+        limit: int = 50,
+    ) -> list[ChatModel]:
+        """The mirror of get_chat_list_by_user_id, for a non-chat surface.
+
+        Deliberately NOT `get_chat_list_by_user_id(kind=...)`: that signature
+        would let a caller pass None and silently get the chat list back, which
+        is the one thing this separation exists to prevent. `kind` is required
+        here, so asking for a surface's history and asking for chat history are
+        different calls that cannot be confused for one another.
+
+        Folder scoping matches the chat list (folder_id IS NULL) so the two
+        behave the same way; a surface that later wants folders should extend
+        both together.
+        """
+        with get_db() as db:
+            query = db.query(Chat).filter_by(user_id=user_id).filter_by(folder_id=None)
+            query = query.filter(Chat.kind == kind)
+            if not include_archived:
+                query = query.filter_by(archived=False)
+
+            query = query.order_by(Chat.updated_at.desc())
+
+            if skip:
+                query = query.offset(skip)
+            if limit:
+                query = query.limit(limit)
+
+            return [ChatModel.model_validate(chat) for chat in query.all()]
+
     def get_chat_title_id_list_by_user_id(
         self,
         user_id: str,
@@ -388,6 +475,9 @@ class ChatTable:
     ) -> list[ChatTitleIdResponse]:
         with get_db() as db:
             query = db.query(Chat).filter_by(user_id=user_id).filter_by(folder_id=None)
+            # See get_chat_list_by_user_id: NULL-only, so later surfaces are
+            # excluded by default.
+            query = query.filter(Chat.kind.is_(None))
             query = query.filter(or_(Chat.pinned.is_(False), Chat.pinned.is_(None)))
 
             if not include_archived:

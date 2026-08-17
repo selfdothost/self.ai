@@ -7,9 +7,11 @@
 #   faster-whisper: local STT -> self.transcribe is its own service
 #   opencv/rapidocr: RAG OCR -> defer with RAG
 #   sentencepiece : local-model tokenizer -> not needed API-tier
-#   pymilvus, qdrant-client, opensearch-py: unused vector backends (we use
-#                   pgvector on self.db; chromadb stays only until config.py's
-#                   top-level import is lazy-guarded)
+#   pymilvus, qdrant-client, opensearch-py: unused vector backends (the yard
+#                   uses pgvector on self.db; the quickstart uses sqlite-vec).
+#                   chromadb was the third such backend and is now gone -- the
+#                   config.py top-level `import chromadb` that pinned it here
+#                   is removed, so nothing loads a vector backend at import.
 #   pytest/docker/factory-boy/respx/... : test-only, not a runtime dep
 #
 # Verified: uvicorn selfai_ui.main:app boots API-only on this set, torch-free.
@@ -30,7 +32,6 @@ Flask-Cors==5.0.0
 
 python-socketio==5.16.3
 python-jose==3.5.0
-passlib[bcrypt]==1.7.4
 
 requests==2.32.3
 aiohttp==3.11.8
@@ -43,7 +44,7 @@ alembic==1.18.5
 psycopg2-binary==2.9.12
 pgvector==0.5.0
 PyMySQL==1.1.1
-bcrypt==4.2.0
+bcrypt==5.0.0
 
 pymongo
 redis
@@ -59,12 +60,22 @@ anthropic
 google-generativeai==0.7.2
 tiktoken
 
-langchain==0.3.7
-langchain-community==0.3.7
-langchain-chroma==0.1.4
+# langchain — one of three packages that capped numpy<2 (self.ai#108). On
+# Python 3.13 there is no numpy 1.x wheel, so that cap forced a ~60s numpy
+# source build into every image. 0.3.30 drops the numpy pin from langchain
+# itself. langchain-community moves with it (same 0.3.x line). langchain-chroma
+# was dropped outright with the chromadb backend; nothing imported it.
+langchain==0.3.30
+langchain-community==0.3.27
 
 fake-useragent==1.5.1
-chromadb==0.5.15
+# sqlite-vec — the zero-config vector store, replacing chromadb (which pulled 41
+# transitive packages / ~98MB: onnxruntime, tokenizers, the OpenTelemetry stack,
+# a Kubernetes client, plus a from-source chroma-hnswlib build). MIT/Apache-2.0
+# dual-licensed, a single py3-none wheel with no dependencies of its own.
+# PINNED EXACTLY and intentionally: sqlite-vec is pre-1.0 and its API can still
+# move between point releases, so bumps get read before they land.
+sqlite-vec==0.1.9
 
 
 
@@ -72,9 +83,9 @@ ftfy==6.2.3
 pypdf==4.3.1
 fpdf2==2.8.2
 pymdown-extensions==10.11.2
-docx2txt==0.8
+docx2txt==0.9
 python-pptx==1.0.0
-unstructured==0.15.9
+unstructured==0.17.2
 nltk==3.9.1
 Markdown==3.7
 pypandoc==1.13
@@ -99,7 +110,6 @@ youtube-transcript-api==0.6.3
 pytube==15.0.0
 
 extract_msg
-pydub
 duckduckgo-search~=6.3.5
 
 ## Google Drive
@@ -120,6 +130,20 @@ ldap3==2.9.1
 # not 2.x. <4 keeps us off the next breaking major. Tighten to the exact resolved
 # == once the image builds in CI.
 firecrawl-py>=3.0.0,<4.0.0
+
+## Declared because the CODE IMPORTS THEM, not because anything else pulls them.
+# All three resolved only transitively through chromadb until it was removed,
+# and removing it broke the build -- exactly the failure mode the PyYAML note
+# below warns about. A transitive resolution is not a declaration.
+#   typer            -> selfai_ui/__init__.py (the CLI entrypoint; importing the
+#                       selfai_ui PACKAGE AT ALL needs it, so this is not
+#                       optional even when the CLI is unused)
+#   huggingface-hub  -> selfai_ui/retrieval/utils.py (snapshot_download)
+#   websocket-client -> selfai_ui/utils/images/comfyui.py (`import websocket`;
+#                       this is the live image-generation client, not a stub)
+typer>=0.12,<1.0
+huggingface-hub>=0.30,<2.0
+websocket-client>=1.8,<2.0
 
 ## YAML — mod manifests (`mod.yaml`) and the training router.
 # Declared explicitly: selfai_ui/routers/training.py has imported yaml since

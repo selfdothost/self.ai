@@ -327,13 +327,49 @@ class QueueCuratorJobForm(BaseModel):
     dataset_name: Optional[str] = None
 
 
+# Priority tiers the queue understands (utils/gpu_queue.py). `run_now` bypasses
+# the GPU window entirely, so it is admin-only; the rest respect windows and
+# only order jobs within them.
+VALID_JOB_PRIORITIES = frozenset({"normal", "high", "run_now"})
+WINDOW_BYPASSING_PRIORITIES = frozenset({"run_now"})
+
+
 @router.post("/queue", response_model=Optional[CuratorJobModel])
 async def queue_curator_job(
     form_data: QueueCuratorJobForm,
     user=Depends(get_verified_user),
 ):
     """Create a CuratorJob record. The GPU-queue daemon dispatches it
-    to the curator container when a window is active."""
+    to the curator container when a window is active.
+
+    ``priority`` is validated here rather than taken as sent (self.ai#88).
+    ``_dispatch_run_now_jobs`` dispatches ``run_now`` jobs "immediately,
+    bypassing windows" — so an unvalidated, caller-supplied priority let ANY
+    verified user put a curation run on the shared 4090 outside every window the
+    admin had scheduled, simply by asking for it. Choosing to override the GPU
+    schedule is an operator decision, so ``run_now`` requires an admin; an
+    unrecognised value is refused outright rather than silently coerced, since
+    silently downgrading a caller's stated intent is its own surprise."""
+    priority = (form_data.priority or "normal").strip()
+    if priority not in VALID_JOB_PRIORITIES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unknown priority {priority!r}; expected one of "
+                f"{sorted(VALID_JOB_PRIORITIES)}"
+            ),
+        )
+    if priority in WINDOW_BYPASSING_PRIORITIES and user.role != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"priority {priority!r} bypasses the GPU job window and is "
+                "admin-only; queue at 'normal' or 'high' to run in the next "
+                "curator window"
+            ),
+        )
+    form_data = form_data.model_copy(update={"priority": priority})
+
     job = CuratorJobs.insert_new_job(
         user_id=user.id,
         form_data=CuratorJobForm(
@@ -359,8 +395,52 @@ async def queue_curator_job(
 ##########################################
 
 
+def require_curator_window(action: str) -> None:
+    """Refuse a direct-to-curator action unless a curator GPU window is open.
+
+    The window-respecting path is ``POST /curator/queue``: it creates a
+    CuratorJob row the daemon dispatches inside a window, under an exclusive VRAM
+    lease, and finalizes into a dataset when it completes. These raw proxies
+    bypass ALL of that — a run started here is invisible to the queue, holds no
+    lease, and produces no dataset, while occupying the same single 4090 as
+    inference (self.ai#88).
+
+    So the proxies are kept for operator use but bounded by the same schedule
+    everything else obeys. Fails CLOSED on an unreadable window table: an unknown
+    schedule must not become an open door to the GPU."""
+    from selfai_ui.models.job_windows import JobWindows
+
+    try:
+        window = JobWindows.get_active_window()
+    except Exception as e:
+        log.warning("curator: window check failed (%r); refusing %s", e, action)
+        raise HTTPException(
+            status_code=503,
+            detail="GPU window status unknown — refusing to start curation work",
+        )
+
+    if window is not None and any(
+        slot.job_type == "curator" for slot in (window.slots or [])
+    ):
+        return
+
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"No curator GPU window is currently open, so {action} is refused. "
+            "Queue the pipeline via /curator/queue to run it in the next window, "
+            "or open a window in Admin > Jobs."
+        ),
+    )
+
+
 @router.post("/api/jobs")
-async def create_job(request: Request, user=Depends(get_verified_user)):
+async def create_job(request: Request, user=Depends(get_admin_user)):
+    """Direct-to-curator job creation. Admin-only (self.ai#88): this is the
+    legacy path the daemon itself uses, and the self.chat client marks it as
+    such — the app queues via /curator/queue. Creating a job does not start it
+    (self.curator creates them PENDING), so this is not window-gated; ``approve``
+    is."""
     url = get_curator_url(request)
     body = await request.body()
     result = await send_post_request(
@@ -417,7 +497,11 @@ async def cancel_job(request: Request, job_id: str, user=Depends(get_verified_us
 
 
 @router.post("/api/jobs/{job_id}/schedule")
-async def schedule_job(request: Request, job_id: str, user=Depends(get_verified_user)):
+async def schedule_job(request: Request, job_id: str, user=Depends(get_admin_user)):
+    """Admin-only (self.ai#88): scheduling work onto the shared 4090 is an
+    operator decision. Note self.curator never auto-starts a scheduled job on its
+    own — its poll loop deliberately leaves dispatch to this daemon — so this
+    only records an intent."""
     url = get_curator_url(request)
     body = await request.body()
     return await send_post_request(
@@ -429,7 +513,7 @@ async def schedule_job(request: Request, job_id: str, user=Depends(get_verified_
 
 
 @router.post("/api/jobs/{job_id}/unschedule")
-async def unschedule_job(request: Request, job_id: str, user=Depends(get_verified_user)):
+async def unschedule_job(request: Request, job_id: str, user=Depends(get_admin_user)):
     url = get_curator_url(request)
     return await send_post_request(
         f"{url}/api/jobs/{job_id}/unschedule",
@@ -440,7 +524,16 @@ async def unschedule_job(request: Request, job_id: str, user=Depends(get_verifie
 
 
 @router.post("/api/jobs/{job_id}/approve")
-async def approve_job(request: Request, job_id: str, user=Depends(get_verified_user)):
+async def approve_job(request: Request, job_id: str, user=Depends(get_admin_user)):
+    """Start a curation run on the shared 4090, right now.
+
+    This is the sharpest of the proxies: it is the ONE call that puts load on the
+    GPU without going through the queue at all. It used to be reachable by any
+    verified user with no window check whatsoever — the widest of the three
+    window bypasses self.ai#88 found. Now admin-only AND gated on an open curator
+    window, so the admin's schedule bounds every path to the card, not just the
+    tidy one."""
+    require_curator_window("starting a curation job directly")
     url = get_curator_url(request)
     return await send_post_request(
         f"{url}/api/jobs/{job_id}/approve",

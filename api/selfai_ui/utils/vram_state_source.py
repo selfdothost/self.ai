@@ -65,12 +65,55 @@ STATE_PATH = "/api/system/vram-state"
 # llamolotl's field; `held_bytes`/`held` cover self.speak / self.sketch's shim.
 _HELD_FIELDS = ("held_vram_bytes", "held_bytes", "held")
 
+# self.ai#74 — CARD-level occupancy fields, a DIFFERENT quantity from held. A
+# consumer that can see the whole device reports what the driver says the card is
+# using (every process, lease consumer or not) here, and NEVER folds it into its
+# own held. `total_capacity_bytes` doubles as the device total because all three
+# consumers already emit it and it is already the whole card's size.
+#
+# No consumer emits `device_used_bytes` yet — until they do these parse to None,
+# `device_occupancy()` finds nothing fresh, and `free_capacity()` falls back to
+# the pure ledger arithmetic. That is the intended rollout order: core learns to
+# ACCEPT the field before any consumer starts sending it.
+_DEVICE_USED_FIELDS = ("device_used_bytes", "device_used")
+_DEVICE_TOTAL_FIELDS = ("device_total_bytes", "total_capacity_bytes", "device_total")
+
 # Per-read httpx timeout so one slow consumer cannot stall the poll cycle
 # (the poller also isolates each read via gather(return_exceptions=True)).
 STATE_READ_TIMEOUT_SECONDS = float(os.environ.get("VRAM_STATE_READ_TIMEOUT_SECONDS", 10))
 
 
 ClientFactory = Callable[[float], httpx.AsyncClient]
+
+
+def first_int_field(data, keys) -> Optional[int]:
+    """First key in ``keys`` whose value is an unambiguous integer, else ``None``.
+
+    ``bool`` is an ``int`` subclass, so it is excluded — a stray ``true`` must
+    never be read as 1. Shared by both state sources so llamolotl's list-based
+    source and the single-control-base one cannot drift apart on parsing."""
+    if not isinstance(data, dict):
+        return None
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def parse_device_occupancy(data):
+    """``(device_used_bytes, device_total_bytes)`` from a vram-state body, either
+    ``None`` independently (self.ai#74).
+
+    Defensive in the same way as the held parse: a missing/blank/non-integer
+    field yields ``None``, which the poller treats as "no card reading this
+    cycle" and simply does not relay — never a fabricated 0. A total with no used
+    is discarded too: a card total on its own says nothing about occupancy, and
+    recording it would imply a reading that was never taken."""
+    used = first_int_field(data, _DEVICE_USED_FIELDS)
+    if used is None:
+        return (None, None)
+    return (used, first_int_field(data, _DEVICE_TOTAL_FIELDS))
 
 
 class ControlBaseVramStateSource:
@@ -125,6 +168,54 @@ class ControlBaseVramStateSource:
         """The consumer's self-reported held VRAM in bytes, or ``None`` if it
         cannot be read this cycle (see class docstring). Only ``held`` is ever
         returned — never capacity."""
+        resp = await self._fetch_state(consumer_id)
+        if resp is None:
+            return None
+        return self._parse_held(consumer_id, resp)
+
+    async def read_full(self, consumer_id: str):
+        """ONE GET, every figure the poller relays:
+        ``(held_bytes, loaded_model_id, device_used_bytes, device_total_bytes)``
+        (self.ai#74).
+
+        Each element is independently ``None`` when absent or unparseable, and
+        the poller relays only the ones it got — so a consumer that has not yet
+        learned to emit card occupancy simply contributes held, exactly as
+        before. ``loaded_model_id`` is always ``None`` here: only
+        self.llamolotl's loaded-model datum feeds the eval-coexist route, and
+        fabricating one for speak/sketch would be worse than omitting it."""
+        resp = await self._fetch_state(consumer_id)
+        if resp is None:
+            return (None, None, None, None)
+        held = self._parse_held(consumer_id, resp)
+        device_used, device_total = self._parse_device(consumer_id, resp)
+        return (held, None, device_used, device_total)
+
+    def _parse_device(self, consumer_id: str, resp):
+        """``(used, total)`` card-level occupancy from the reply, or
+        ``(None, None)``. Reuses the shared defensive parse; a non-2xx or
+        undecodable body has already been rejected by ``_parse_held``'s own
+        checks, so this only has to handle a well-formed body missing the
+        fields."""
+        try:
+            data = resp.json()
+        except Exception:
+            return (None, None)
+        used, total = parse_device_occupancy(data)
+        if used is not None:
+            log.debug(
+                "vram-state: %r reported card occupancy used=%d total=%r",
+                consumer_id,
+                used,
+                total,
+            )
+        return (used, total)
+
+    async def _fetch_state(self, consumer_id: str):
+        """GET the consumer's vram-state reply, or ``None`` when it cannot be
+        read this cycle (unconfigured base, unmintable ticket, transport
+        failure). Factored out so ``read_held_bytes`` and ``read_full`` share ONE
+        request — the poller must never issue two GETs per consumer per cycle."""
         base = self._resolve_control_base()
         if base is None:
             log.debug(
@@ -161,7 +252,7 @@ class ControlBaseVramStateSource:
             )
             return None
 
-        return self._parse_held(consumer_id, resp)
+        return resp
 
     def _parse_held(self, consumer_id: str, resp) -> Optional[int]:
         """Defensively read the self-reported held figure. Any shape that is not an

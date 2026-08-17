@@ -20,11 +20,33 @@ from sqlalchemy.orm import declarative_base, scoped_session, sessionmaker
 from sqlalchemy.pool import NullPool
 from sqlalchemy.sql import true
 
-from selfai_ui.config import PGVECTOR_DB_URL, PGVECTOR_INITIALIZE_MAX_VECTOR_LENGTH
+from selfai_ui.config import (
+    PGVECTOR_CREATE_VECTOR_INDEX,
+    PGVECTOR_DB_URL,
+    PGVECTOR_INITIALIZE_MAX_VECTOR_LENGTH,
+    PGVECTOR_IVFFLAT_LISTS,
+)
 from selfai_ui.retrieval.vector.main import GetResult, SearchResult, VectorItem
 
 VECTOR_LENGTH = PGVECTOR_INITIALIZE_MAX_VECTOR_LENGTH
 Base = declarative_base()
+
+
+def _vector_index_ddl() -> Optional[str]:
+    """DDL for the document_chunk vector index, or None when it is disabled.
+
+    Split out of __init__ so the decision can be tested without a database
+    (self.ai#62). Reads the flags as module globals rather than closing over
+    them, so a test can monkeypatch them.
+    """
+    if not PGVECTOR_CREATE_VECTOR_INDEX:
+        return None
+
+    return (
+        "CREATE INDEX IF NOT EXISTS idx_document_chunk_vector "
+        "ON document_chunk USING ivfflat (vector vector_cosine_ops) "
+        f"WITH (lists = {PGVECTOR_IVFFLAT_LISTS});"
+    )
 
 
 class DocumentChunk(Base):
@@ -63,13 +85,16 @@ class PgvectorClient:
             connection = self.session.connection()
             Base.metadata.create_all(bind=connection)
 
-            # Create an index on the vector column if it doesn't exist
-            self.session.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS idx_document_chunk_vector "
-                    "ON document_chunk USING ivfflat (vector vector_cosine_ops) WITH (lists = 100);"
-                )
-            )
+            # Vector index: opt-in, off by default (self.ai#62). At the yard's
+            # corpus size the planner never used it and it cost ~72% of the
+            # table's footprint. See config.PGVECTOR_CREATE_VECTOR_INDEX.
+            #
+            # NOTE this ran on EVERY startup, so a manual DROP INDEX against the
+            # live database does not stick on its own -- the next pod restart
+            # recreated it. That is why the fix has to be here.
+            vector_index_ddl = _vector_index_ddl()
+            if vector_index_ddl:
+                self.session.execute(text(vector_index_ddl))
             self.session.execute(
                 text(
                     "CREATE INDEX IF NOT EXISTS idx_document_chunk_collection_name "

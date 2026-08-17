@@ -1,3 +1,14 @@
+# requirements.txt — the ORIGINAL monolith dependency set, inherited from the
+# OpenWebUI fork.
+#
+# DUCT TAPE, named rather than cleaned: NOTHING INSTALLS THIS FILE. api/Dockerfile
+# installs requirements-api.txt; no other Dockerfile, CI job, or script reads
+# this one (verified by grep). It survives as the reference set that
+# requirements-api.txt is diffed against -- see that file's header, which asks
+# for the two to be kept in sync. Editing this file therefore changes NO shipped
+# image. Keep it resolvable so the comparison stays meaningful, but do not
+# mistake a change here for a deploy.
+
 fastapi==0.139.0
 uvicorn[standard]==0.51.0
 pydantic==2.13.4
@@ -8,7 +19,6 @@ Flask-Cors==5.0.0
 
 python-socketio==5.16.3
 python-jose==3.5.0
-passlib[bcrypt]==1.7.4
 
 requests==2.32.3
 aiohttp==3.11.8
@@ -21,7 +31,7 @@ alembic==1.18.5
 psycopg2-binary==2.9.12
 pgvector==0.5.0
 PyMySQL==1.1.1
-bcrypt==4.2.0
+bcrypt==5.0.0
 
 pymongo
 redis
@@ -46,12 +56,22 @@ anthropic
 google-generativeai==0.7.2
 tiktoken
 
-langchain==0.3.7
-langchain-community==0.3.7
-langchain-chroma==0.1.4
+# langchain — one of three packages that capped numpy<2 (self.ai#108). On
+# Python 3.13 there is no numpy 1.x wheel, so that cap forced a ~60s numpy
+# source build into every image. 0.3.30 drops the numpy pin from langchain
+# itself. langchain-community moves with it (same 0.3.x line). langchain-chroma
+# was dropped outright with the chromadb backend; nothing imported it.
+langchain==0.3.30
+langchain-community==0.3.27
 
 fake-useragent==1.5.1
-chromadb==0.5.15
+# sqlite-vec — the zero-config vector store, replacing chromadb (which pulled 41
+# transitive packages / ~98MB: onnxruntime, tokenizers, the OpenTelemetry stack,
+# a Kubernetes client, plus a from-source chroma-hnswlib build). MIT/Apache-2.0
+# dual-licensed, a single py3-none wheel with no dependencies of its own.
+# PINNED EXACTLY and intentionally: sqlite-vec is pre-1.0 and its API can still
+# move between point releases, so bumps get read before they land.
+sqlite-vec==0.1.9
 pymilvus==2.5.0
 qdrant-client~=1.12.0
 opensearch-py==2.7.1
@@ -65,9 +85,9 @@ ftfy==6.2.3
 pypdf==4.3.1
 fpdf2==2.8.2
 pymdown-extensions==10.11.2
-docx2txt==0.8
+docx2txt==0.9
 python-pptx==1.0.0
-unstructured==0.15.9
+unstructured==0.17.2
 nltk==3.9.1
 Markdown==3.7
 pypandoc==1.13
@@ -82,7 +102,12 @@ sentencepiece
 soundfile==0.12.1
 
 opencv-python-headless==4.10.0.84
-rapidocr-onnxruntime==1.3.24
+# rapidocr-onnxruntime — the third numpy<2 cap (self.ai#108); 1.4.4 lifts it.
+# Only in this file, not requirements-api.txt: RAG OCR is monolith-only.
+# It transitively pulls opencv-python (non-headless) alongside the
+# opencv-python-headless we pin above -- both land in the image. Pre-existing;
+# named, not fixed here.
+rapidocr-onnxruntime==1.4.4
 rank-bm25==0.2.2
 
 faster-whisper==1.0.3
@@ -96,7 +121,6 @@ youtube-transcript-api==0.6.3
 pytube==15.0.0
 
 extract_msg
-pydub
 duckduckgo-search~=6.3.5
 
 ## Google Drive
@@ -126,3 +150,17 @@ ldap3==2.9.1
 # not 2.x. <4 keeps us off the next breaking major. Tighten to the exact resolved
 # == once the image builds in CI.
 firecrawl-py>=3.0.0,<4.0.0
+
+## Declared because the CODE IMPORTS THEM, not because anything else pulls them.
+# All three resolved only transitively through chromadb until it was removed,
+# and removing it broke the build -- exactly the failure mode the PyYAML note
+# below warns about. A transitive resolution is not a declaration.
+#   typer            -> selfai_ui/__init__.py (the CLI entrypoint; importing the
+#                       selfai_ui PACKAGE AT ALL needs it, so this is not
+#                       optional even when the CLI is unused)
+#   huggingface-hub  -> selfai_ui/retrieval/utils.py (snapshot_download)
+#   websocket-client -> selfai_ui/utils/images/comfyui.py (`import websocket`;
+#                       this is the live image-generation client, not a stub)
+typer>=0.12,<1.0
+huggingface-hub>=0.30,<2.0
+websocket-client>=1.8,<2.0

@@ -51,7 +51,7 @@ async def create_new_model(
     user=Depends(get_verified_user),
 ):
     if user.role != "admin" and not has_permission(
-        user.id, "workspace.models", request.app.state.config.USER_PERMISSIONS
+        user.id, "studio.models", request.app.state.config.USER_PERMISSIONS
     ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

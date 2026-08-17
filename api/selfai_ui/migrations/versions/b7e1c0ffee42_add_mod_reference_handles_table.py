@@ -48,11 +48,11 @@ not require the mod's runtime code to read or write it in this task.
 """
 
 import logging
-import os
-import sys
 
 import sqlalchemy as sa
 from alembic import op
+
+from selfai_ui.migrations.util import mod_enabled
 
 revision = "b7e1c0ffee42"
 down_revision = "d5e6f7a8b9c0"
@@ -62,39 +62,9 @@ depends_on = None
 log = logging.getLogger(__name__)
 
 
-def _enabled_mods() -> list[str]:
-    """The enabled-mod list, read the way the running app reads it.
-
-    Primary source is `selfai_ui.config.ENABLED_MODS.value` -- the same
-    `PersistentConfig` the boot path consults, so a DB-persisted enablement
-    override is honoured. But we consult it ONLY when `selfai_ui.config` is
-    already fully imported in this process; we never trigger a *fresh* import of
-    it from inside a running Alembic env. Importing that heavy module mid-upgrade
-    has two failure modes, both observed while building this migration:
-      * a circular import when config is imported for the first time during the
-        upgrade (the test harness runs `upgrade head` *before* importing config,
-        precisely to build the schema the config table lives in --
-        `tests/conftest.py`); and
-      * corruption of Alembic's shared proxy bookkeeping
-        (`alembic.util.langhelpers` module-class proxies), which surfaced as a
-        `KeyError` in `EnvironmentContext.__exit__._remove_proxy`.
-
-    When config is not yet loaded there is no persisted override in play (the DB
-    is fresh in that window), so the env-derived value equals what
-    `ENABLED_MODS.value` would hold; we parse the same `ENABLED_MODS` env var
-    config itself derives from (`selfai_ui.config:817-821`). The two paths agree
-    in that window by construction.
-    """
-    config_mod = sys.modules.get("selfai_ui.config")
-    enabled = getattr(config_mod, "ENABLED_MODS", None)
-    if enabled is not None:
-        return list(enabled.value)
-    return [m.strip() for m in os.environ.get("ENABLED_MODS", "").split(",") if m.strip()]
-
-
 def _reference_enabled() -> bool:
     """True when the `reference` mod is in the enabled list."""
-    return "reference" in _enabled_mods()
+    return mod_enabled("reference")
 
 
 def _table_name() -> str:

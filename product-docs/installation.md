@@ -36,8 +36,8 @@ reverse proxy serving both same-origin), and **Kubernetes via Flux** (the
 - **Postgres**: optional. With `DATABASE_URL` unset, the API server uses local
   SQLite under its data volume. Set a Postgres DSN to use Postgres; set
   `VECTOR_DB=pgvector` (plus `PGVECTOR_DB_URL`, which falls back to
-  `DATABASE_URL`) to put vectors there too. The default vector store is local
-  chroma on the data directory.
+  `DATABASE_URL`) to put vectors there too. The default vector store is
+  sqlite-vec, a single file on the data directory that needs no extra service.
 - **An embeddings endpoint**: optional, but required if you want the knowledge
   base. The published API image is torch-free and ships no local embedding
   model. See [Knowledge base](#knowledge-base-rag) below.
@@ -55,6 +55,11 @@ docker compose -f docker-compose.combined.yml up
 Open `http://localhost:3000`. The container listens on `8080` internally and is
 published on host port `3000`; data persists in the `selfai-data` volume mounted
 at `/app/backend/data`.
+
+To keep the data somewhere else, set `DATA_DIR` and mount a volume there. The
+directory does not need to exist beforehand — self.ai creates it at startup and
+verifies it is writable, and says so plainly if it cannot. A non-root or
+read-only-rootfs deployment needs a writable volume mounted at `DATA_DIR`.
 
 Required and commonly set environment:
 

@@ -49,7 +49,7 @@ from selfai_ui.socket.main import (
     get_event_call,
     get_event_emitter,
 )
-from selfai_ui.tasks import create_task
+from selfai_ui.tasks import create_task, register_cancel_hook
 from selfai_ui.utils.access_control import has_access
 from selfai_ui.utils.chat import generate_chat_completion
 from selfai_ui.utils.misc import (
@@ -447,19 +447,30 @@ async def run_web_search_tool_call(request: Request, query: str, extra_params: d
             fetched_urls.append(result.link)
 
         if not docs:
+            # Distinct from the stage-1 "no results" case above: the search
+            # engine DID return links, we just couldn't read any of the pages
+            # (bot-protection, 5xx, timeouts — general-search does not retry).
+            # Report it as its own failure so the user and the model can tell
+            # "search found nothing" apart from "search found links but every
+            # fetch failed" — the two used to collapse into one message.
+            found = len(search_results)
             await event_emitter(
                 {
                     "type": "status",
                     "data": {
                         "action": "web_search",
-                        "description": "No search results found",
+                        "description": f"Found {found} result(s) but could not read any page",
                         "query": query,
                         "done": True,
                         "error": True,
                     },
                 }
             )
-            return "No search results found."
+            return (
+                f"Web search found {found} result link(s) for this query, but none of "
+                "the pages could be retrieved (they may be bot-protected, rate-limited, "
+                "or temporarily unavailable). No page content is available."
+            )
 
         collection_name = f"web-search-{calculate_sha256_string(query)}"[:63]
 
@@ -1030,15 +1041,89 @@ async def run_web_crawl_tool_call(request: Request, url: str, extra_params: dict
 
 MAX_TOOL_CALL_ROUNDS = 5
 
+#: The qualifier a built-in tool (web_search and friends) is offered under when a
+#: client-supplied tool has claimed its bare name. Built-ins have no `toolkit_id`
+#: to qualify by, so they get a fixed one; the resulting name is produced by the
+#: same `collide_name` every other qualified tool goes through.
+BUILTIN_TOOL_OWNER = "selfai"
+
+#: Handed back to the model as the tool result for a client-owned tool call that
+#: arrived in the SAME round as a server-owned one. Such a round cannot be
+#: returned to the caller: half of it is already resolved here, and the caller
+#: would owe us a result for a tool it has no way to run. So the server side
+#: resolves, and the model is asked to re-issue the client call on its own --
+#: which then arrives as a client-only round, and that one IS returnable.
+CLIENT_TOOL_DEFERRAL = (
+    "This tool runs on the client, which cannot be reached in the middle of a turn. "
+    "The results of the other tool calls in this round are above. Re-issue this call "
+    "on its own, with no other tool call alongside it, and it will be dispatched."
+)
+
+
+def extract_client_tools(form_data: dict) -> list[dict]:
+    """The function tools the caller supplied on the request, verbatim.
+
+    Verbatim is the contract: whatever the caller sent is what the model is
+    offered and what comes back keeps the caller's spelling, because the caller
+    matches the returned `tool_calls` against its own registry by name.
+    Entries that could not be a function tool -- not a dict, a non-function
+    `type`, no usable `name` -- are dropped here rather than passed to a
+    provider that would reject the whole request over one of them.
+    """
+    client_tools = []
+    for tool in form_data.get("tools") or []:
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("type") not in (None, "function"):
+            continue
+        name = (tool.get("function") or {}).get("name")
+        if not isinstance(name, str) or not name:
+            log.warning("dropping a client-supplied tool with no usable function name: %r", tool)
+            continue
+        client_tools.append(tool)
+    return client_tools
+
+
+def _tool_call_name(tool_call: dict) -> str:
+    return (tool_call.get("function") or {}).get("name") or ""
+
+
+def _tool_call_id(tool_call: dict) -> str:
+    return tool_call.get("id") or _tool_call_name(tool_call)
+
+
+def _partition_tool_calls(tool_calls: list, client_tool_names: set) -> tuple[list, list]:
+    """Split one round's tool_calls into the ones self.ai runs and the ones the
+    caller runs. Ownership is by name, and a client name always wins it: the
+    merge that built the offer list already qualified any server-side tool that
+    wanted a name the caller had claimed, so a bare claimed name reaching here
+    can only be the client's."""
+    server_calls, client_calls = [], []
+    for tool_call in tool_calls:
+        target = client_calls if _tool_call_name(tool_call) in client_tool_names else server_calls
+        target.append(tool_call)
+    return server_calls, client_calls
+
 
 async def _dispatch_tool_call(
-    request: Request, tool_call: dict, admin_tools: dict, extra_params: dict, user, messages: list
+    request: Request,
+    tool_call: dict,
+    admin_tools: dict,
+    extra_params: dict,
+    user,
+    messages: list,
+    builtin_aliases: dict | None = None,
 ) -> str:
     """Execute one tool_calls entry (web_search or an admin Tool) and return
     its string result for a role="tool" message. Shared by the buffered and
-    streaming round-runners so dispatch logic lives in exactly one place."""
+    streaming round-runners so dispatch logic lives in exactly one place.
+
+    `builtin_aliases` maps an offered name back to the built-in it stands for,
+    and is non-empty only when a client-supplied tool claimed a built-in's bare
+    name on this request. Resolved first, so every branch below still compares
+    against the canonical name."""
     function = tool_call.get("function", {})
-    name = function.get("name")
+    name = (builtin_aliases or {}).get(function.get("name"), function.get("name"))
     try:
         arguments = json.loads(function.get("arguments") or "{}")
     except Exception:
@@ -1091,21 +1176,37 @@ async def _dispatch_tool_call(
 
 
 async def _run_tool_calling_buffered(
-    request: Request, form_data: dict, messages: list, openai_tools: list, admin_tools: dict, extra_params: dict, user
+    request: Request,
+    form_data: dict,
+    messages: list,
+    openai_tools: list,
+    admin_tools: dict,
+    extra_params: dict,
+    user,
+    client_tool_names: set | None = None,
+    builtin_aliases: dict | None = None,
 ):
     """Non-streaming tool-calling loop: each round is a single non-streaming
     completion call, easy to inspect for tool_calls. Used whenever the
     client asked for stream=False (e.g. eval jobs) — those want a plain
     dict response anyway, so there's nothing to gain from streaming
-    internally."""
+    internally.
+
+    `client_tool_names` are the tools the CALLER owns. They are offered to the
+    model alongside ours but dispatched by the caller, not here: a round made
+    entirely of them is returned unresolved, in OpenAI's shape, and the caller
+    drives the next request (self.ai#71)."""
     original_stream = form_data.get("stream", False)
+    client_tool_names = client_tool_names or set()
 
     for _ in range(MAX_TOOL_CALL_ROUNDS):
         round_payload = {
             **form_data,
             "messages": messages,
             "tools": openai_tools,
-            "tool_choice": "auto",
+            # A caller that stated a tool_choice gets it honoured; "auto" is the
+            # default the WebUI has always run under, not an override.
+            "tool_choice": form_data.get("tool_choice") or "auto",
             "stream": False,
         }
 
@@ -1125,25 +1226,61 @@ async def _run_tool_calling_buffered(
         if not tool_calls:
             return response
 
+        server_calls, client_calls = _partition_tool_calls(tool_calls, client_tool_names)
+
+        if client_calls and not server_calls:
+            # Nothing in this round is ours to run. Hand it back whole and let
+            # the caller execute and re-post. finish_reason is normalised rather
+            # than trusted: a client keys its agent loop off it, and an upstream
+            # that says "stop" on a round carrying tool_calls would stall it.
+            choices = response.get("choices") or []
+            if choices:
+                choices[0]["finish_reason"] = "tool_calls"
+            return response
+
         messages.append(message)
 
-        for tool_call in tool_calls:
-            tool_output = await _dispatch_tool_call(request, tool_call, admin_tools, extra_params, user, messages)
+        for tool_call in server_calls:
+            tool_output = await _dispatch_tool_call(
+                request, tool_call, admin_tools, extra_params, user, messages, builtin_aliases
+            )
             messages.append(
                 {
                     "role": "tool",
-                    "tool_call_id": tool_call.get("id", tool_call.get("function", {}).get("name")),
+                    "tool_call_id": _tool_call_id(tool_call),
                     "content": tool_output,
                 }
             )
 
+        for tool_call in client_calls:
+            # Mixed round — see CLIENT_TOOL_DEFERRAL.
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": _tool_call_id(tool_call),
+                    "content": CLIENT_TOOL_DEFERRAL,
+                }
+            )
+
     # Exceeded MAX_TOOL_CALL_ROUNDS while the model kept calling tools —
-    # force a final answer without offering any more.
-    return await generate_chat_completion(request, {**form_data, "messages": messages, "stream": original_stream}, user)
+    # force a final answer without offering any more. `tools: None` is what
+    # makes that true when the caller supplied its own; without it the caller's
+    # array rides along in form_data and the model can keep calling forever.
+    return await generate_chat_completion(
+        request, {**form_data, "messages": messages, "tools": None, "stream": original_stream}, user
+    )
 
 
 async def _stream_tool_calling(
-    request: Request, form_data: dict, messages: list, openai_tools: list, admin_tools: dict, extra_params: dict, user
+    request: Request,
+    form_data: dict,
+    messages: list,
+    openai_tools: list,
+    admin_tools: dict,
+    extra_params: dict,
+    user,
+    client_tool_names: set | None = None,
+    builtin_aliases: dict | None = None,
 ):
     """Streaming tool-calling loop: each round is a real streaming
     completion call. content deltas are relayed to the client the instant
@@ -1158,7 +1295,14 @@ async def _stream_tool_calling(
     that narrates before calling a tool ("let me check...") has that
     narration stream live too, then the real answer streams live right
     after the tool result comes back.
+
+    A round made entirely of CLIENT-owned tool calls ends the stream instead of
+    opening another round: the accumulated calls are re-emitted as SSE deltas
+    (they were suppressed on the way past, like every other tool_calls delta)
+    followed by a `finish_reason: tool_calls` chunk, and the caller executes
+    them and posts the results back as a new request (self.ai#71).
     """
+    client_tool_names = client_tool_names or set()
 
     async def iter_lines(response):
         # response.body_iterator (aiohttp StreamReader under the hood, for
@@ -1177,7 +1321,8 @@ async def _stream_tool_calling(
             **form_data,
             "messages": messages,
             "tools": openai_tools,
-            "tool_choice": "auto",
+            # See the buffered loop: a caller's stated tool_choice is honoured.
+            "tool_choice": form_data.get("tool_choice") or "auto",
             "stream": True,
         }
 
@@ -1200,6 +1345,10 @@ async def _stream_tool_calling(
 
         tool_calls_by_index = {}
         content_parts = []
+        # Kept only to stamp the synthesized client-tool_calls chunks below with
+        # the same id/model/created the rest of this stream carried — a client
+        # correlating chunks by id must not see a round appear from nowhere.
+        chunk_envelope = {}
 
         async for line in iter_lines(response):
             if not line.strip() or not line.startswith("data: "):
@@ -1212,6 +1361,11 @@ async def _stream_tool_calling(
                 chunk = json.loads(data_str)
             except Exception:
                 continue
+
+            if not chunk_envelope:
+                chunk_envelope = {
+                    key: chunk[key] for key in ("id", "created", "model", "system_fingerprint") if key in chunk
+                }
 
             choices = chunk.get("choices") or []
             if not choices:
@@ -1246,6 +1400,41 @@ async def _stream_tool_calling(
             return
 
         tool_calls = [tool_calls_by_index[i] for i in sorted(tool_calls_by_index)]
+        server_calls, client_calls = _partition_tool_calls(tool_calls, client_tool_names)
+
+        if client_calls and not server_calls:
+            # Every call in this round is the caller's to run. Re-emit them —
+            # they were accumulated, not relayed — as one delta chunk carrying
+            # the whole assembled array (legal: a client concatenates argument
+            # fragments, and a single complete fragment concatenates to itself),
+            # then close the round with finish_reason so the caller's agent loop
+            # knows it owns the next move.
+            emitted = [{"index": i, **call} for i, call in enumerate(client_calls)]
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        **chunk_envelope,
+                        "object": "chat.completion.chunk",
+                        "choices": [{"index": 0, "delta": {"tool_calls": emitted}, "finish_reason": None}],
+                    }
+                )
+                + "\n\n"
+            )
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        **chunk_envelope,
+                        "object": "chat.completion.chunk",
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                    }
+                )
+                + "\n\n"
+            )
+            yield "data: [DONE]\n\n"
+            return
+
         messages.append(
             {
                 "role": "assistant",
@@ -1254,13 +1443,25 @@ async def _stream_tool_calling(
             }
         )
 
-        for tool_call in tool_calls:
-            tool_output = await _dispatch_tool_call(request, tool_call, admin_tools, extra_params, user, messages)
+        for tool_call in server_calls:
+            tool_output = await _dispatch_tool_call(
+                request, tool_call, admin_tools, extra_params, user, messages, builtin_aliases
+            )
             messages.append(
                 {
                     "role": "tool",
-                    "tool_call_id": tool_call.get("id", tool_call.get("function", {}).get("name")),
+                    "tool_call_id": _tool_call_id(tool_call),
                     "content": tool_output,
+                }
+            )
+
+        for tool_call in client_calls:
+            # Mixed round — see CLIENT_TOOL_DEFERRAL.
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": _tool_call_id(tool_call),
+                    "content": CLIENT_TOOL_DEFERRAL,
                 }
             )
 
@@ -1294,6 +1495,16 @@ async def generate_chat_completion_with_tools(request: Request, form_data: dict,
     call, web search off) — zero overhead for the common case. Otherwise
     dispatches to a real streaming loop (content relayed live, round-by-round)
     or the simpler buffered loop, matching whatever the client asked for.
+
+    Tools the CALLER supplied on the request are merged into the same offer,
+    never replaced by it (self.ai#71). Before this, `openai_tools` was built
+    purely from the server side and splatted over `form_data`, so an
+    OpenAI-compatible client that sent its own `tools` had them silently
+    substituted away — no error, no warning — and self.ai's own web tools could
+    never be used in the same session as a client's. The two halves are
+    dispatched by different parties: ours run here, the caller's are returned to
+    it as `tool_calls`. Names are the seam, so a client name is never rewritten
+    and any server-side tool wanting the same one yields.
     """
     metadata = form_data.get("metadata", {}) or {}
 
@@ -1326,11 +1537,20 @@ async def generate_chat_completion_with_tools(request: Request, form_data: dict,
     # loaded, and is scope-gated per user, so "a mod is enabled" does not become
     # "every request pays for tool calling". It also removes what would be a
     # second assembly pass -- one result both decides the gate and merges below.
-    from selfai_ui.mods.tools import assemble_for_user, resolve_collisions
+    from selfai_ui.mods.tools import assemble_for_user, collide_name, resolve_collisions, yield_names_to
 
     mod_defaults = getattr(request.app.state.config, "USER_PERMISSIONS", None) or {}
     mod_tool_pairs = assemble_for_user(getattr(request.app.state, "MODS", None), user, defaults=mod_defaults)
 
+    client_tools = extract_client_tools(form_data)
+    client_tool_names = {tool["function"]["name"] for tool in client_tools}
+
+    # The fall-through gate is unchanged, and correct for client tools without
+    # naming them: with nothing of ours to offer, `form_data` still carries the
+    # caller's `tools` untouched, so a plain completion is exactly the
+    # passthrough such a request wants. It is only when we DO have something to
+    # offer that the two sets have to be merged rather than one overwriting the
+    # other -- which is the whole of self.ai#71.
     if (
         not tool_ids
         and not web_search_enabled
@@ -1379,31 +1599,80 @@ async def generate_chat_completion_with_tools(request: Request, form_data: dict,
     if mod_tool_pairs:
         admin_tools = resolve_collisions(list(admin_tools.items()) + mod_tool_pairs)
 
+    # A name the caller claimed is the caller's. Our side is re-keyed here, once,
+    # before anything is serialized -- dispatch looks a returned call up by
+    # `admin_tools` key, so the key and the spec name must move together, which
+    # is what `yield_names_to` guarantees. No-op when the caller sent no tools.
+    admin_tools = yield_names_to(admin_tools, client_tool_names)
+
     # Serialized at the wrap site, not carried typed: what goes on the wire is a
     # plain dict, so the round payload below still `json.dumps` with no `default=`
     # hook. `to_openai()` deep-copies the schema body, so nothing downstream of
     # here can reach back into a cached spec.
     openai_tools = [{"type": "function", "function": tool["spec"].to_openai()} for tool in admin_tools.values()]
+
+    # Built-ins have no `toolkit_id`, so a claimed one is qualified under a fixed
+    # owner and remembered here: dispatch matches built-ins by literal name, and
+    # `builtin_aliases` is what maps the offered name back to it.
+    builtin_aliases: dict[str, str] = {}
+
+    def offer_builtin(spec):
+        function = spec.to_openai()
+        if spec.name in client_tool_names:
+            offered = collide_name(BUILTIN_TOOL_OWNER, spec.name)
+            builtin_aliases[offered] = spec.name
+            function = {**function, "name": offered}
+            log.warning(
+                "built-in tool %r is claimed by a client-supplied tool on this request; offering it as %r",
+                spec.name,
+                offered,
+            )
+        openai_tools.append({"type": "function", "function": function})
+
     if web_search_enabled:
         # The Web Search toggle covers both ways of getting a page: ask a search
         # engine which page, or name the page directly. Its stored key and label
         # are unchanged.
-        openai_tools.append({"type": "function", "function": WEB_SEARCH_TOOL_SPEC.to_openai()})
-        openai_tools.append({"type": "function", "function": WEB_FETCH_TOOL_SPEC.to_openai()})
+        offer_builtin(WEB_SEARCH_TOOL_SPEC)
+        offer_builtin(WEB_FETCH_TOOL_SPEC)
     if deep_research_enabled:
-        openai_tools.append({"type": "function", "function": DEEP_RESEARCH_TOOL_SPEC.to_openai()})
+        offer_builtin(DEEP_RESEARCH_TOOL_SPEC)
     if web_crawl_enabled:
-        openai_tools.append({"type": "function", "function": WEB_CRAWL_TOOL_SPEC.to_openai()})
+        offer_builtin(WEB_CRAWL_TOOL_SPEC)
+
+    # The caller's own tools, appended verbatim and last. Verbatim because the
+    # caller matches what comes back by name; last because ours were qualified
+    # around these, so this is the point at which the offer list is complete and
+    # collision-free.
+    openai_tools.extend(client_tools)
 
     messages = list(form_data["messages"])
 
     if not form_data.get("stream", True):
         return await _run_tool_calling_buffered(
-            request, form_data, messages, openai_tools, admin_tools, extra_params, user
+            request,
+            form_data,
+            messages,
+            openai_tools,
+            admin_tools,
+            extra_params,
+            user,
+            client_tool_names=client_tool_names,
+            builtin_aliases=builtin_aliases,
         )
 
     return StreamingResponse(
-        _stream_tool_calling(request, form_data, messages, openai_tools, admin_tools, extra_params, user),
+        _stream_tool_calling(
+            request,
+            form_data,
+            messages,
+            openai_tools,
+            admin_tools,
+            extra_params,
+            user,
+            client_tool_names=client_tool_names,
+            builtin_aliases=builtin_aliases,
+        ),
         media_type="text/event-stream",
     )
 
@@ -1749,6 +2018,16 @@ async def process_chat_response(request, response, form_data, user, events, meta
                     metadata["message_id"],
                     {
                         "selectedModelId": response["selected_model_id"],
+                        # self.ai#35: an eval-window substitution also sets
+                        # selected_model_id, but "served != requested" alone
+                        # cannot say WHY -- an arena pick looks identical. Persist
+                        # the reason so the stored message can explain itself
+                        # later, not just at the moment it streamed.
+                        **(
+                            {"modelSubstitution": response["model_substitution"]}
+                            if response.get("model_substitution")
+                            else {}
+                        ),
                     },
                 )
 
@@ -1820,6 +2099,12 @@ async def process_chat_response(request, response, form_data, user, events, meta
 
         task_id = str(uuid4())  # Create a unique task ID.
 
+        # Filled in by post_response_handler as soon as the backend's first SSE
+        # chunk arrives. Read lazily by the cancel hook below, so whatever has
+        # been seen by the time Stop is pressed is what gets cancelled — an empty
+        # dict (generation not started yet) just means no explicit cancel to send.
+        upstream_completion: dict = {}
+
         # Handle as a background task
         async def post_response_handler(response, events):
             message = Chats.get_message_by_id_and_message_id(metadata["chat_id"], metadata["message_id"])
@@ -1865,12 +2150,26 @@ async def process_chat_response(request, response, form_data, user, events, meta
                     try:
                         data = json.loads(data)
 
+                        # Remember the upstream completion id so Stop can send an
+                        # explicit cancel instead of only dropping our socket
+                        # (self.ai#39). First chunk carries it; later chunks repeat
+                        # the same value, so only the first assignment matters.
+                        if upstream_completion.get("id") is None and data.get("id"):
+                            upstream_completion["id"] = data["id"]
+
                         if "selected_model_id" in data:
                             Chats.upsert_message_to_chat_by_id_and_message_id(
                                 metadata["chat_id"],
                                 metadata["message_id"],
                                 {
                                     "selectedModelId": data["selected_model_id"],
+                                    # self.ai#35 -- see the non-streaming branch
+                                    # above; the reason rides the same event.
+                                    **(
+                                        {"modelSubstitution": data["model_substitution"]}
+                                        if data.get("model_substitution")
+                                        else {}
+                                    ),
                                 },
                             )
 
@@ -1878,6 +2177,29 @@ async def process_chat_response(request, response, form_data, user, events, meta
                             delta = data.get("choices", [])[0].get("delta", {})
                             value = delta.get("content")
                             reasoning_value = delta.get("reasoning_content")
+
+                            # T-303 (LR/R2). Per-token distributions for a
+                            # tokenization session.
+                            #
+                            # This relay reads exactly two keys and, with
+                            # ENABLE_REALTIME_CHAT_SAVE OFF, REPLACES the chunk
+                            # with `update` before emitting -- so logprobs
+                            # survive today only by accident of configuration.
+                            # Captured here, re-attached below, and deliberately
+                            # NEVER added to `update`: `update` is what gets
+                            # persisted, and the treasuremap estimates order 1 MB
+                            # of JSON per 1000-token reply against a chat blob
+                            # that is loaded whole (models/chats.py).
+                            #
+                            # Guarded with a broad except rather than trusting
+                            # the shape: a malformed logprobs payload must not
+                            # break the rest of the message (R2-AC6).
+                            logprobs_payload = None
+                            if metadata.get("logprobs_settings"):
+                                try:
+                                    logprobs_payload = data.get("choices", [])[0].get("logprobs")
+                                except Exception:
+                                    logprobs_payload = None
 
                             if reasoning_value:
                                 reasoning = f"{reasoning}{reasoning_value}"
@@ -1898,7 +2220,15 @@ async def process_chat_response(request, response, form_data, user, events, meta
                                         update,
                                     )
                                 else:
+                                    # The OFF path replaces the chunk with the
+                                    # accumulated update, which is where the
+                                    # distributions were being lost. Re-attach
+                                    # to the EMITTED payload only -- `update`
+                                    # itself, already persisted above in the ON
+                                    # path, stays free of them.
                                     data = update
+                                    if logprobs_payload is not None:
+                                        data = {**update, "logprobs": logprobs_payload}
 
                         await event_emitter(
                             {
@@ -1973,6 +2303,33 @@ async def process_chat_response(request, response, form_data, user, events, meta
 
         # background_tasks.add_task(post_response_handler, response, events)
         task_id, _ = create_task(post_response_handler(response, events))
+
+        # Make Stop a real e-stop for locally-served models (self.ai#39).
+        #
+        # Only llamolotl exposes an explicit cancel; external gateways
+        # (GO.*/ZEN.* via the OpenAI surface, anthropic) have no equivalent, so no
+        # hook is registered for them and they keep the connection-drop behaviour
+        # that is all their APIs offer anyway.
+        model_id = form_data.get("model")
+        model = (request.app.state.MODELS or {}).get(model_id) or {}
+
+        if model.get("owned_by") == "llamolotl":
+            # Imported here rather than at module scope: routers/ imports utils/,
+            # so pulling a router in at import time is the direction that risks a
+            # cycle. This runs per-response, well after startup.
+            from selfai_ui.routers.llamolotl import cancel_chat_completion
+
+            async def _cancel_upstream():
+                completion_id = upstream_completion.get("id")
+                if not completion_id:
+                    # Stop pressed before the backend emitted its first chunk.
+                    # There is no id to cancel by; dropping the connection is the
+                    # only lever, and it is the one we already pull.
+                    return
+                await cancel_chat_completion(request, completion_id, model_id)
+
+            register_cancel_hook(task_id, _cancel_upstream)
+
         return {"status": True, "task_id": task_id}
 
     else:

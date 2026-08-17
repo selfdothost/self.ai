@@ -74,18 +74,45 @@ async def _poll_consumer(consumer_id, source, registry) -> None:
     defensive and return ``None`` rather than raising; a raise is still isolated to
     this consumer by the surrounding ``gather(return_exceptions=True)`` (R6-AC1).
 
-    Prefers the source's ``read_state`` (one GET, both figures); a source exposing
-    only ``read_held_bytes`` (a pre-R4 fake) is handled back-compat, held only."""
+    A third figure rides along since self.ai#74: ``device_used``/``device_total``,
+    the CARD-level occupancy, relayed via ``record_device_occupancy`` — a separate
+    writer that never touches ``held_bytes``, because card-used is a different
+    quantity from any one consumer's held and must never be summed with it. It is
+    what lets ``free_capacity()`` account for CUDA contexts and non-consumer
+    processes that no consumer can report as its own.
+
+    Prefers ``read_full`` (one GET, every figure), then ``read_state`` (held +
+    loaded model), then bare ``read_held_bytes``. The chain is walked with
+    ``getattr`` rather than assumed so pre-existing fakes — and any consumer
+    source that has not learned the newer fields — keep working untouched; each
+    older shape simply contributes fewer figures."""
+    read_full = getattr(source, "read_full", None)
     read_state = getattr(source, "read_state", None)
-    if read_state is not None:
-        held, loaded_model = await read_state(consumer_id)
+    if read_full is not None:
+        held, loaded_model, device_used, device_total = await read_full(consumer_id)
+    elif read_state is not None:
+        (held, loaded_model), device_used, device_total = (
+            await read_state(consumer_id),
+            None,
+            None,
+        )
     else:
-        held, loaded_model = await source.read_held_bytes(consumer_id), None
+        held, loaded_model, device_used, device_total = (
+            await source.read_held_bytes(consumer_id),
+            None,
+            None,
+            None,
+        )
 
     if held is not None:
         registry.heartbeat(consumer_id, held)
     if loaded_model is not None:
         registry.record_loaded_model(consumer_id, loaded_model)
+    if device_used is not None:
+        # Ordered AFTER the heartbeat on purpose: record_device_occupancy derives
+        # the unattributed-overhead term from the ledger's total held AT THIS
+        # INSTANT, so it must see this cycle's held, not the previous one's.
+        registry.record_device_occupancy(consumer_id, device_used, device_total)
 
 
 async def _poll_once(state_sources, registry=VramLeases) -> None:

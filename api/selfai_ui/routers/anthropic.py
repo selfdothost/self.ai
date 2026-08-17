@@ -25,6 +25,7 @@ from selfai_ui.env import (
 from selfai_ui.models.models import Models
 from selfai_ui.utils.access_control import has_access
 from selfai_ui.utils.auth import get_admin_user, get_verified_user
+from selfai_ui.utils.model_context import upstream_context_fields
 from selfai_ui.utils.payload import (
     apply_model_params_to_body_openai,
     apply_model_system_prompt_to_body,
@@ -317,6 +318,11 @@ async def get_all_models(request: Request):
                         "max_input_tokens": model.get("max_input_tokens"),
                         "supports_adaptive_thinking": _supports_adaptive_thinking(model),
                     },
+                    # Only what the upstream listing actually reported. Reads the
+                    # raw max_tokens, not the DEFAULT_MAX_TOKENS fallback above:
+                    # that fallback is what we send when the model list is silent,
+                    # not a limit the model published (self.ai#87).
+                    **upstream_context_fields(model, {"max_output_tokens": model.get("max_tokens")}),
                 }
             )
 

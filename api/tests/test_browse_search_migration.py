@@ -128,6 +128,37 @@ def test_no_search_results_short_circuits_before_any_fetch():
 
 
 @pytest.mark.tier0
+def test_all_fetches_failing_is_distinct_from_no_search_results():
+    # Stage 1 (the search engine) returned links, but every stage-2 page
+    # fetch fails (bot-protection, 5xx — general-search does not retry). The
+    # tool must report this as its OWN failure, not collapse it into the
+    # stage-1 "no search results" message: otherwise "search found nothing"
+    # and "search found links but none were readable" are indistinguishable
+    # to both the user and the model. Regression guard for the SF-events
+    # diagnosis (chat 7352e218).
+    request = _fake_request()
+    user = SimpleNamespace(id="u1", role="admin")  # DB-free admin bypass, see note above
+
+    links = [_search_result("https://a.example/1"), _search_result("https://b.example/2")]
+    with (
+        patch("selfai_ui.utils.middleware.search_web", return_value=links),
+        patch(
+            "selfai_ui.utils.middleware.browse_fetch",
+            new=AsyncMock(return_value=BrowseFetchResult(success=False, error="HTTP 500")),
+        ) as mock_browse_fetch,
+    ):
+        result = asyncio.run(run_web_search_tool_call(request, "query", _extra_params(), user))
+
+    # It DID attempt to read the found links...
+    assert mock_browse_fetch.call_count == len(links)
+    # ...so it must not claim the search returned nothing...
+    assert "no search results" not in result.lower()
+    # ...and it must report the read failure, naming how many links it found.
+    assert "2" in result
+    assert "no page content" in result.lower()
+
+
+@pytest.mark.tier0
 def test_denied_user_never_reaches_search_or_fetch():
     # Mocking has_browsing_access directly (rather than routing a non-admin
     # user through the real, DB-backed has_permission chain) tests exactly
@@ -257,7 +288,7 @@ def test_general_search_profile_does_not_retry_extensively():
 
 
 @pytest.mark.tier0
-def test_all_urls_failing_reports_no_results_not_a_hard_error():
+def test_all_urls_failing_reports_a_read_failure_not_a_hard_error():
     request = _fake_request()
     user = SimpleNamespace(id="u1", role="admin")
     search_results = [_search_result("https://bad.example/a")]
@@ -271,7 +302,12 @@ def test_all_urls_failing_reports_no_results_not_a_hard_error():
     ):
         result = asyncio.run(run_web_search_tool_call(request, "query", _extra_params(), user))
 
-    assert "no search results" in result.lower()
+    # Graceful string, never a raised/hard error. And it's the page-read
+    # failure, kept distinct from the stage-1 "no search results" case (the
+    # engine DID return a link here) — see
+    # test_all_fetches_failing_is_distinct_from_no_search_results.
+    assert "no search results" not in result.lower()
+    assert "no page content" in result.lower()
 
 
 # --- R4: own content extraction (formal close-out) --------------------------

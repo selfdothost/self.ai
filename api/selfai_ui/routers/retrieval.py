@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -22,6 +23,7 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter, TokenTextSpl
 from langchain_core.documents import Document
 from pydantic import BaseModel
 
+from selfai_ui.browse.connection import browse_fetch
 from selfai_ui.browse.profiles import resolve_profile
 from selfai_ui.browse.robots import RobotsCache
 from selfai_ui.config import (
@@ -771,8 +773,10 @@ def save_docs_to_vector_db(
         for doc in docs
     ]
 
-    # ChromaDB does not like datetime formats
-    # for meta-data so convert them to string.
+    # Metadata is stored as JSON by every backend, and datetime is not JSON
+    # serializable -- stringify before it reaches the store. (Inherited as a
+    # ChromaDB-specific workaround; it is a general requirement, not one
+    # backend's quirk, so it outlived chroma.)
     for metadata in metadatas:
         for key, value in metadata.items():
             if isinstance(value, datetime):
@@ -1734,6 +1738,105 @@ def process_web_search(request: Request, form_data: SearchForm, user=Depends(get
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=ERROR_MESSAGES.DEFAULT(e),
         )
+
+
+# A fixed probe string — never user or model input — so this endpoint is safe
+# to expose behind an admin button. It only exercises the same read-only
+# search/fetch path the tool uses; it embeds and stores nothing.
+WEB_SEARCH_TEST_QUERY = "self.ai web search connection test"
+
+
+@router.post("/process/web/search/test")
+async def test_web_search_connection(request: Request, user=Depends(get_admin_user)):
+    """Probe the in-chat web_search pipeline end to end and report each stage
+    separately, so a failure names the stage that caused it.
+
+    The tool is two-stage: SearXNG (or whichever RAG_WEB_SEARCH_ENGINE is
+    configured) returns links, then each link is fetched through the core
+    Playwright connection. A green search stage with a red fetch stage is
+    exactly the "search.home returns results but chat says none found"
+    signature, and this surfaces that split instead of collapsing it into one
+    opaque "No search results found".
+
+    For searxng we additionally report `unresponsive_engines` — the common
+    real-world cause of an empty result set (upstream engines rate-limited or
+    CAPTCHA'd) that `search_web` otherwise discards.
+    """
+    engine = request.app.state.config.RAG_WEB_SEARCH_ENGINE
+
+    search_stage = {
+        "ok": False,
+        "engine": engine,
+        "count": 0,
+        "samples": [],
+        "unresponsive_engines": [],
+        "error": None,
+    }
+    fetch_stage = {
+        "attempted": False,
+        "ok": False,
+        "url": None,
+        "content_chars": 0,
+        "error": None,
+    }
+
+    # ── Stage 1: search ──────────────────────────────────────────────────
+    # search_web is synchronous (blocking HTTP), so run it off the event loop.
+    results = []
+    try:
+        loop = asyncio.get_running_loop()
+        with ThreadPoolExecutor() as executor:
+            results = await loop.run_in_executor(
+                executor, lambda: search_web(request, engine, WEB_SEARCH_TEST_QUERY)
+            )
+        search_stage["count"] = len(results)
+        search_stage["ok"] = len(results) > 0
+        search_stage["samples"] = [{"title": r.title, "link": r.link} for r in results[:3]]
+    except Exception as e:
+        log.exception(e)
+        search_stage["error"] = str(e)
+
+    # Engine health for searxng: search_searxng returns only the result list,
+    # dropping the `unresponsive_engines` diagnostic. Re-query the JSON API
+    # directly for it — best-effort, never fatal to the probe.
+    if engine == "searxng" and request.app.state.config.SEARXNG_QUERY_URL:
+        try:
+            import requests
+
+            query_url = request.app.state.config.SEARXNG_QUERY_URL.split("?")[0]
+            resp = requests.get(
+                query_url,
+                params={"q": WEB_SEARCH_TEST_QUERY, "format": "json"},
+                headers={"User-Agent": "Self.AI UI RAG Bot"},
+                timeout=15,
+            )
+            if resp.ok:
+                search_stage["unresponsive_engines"] = [
+                    {"engine": entry[0], "reason": entry[1]}
+                    for entry in resp.json().get("unresponsive_engines", [])
+                    if entry
+                ]
+        except Exception as e:
+            log.debug(f"web search test: unresponsive-engines probe failed: {e}")
+
+    # ── Stage 2: fetch ───────────────────────────────────────────────────
+    # Fetch the top result through the same Playwright path the tool uses.
+    if results:
+        fetch_stage["attempted"] = True
+        sample_url = results[0].link
+        fetch_stage["url"] = sample_url
+        try:
+            fetch_result = await browse_fetch(request, sample_url, resolve_profile("general-search"))
+            fetch_stage["ok"] = fetch_result.success
+            if fetch_result.success:
+                fetch_stage["content_chars"] = len(fetch_result.content or "")
+            else:
+                fetch_stage["error"] = fetch_result.error
+        except Exception as e:
+            log.exception(e)
+            fetch_stage["error"] = str(e)
+
+    return {"query": WEB_SEARCH_TEST_QUERY, "search": search_stage, "fetch": fetch_stage}
 
 
 class QueryDocForm(BaseModel):

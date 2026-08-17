@@ -143,7 +143,12 @@ def test_released_status_maps_to_confirmed_with_new_held(monkeypatch):
     assert len(client.posted) == 1
     call = client.posted[0]
     assert call["url"] == f"http://self-llamolotl:8093{RELEASE_PATH}"
-    assert call["json"] == {"target_bytes": 4 * GiB, "timeout_seconds": 1.0}
+    # Default (cooperative) release carries force=False explicitly.
+    assert call["json"] == {
+        "target_bytes": 4 * GiB,
+        "timeout_seconds": 1.0,
+        "force": False,
+    }
     # Ticket minted for the llamolotl audience with system:write.
     assert minted == [("self.llamolotl", RELEASE_SCOPE)]
 

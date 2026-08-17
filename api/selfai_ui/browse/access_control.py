@@ -17,7 +17,7 @@ BROWSING_PERMISSION_KEY = "features.web_browsing"
 def has_browsing_access(user, user_permissions: dict) -> bool:
     """R1: per-user/role gate. Admins always pass; other roles are gated by
     the standard USER_PERMISSIONS tree, same shape as every other
-    workspace/chat permission check in this codebase."""
+    studio/chat permission check in this codebase."""
     if user.role == "admin":
         return True
     return has_permission(user.id, BROWSING_PERMISSION_KEY, user_permissions)

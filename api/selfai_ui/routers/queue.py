@@ -9,6 +9,7 @@ from selfai_ui.env import SRC_LOG_LEVELS
 from selfai_ui.internal.db import get_db
 from selfai_ui.models.curator_jobs import CuratorJob, CuratorJobModel, CuratorJobs
 from selfai_ui.models.eval_jobs import EvalJob, EvalJobModel, EvalJobs
+from selfai_ui.models.model_versions import PublishJob, PublishJobModel, PublishJobs
 from selfai_ui.models.training import TrainingJob, TrainingJobModel, TrainingJobs
 from selfai_ui.utils.auth import get_admin_user
 
@@ -18,7 +19,7 @@ log.setLevel(SRC_LOG_LEVELS.get("MAIN", logging.INFO))
 router = APIRouter()
 
 ACTIVE_STATUSES = ("pending", "queued", "running", "paused")
-JOB_TYPES = ("training", "language-eval", "code-eval", "curator")
+JOB_TYPES = ("training", "language-eval", "code-eval", "curator", "publish")
 
 
 class QueueItem(BaseModel):
@@ -30,6 +31,13 @@ class QueueItem(BaseModel):
     # type-specific label fields
     label: str  # human-readable description
     model_id: Optional[str] = None
+    # Why a job is sitting where it is (self.ai#88). A curator job that cannot
+    # get the GPU stays `queued` with the broker's refusal recorded here — who
+    # was holding the card and what they said — so the Queue Monitor shows a
+    # reason instead of a row that never moves. Carries whatever a job type puts
+    # in `error_message`, which for a non-terminal status is a status detail
+    # rather than a failure.
+    status_detail: Optional[str] = None
 
 
 def _training_to_item(job: TrainingJobModel) -> QueueItem:
@@ -41,6 +49,7 @@ def _training_to_item(job: TrainingJobModel) -> QueueItem:
         created_at=job.created_at,
         label=f"Course {job.course_id}",
         model_id=job.model_id,
+        status_detail=job.error_message,
     )
 
 
@@ -53,6 +62,7 @@ def _eval_to_item(job: EvalJobModel) -> QueueItem:
         created_at=job.created_at,
         label=job.benchmark,
         model_id=job.model_id,
+        status_detail=getattr(job, "error_message", None),
     )
 
 
@@ -65,6 +75,23 @@ def _curator_to_item(job: CuratorJobModel) -> QueueItem:
         created_at=job.created_at,
         label=f"Pipeline {job.pipeline_id}",
         model_id=None,
+        status_detail=job.error_message,
+    )
+
+
+def _publish_to_item(job: PublishJobModel) -> QueueItem:
+    return QueueItem(
+        id=job.id,
+        job_type="publish",
+        priority=job.priority,
+        status=job.status,
+        created_at=job.created_at,
+        label=f"Publish {job.output_name or job.line_id}",
+        model_id=None,
+        # A queued publish carries the broker's refusal in meta, not in
+        # error_message: it has not failed, it is waiting, and those are
+        # different problems with different fixes (self.ai#136 R3).
+        status_detail=job.error_message or (job.meta or {}).get("waiting_reason"),
     )
 
 
@@ -84,6 +111,9 @@ async def get_queue(user=Depends(get_admin_user)):
             for job in db.query(CuratorJob).filter_by(status=status).all():
                 items.append(_curator_to_item(CuratorJobModel.model_validate(job)))
 
+            for job in db.query(PublishJob).filter_by(status=status).all():
+                items.append(_publish_to_item(PublishJobModel.model_validate(job)))
+
     items.sort(key=lambda x: x.created_at)
     return items
 
@@ -99,6 +129,9 @@ def _get_job_and_table(job_type: str, job_id: str):
     elif job_type == "curator":
         job = CuratorJobs.get_job_by_id(job_id)
         return job, CuratorJobs
+    elif job_type == "publish":
+        job = PublishJobs.get_job_by_id(job_id)
+        return job, PublishJobs
     else:
         raise HTTPException(
             status_code=400,
@@ -115,6 +148,8 @@ def _update_priority(job_type: str, job_id: str, priority: str):
             db.query(EvalJob).filter_by(id=job_id).update({"priority": priority, "updated_at": int(time.time())})
         elif job_type == "curator":
             db.query(CuratorJob).filter_by(id=job_id).update({"priority": priority, "updated_at": int(time.time())})
+        elif job_type == "publish":
+            db.query(PublishJob).filter_by(id=job_id).update({"priority": priority, "updated_at": int(time.time())})
         db.commit()
 
 
@@ -132,6 +167,8 @@ def _update_status_and_priority(job_type: str, job_id: str, priority: str, statu
             db.query(EvalJob).filter_by(id=job_id).update(fields)
         elif job_type == "curator":
             db.query(CuratorJob).filter_by(id=job_id).update(fields)
+        elif job_type == "publish":
+            db.query(PublishJob).filter_by(id=job_id).update(fields)
         db.commit()
 
 

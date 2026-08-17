@@ -321,3 +321,286 @@ async def convert_streaming_response_anthropic_to_openai(anthropic_streaming_res
                 yield f"data: {json.dumps(final)}\n\n"
 
     yield "data: [DONE]\n\n"
+
+
+##########################################
+#
+# OpenAI -> Anthropic (INBOUND: we are the provider)
+#
+# The mirror of the two converters above. Those normalize an Anthropic upstream
+# into the OpenAI shape everything internal expects; these take the OpenAI shape
+# our own chat pipeline produces and re-emit it as the Anthropic Messages
+# response an Anthropic-native client is waiting for.
+#
+##########################################
+
+# OpenAI finish_reason -> Anthropic stop_reason. Inverse of ANTHROPIC_STOP_REASON_MAP,
+# which is many-to-one, so this cannot be derived from it: "stop" maps back to
+# "end_turn" (the common case) and "stop_sequence" is unrecoverable from here.
+OPENAI_FINISH_REASON_MAP = {
+    "stop": "end_turn",
+    "length": "max_tokens",
+    "tool_calls": "tool_use",
+    "function_call": "tool_use",
+    "content_filter": "refusal",
+}
+
+
+def _anthropic_message_id(openai_id) -> str:
+    """Anthropic message ids are `msg_`-prefixed; some SDKs assert on that."""
+    if isinstance(openai_id, str) and openai_id.startswith("msg_"):
+        return openai_id
+    return f"msg_{uuid.uuid4().hex}"
+
+
+def _openai_usage_to_anthropic(usage: dict) -> dict:
+    converted = {
+        "input_tokens": usage.get("prompt_tokens", 0) or 0,
+        "output_tokens": usage.get("completion_tokens", 0) or 0,
+    }
+    for field in ("cache_creation_input_tokens", "cache_read_input_tokens"):
+        if field in usage:
+            converted[field] = usage[field]
+    return converted
+
+
+def _anthropic_tool_input(arguments) -> dict:
+    """Tool arguments arrive as a JSON *string* on OpenAI and a JSON *object* on Anthropic."""
+    if isinstance(arguments, dict):
+        return arguments
+    if not arguments:
+        return {}
+    try:
+        parsed = json.loads(arguments)
+    except json.JSONDecodeError:
+        log.warning(f"Unparseable tool_call arguments; sending empty input: {str(arguments)[:200]}")
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def convert_response_openai_to_anthropic(openai_response: dict, model: str | None = None) -> dict:
+    """Convert a non-streaming OpenAI chat.completion to an Anthropic Messages response.
+
+    `model` overrides the id echoed back to the client. The pipeline may rewrite
+    `model` internally (a base-model id, a provider prefix), and an Anthropic client
+    that asked for one model and is told it got another will often reject the reply.
+    """
+    choice = (openai_response.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+
+    content: list[dict] = []
+    if text := message.get("content"):
+        content.append({"type": "text", "text": text})
+
+    for call in message.get("tool_calls") or []:
+        function = call.get("function") or {}
+        content.append(
+            {
+                "type": "tool_use",
+                "id": call.get("id") or f"toolu_{uuid.uuid4().hex}",
+                "name": function.get("name"),
+                "input": _anthropic_tool_input(function.get("arguments")),
+            }
+        )
+
+    if not content:
+        # A message with no content blocks at all is not something Anthropic ever
+        # returns, and SDKs index content[0] freely. An empty text block is the
+        # faithful representation of "the model said nothing".
+        content.append({"type": "text", "text": ""})
+
+    response = {
+        "id": _anthropic_message_id(openai_response.get("id")),
+        "type": "message",
+        "role": "assistant",
+        "model": model or openai_response.get("model"),
+        "content": content,
+        "stop_reason": OPENAI_FINISH_REASON_MAP.get(choice.get("finish_reason"), "end_turn"),
+        "stop_sequence": None,
+        "usage": _openai_usage_to_anthropic(openai_response.get("usage") or {}),
+    }
+    return response
+
+
+def _sse(event_type: str, data: dict) -> str:
+    """Anthropic frames carry both an `event:` name and the typed `data:` payload.
+
+    Our own reader switches on data.type and ignores the event name, but the
+    official SDKs dispatch on `event:` -- omitting it is what makes a stream that
+    looks correct in curl fail inside a real client.
+    """
+    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+
+
+async def convert_streaming_response_openai_to_anthropic(openai_streaming_response, model: str | None = None):
+    """
+    Re-emit an OpenAI chat.completion.chunk stream as Anthropic Messages SSE.
+
+    The two formats disagree about where structure lives. OpenAI sends a flat
+    sequence of deltas and lets the client work out which content is which;
+    Anthropic brackets every run of content in an explicit block:
+
+        message_start
+          content_block_start(index=0, text) / content_block_delta(text_delta) / content_block_stop
+          content_block_start(index=1, tool_use) / content_block_delta(input_json_delta) / content_block_stop
+        message_delta(stop_reason, usage)
+        message_stop
+
+    So this is not a per-chunk mapping -- it is a state machine that opens a block
+    on the first delta of a kind, and closes it when the kind changes or the stream
+    ends. Exactly one block is open at a time, which is what lets a single
+    `next_index` counter serve both text and tool blocks.
+
+    `reasoning_content` is dropped rather than re-emitted as a `thinking` block: a
+    real thinking block carries a `signature` that only the originating model can
+    produce, and the SDKs reject an unsigned one when it is replayed.
+    """
+    message_id = f"msg_{uuid.uuid4().hex}"
+    stream_model = model or "self-ai"
+
+    started = False
+    next_index = 0
+    open_block: str | None = None  # "text" | "tool_use"
+    # OpenAI tool_calls index -> the Anthropic content-block index it was opened at.
+    tool_block_index: dict[int, int] = {}
+    stop_reason = "end_turn"
+    usage: dict = {}
+
+    def start_message() -> str:
+        return _sse(
+            "message_start",
+            {
+                "type": "message_start",
+                "message": {
+                    "id": message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": stream_model,
+                    "content": [],
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    # Real input_tokens only arrive with the final usage block, if at
+                    # all. Zero is the honest placeholder; the message_delta below
+                    # carries the real numbers.
+                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                },
+            },
+        )
+
+    def close_block(index: int) -> str:
+        return _sse("content_block_stop", {"type": "content_block_stop", "index": index})
+
+    buffer = ""
+    async for raw in openai_streaming_response.body_iterator:
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        buffer += raw
+
+        while "\n" in buffer:
+            line, buffer = buffer.split("\n", 1)
+            line = line.strip()
+
+            if not line or not line.startswith("data:"):
+                continue
+
+            payload = line.removeprefix("data:").strip()
+            if not payload or payload == "[DONE]":
+                continue
+
+            try:
+                chunk = json.loads(payload)
+            except json.JSONDecodeError:
+                log.warning(f"Skipping unparseable OpenAI SSE payload: {payload[:200]}")
+                continue
+
+            if model is None and (chunk_model := chunk.get("model")):
+                stream_model = chunk_model
+
+            if chunk_usage := chunk.get("usage"):
+                usage.update(chunk_usage)
+
+            choice = (chunk.get("choices") or [{}])[0]
+            delta = choice.get("delta") or {}
+
+            if not started:
+                started = True
+                yield start_message()
+
+            if text := delta.get("content"):
+                if open_block == "tool_use":
+                    yield close_block(next_index - 1)
+                    open_block = None
+                if open_block is None:
+                    yield _sse(
+                        "content_block_start",
+                        {
+                            "type": "content_block_start",
+                            "index": next_index,
+                            "content_block": {"type": "text", "text": ""},
+                        },
+                    )
+                    open_block = "text"
+                    next_index += 1
+                yield _sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": next_index - 1,
+                        "delta": {"type": "text_delta", "text": text},
+                    },
+                )
+
+            for call in delta.get("tool_calls") or []:
+                call_index = call.get("index", 0)
+                function = call.get("function") or {}
+
+                if call_index not in tool_block_index:
+                    if open_block is not None:
+                        yield close_block(next_index - 1)
+                    yield _sse(
+                        "content_block_start",
+                        {
+                            "type": "content_block_start",
+                            "index": next_index,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": call.get("id") or f"toolu_{uuid.uuid4().hex}",
+                                "name": function.get("name"),
+                                "input": {},
+                            },
+                        },
+                    )
+                    tool_block_index[call_index] = next_index
+                    open_block = "tool_use"
+                    next_index += 1
+
+                if arguments := function.get("arguments"):
+                    yield _sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": tool_block_index[call_index],
+                            "delta": {"type": "input_json_delta", "partial_json": arguments},
+                        },
+                    )
+
+            if finish_reason := choice.get("finish_reason"):
+                stop_reason = OPENAI_FINISH_REASON_MAP.get(finish_reason, "end_turn")
+
+    # A stream that produced nothing at all still owes the client a well-formed
+    # message rather than an empty body -- an SDK waiting on message_start hangs.
+    if not started:
+        yield start_message()
+
+    if open_block is not None:
+        yield close_block(next_index - 1)
+
+    yield _sse(
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+            "usage": _openai_usage_to_anthropic(usage),
+        },
+    )
+    yield _sse("message_stop", {"type": "message_stop"})

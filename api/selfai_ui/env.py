@@ -273,6 +273,54 @@ if FROM_INIT_PY:
     DATA_DIR = Path(os.getenv("DATA_DIR", SELFAI_UI_DIR / "data"))
 
 
+# Create DATA_DIR, and prove it is writable, before anything tries to use it
+# (self.ai#120).
+#
+# Without this, pointing DATA_DIR at a path that does not exist fails several
+# frames from the cause: DATABASE_URL defaults to sqlite under DATA_DIR, sqlite
+# will not create a missing parent, and the operator sees
+# `sqlite3.OperationalError: unable to open database file` wrapped in a
+# MigrationError. Nothing in that stack says DATA_DIR, so it reads as a
+# permissions fault. The default /app/backend/data ships in the image, so this
+# stays invisible until someone follows the advice we give for the combined
+# image -- mount a volume, point DATA_DIR at it -- which is the on-ramp new
+# users take.
+#
+# DELIBERATELY placed here rather than at the DATA_DIR assignment above, which
+# is where it looks like it belongs. The FROM_INIT_PY block migrates the old
+# package-relative data directory only `if DATA_DIR.exists()`; creating the
+# directory before it would make that branch fire on every CLI run, archive an
+# empty directory to selfai_ui_data.zip and delete it. By this point
+# FROM_INIT_PY has already created NEW_DATA_DIR and repointed DATA_DIR at it,
+# so the mkdir below is a no-op on that path.
+try:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+except OSError as e:
+    raise RuntimeError(
+        f"DATA_DIR could not be created: {DATA_DIR} ({e.strerror}). "
+        "self.ai stores uploads, caches and -- unless DATABASE_URL points "
+        "elsewhere -- its SQLite database here. Set DATA_DIR to a writable "
+        "path, or mount a writable volume at this one."
+    ) from e
+
+# os.access() is not enough: it consults the real uid and lies under a
+# read-only mount or when running as root over a read-only filesystem. Actually
+# writing is the only answer that matches what the app will do a moment later.
+_probe = DATA_DIR / ".selfai-write-probe"
+try:
+    _probe.touch()
+    _probe.unlink()
+except OSError as e:
+    raise RuntimeError(
+        f"DATA_DIR exists but is not writable: {DATA_DIR} ({e.strerror}). "
+        "self.ai stores uploads, caches and -- unless DATABASE_URL points "
+        "elsewhere -- its SQLite database here. A non-root or read-only-rootfs "
+        "deployment needs a writable volume mounted at DATA_DIR."
+    ) from e
+finally:
+    del _probe
+
+
 STATIC_DIR = Path(os.getenv("STATIC_DIR", SELFAI_UI_DIR / "static"))
 
 FONTS_DIR = Path(os.getenv("FONTS_DIR", SELFAI_UI_DIR / "static" / "fonts"))
@@ -419,6 +467,43 @@ SERVICE_AUTH_ISSUER = os.environ.get("SERVICE_AUTH_ISSUER", "self.ai")
 # ticket-granting service and, for the broker, a ticket-consuming callee.
 SERVICE_AUTH_AUDIENCE = os.environ.get("SERVICE_AUTH_AUDIENCE", "self.ai")
 
+# --- MCP front door: who may register a backend, and where it may point ---
+# self.ai#25. Registration decides where /mcp/{name} points, and the proxy
+# forwards the caller's OWN backend credential there (a GitLab PAT, an IPA
+# password). So whoever controls a name can harvest the credentials of everyone
+# who uses it, and both of these are security controls rather than convenience
+# config.
+#
+# MCP_REGISTRARS: comma-separated self.ai user ids and/or emails allowed to
+# register. Empty (the default) means registration is CLOSED — the API returns
+# 403 for everyone, and the front door behaves exactly as it did in phase 1 with
+# only the GitOps entries in MCP_PROXY_BACKENDS serving. Fail-closed is the right
+# default for a surface that can redirect other people's credentials.
+#
+# Deliberately not a service ticket: self.ai#79 established that
+# require_service_ticket proves possession of one shared SERVICE_AUTH_SECRET and
+# nothing more (`iss` is unpinned), so every mesh service can act as every other.
+# A user id is a real identity, revocable by rotating one API key.
+MCP_REGISTRARS = {
+    entry.strip()
+    for entry in os.environ.get("MCP_REGISTRARS", "").split(",")
+    if entry.strip()
+}
+
+# MCP_REGISTRY_ALLOWED_NAMESPACES: the k8s namespaces a registered backend URL
+# may live in. This is the control that survives a leaked registrar credential —
+# a stolen key still cannot point a backend at an attacker-controlled host
+# off-cluster, so credentials can only ever be forwarded somewhere the platform
+# already governs. Defaults to the two namespaces the front door exists to
+# serve: our own, and the crew's MCP servers.
+MCP_REGISTRY_ALLOWED_NAMESPACES = {
+    entry.strip()
+    for entry in os.environ.get(
+        "MCP_REGISTRY_ALLOWED_NAMESPACES", "self-ai,crew-system"
+    ).split(",")
+    if entry.strip()
+}
+
 # --- GPU VRAM lease broker: config-driven self.llamolotl registration (R4) ---
 # self.llamolotl is the single known VRAM consumer this phase registers at
 # startup (cavekit-gpu-lease-broker R4/AC1 — manual/config-driven is acceptable
@@ -466,6 +551,55 @@ SKETCH_VRAM_CAPACITY_BYTES = os.environ.get("SKETCH_VRAM_CAPACITY_BYTES", "")
 # below llamolotl's 10) so image generation — the most interruptible, bursty
 # workload — yields VRAM before both audio and the inference brain.
 SKETCH_VRAM_LEASE_PRIORITY = int(os.environ.get("SKETCH_VRAM_LEASE_PRIORITY", "0"))
+
+# --- GPU VRAM lease broker: config-driven self.curator registration ---
+# self.curator (NeMo Curator data curation) is the broker's FOURTH config-driven
+# VRAM consumer (self.ai#88; same shape as the sketch block above). It was the
+# last GPU pod on the shared 4090 that the broker could not see — an invisible
+# holder core would over-grant against. Same discipline: raw string parsed
+# defensively at use, unset "" means "unconfigured" → startup skips the
+# registration and logs it rather than crashing.
+CURATOR_VRAM_CAPACITY_BYTES = os.environ.get("CURATOR_VRAM_CAPACITY_BYTES", "")
+# Reclamation priority for self.curator's lease (lower = asked to release
+# first). Integer, defaults to 0; the manifest supplies 8 — below llamolotl's 10
+# so curation never pre-empts the inference brain, above self.speak (5) and
+# self.sketch (3) so a curator window can actually clear voices and image
+# generation off the card, which is what makes the window's promise real.
+CURATOR_VRAM_LEASE_PRIORITY = int(os.environ.get("CURATOR_VRAM_LEASE_PRIORITY", "0"))
+# Force-reap pod identity for self.curator (R5 opt-in, same contract as the
+# llamolotl block above): both blank = registered but never force-reap eligible.
+CURATOR_K8S_NAMESPACE = os.environ.get("CURATOR_K8S_NAMESPACE", "")
+CURATOR_K8S_POD_SELECTOR = os.environ.get("CURATOR_K8S_POD_SELECTOR", "")
+
+# A PUBLISH (self.ai#136) is the broker's FIFTH config-driven consumer, and the
+# odd one out: the VRAM is not held by a pod of its own. A publish merges
+# adapters into a base through self.llamolotl's pipeline, which loads the base
+# at fp16 with device_map="auto" (api/merge_lora.py:51-52), so the hold lands
+# in a pipeline SUBPROCESS inside the llamolotl pod — not in llama-server, and
+# not anywhere the llamolotl row accounts for.
+#
+# It registers under its own consumer id precisely because of that: acquiring
+# as `self.llamolotl` would mark the serving process the exclusive holder while
+# the serving process is exactly what has to give its VRAM up first.
+#
+# Same discipline as the four blocks above: unset "" means unconfigured, so
+# startup skips the registration and logs it rather than crashing, and
+# gpu_queue._publish_is_lease_consumer() then reports False and publishes
+# dispatch without a lease exactly as they did before this existed.
+PUBLISH_VRAM_CAPACITY_BYTES = os.environ.get("PUBLISH_VRAM_CAPACITY_BYTES", "")
+# Reclamation priority for a publish (lower = asked to release first). Integer,
+# defaults to 0; the manifest supplies 8 — deliberately the SAME tier as
+# self.curator, because a publish is the same kind of act: a scheduled,
+# window-gated job that needs the whole card and must be able to clear
+# self.speak (5) and self.sketch (3) off it, while never casually pre-empting
+# the inference brain at llamolotl's 10. A publish and a curator run cannot
+# both hold the card regardless of this number: both take the card through
+# acquire_exclusive, and the first one holding it denies the second.
+PUBLISH_VRAM_LEASE_PRIORITY = int(os.environ.get("PUBLISH_VRAM_LEASE_PRIORITY", "0"))
+# No force-reap identity, deliberately: the merge runs inside self.llamolotl's
+# pod, so reaping "the publish" would mean killing llamolotl — which is
+# llamolotl's own row's business, under its own namespace/selector. A publish is
+# registered but never force-reap eligible.
 
 ENABLE_WEBSOCKET_SUPPORT = os.environ.get("ENABLE_WEBSOCKET_SUPPORT", "True").lower() == "true"
 

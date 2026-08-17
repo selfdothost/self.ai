@@ -72,12 +72,33 @@ The whole grant decision runs under one broker-wide grant lock so two concurrent
 requests can never both pass the free check and double-spend the same VRAM. The
 force-reap escalation runs under that same lock (never a nested per-consumer
 release lock), so it cannot deadlock and cannot race a concurrent grant.
+
+Where a reap target comes from (self.ai#75/#79)
+----------------------------------------------
+Force-reap deletes a pod, so WHERE it aims is a security decision, not a
+bookkeeping one. The target namespace/selector are read from a TRUSTED map
+installed at startup from core's own environment (``set_reap_targets``), NEVER
+from the consumer's registry row.
+
+The row still carries ``k8s_namespace``/``k8s_pod_selector`` for observability,
+but they are deliberately not authoritative: ``POST /vram-leases/register`` is
+gated on a service ticket minted from ONE shared mesh secret with no caller
+identity (#79), so any service that can register could otherwise re-register a
+consumer with a selector pointing at some OTHER pod in the namespace — the chat
+pod, or core itself — and then engineer a grant that deletes it. Namespaced RBAC
+bounds the blast radius to the tenant; it does not bound it to the right pod.
+Sourcing the target from env removes the redirect entirely.
+
+A consumer with no entry in the trusted map is simply never force-reap eligible
+(``ineligible-no-pod-identity``), which is the same R5-AC7 opt-in as before —
+only the source of the opt-in moved from a writable table to core's config.
 """
 
 import asyncio
 import enum
 import logging
 import os
+import time
 from typing import Optional, Protocol, Union, runtime_checkable
 
 from pydantic import BaseModel
@@ -99,6 +120,18 @@ log.setLevel(SRC_LOG_LEVELS.get("MAIN", logging.INFO))
 # urgent grant can pass a tighter bound; routine ones fall back to this.
 GRANT_RELEASE_TIMEOUT_SECONDS = float(
     os.environ.get("VRAM_GRANT_RELEASE_TIMEOUT_SECONDS", "30")
+)
+
+# Overall wall-clock bound on ONE grant decision (self.ai#80). The per-release
+# timeout above bounds each holder individually, which left the total unbounded:
+# (eligible holders + stale holders) x 30s, all of it under the broker-wide grant
+# lock, serialising every other grant and both exclusive operations. An HTTP
+# client that gives up does not cancel the handler, so the lock stayed held
+# regardless. 90s is ~3 holders at the default per-release bound — enough for a
+# real reclamation, short enough that a wedged consumer cannot stall the broker
+# for minutes.
+GRANT_TOTAL_TIMEOUT_SECONDS = float(
+    os.environ.get("VRAM_GRANT_TOTAL_TIMEOUT_SECONDS", "90")
 )
 
 
@@ -138,6 +171,30 @@ HOLDER_OUTCOME_REAPED = "reaped"
 HOLDER_OUTCOME_REAP_FAILED = "reap-failed"
 HOLDER_OUTCOME_INELIGIBLE_NO_POD_IDENTITY = "ineligible-no-pod-identity"
 
+# R5 eligibility (self.ai#105): a registered consumer from which no genuine
+# observation has EVER arrived. Distinct from `ineligible-no-pod-identity` (an
+# operator chose not to opt it in) and from an ordinary stale holder (it reported
+# healthily, then went quiet) — this one is a consumer core has never once heard
+# from, which is the signature of a deployment gap rather than a fault.
+HOLDER_OUTCOME_INELIGIBLE_NEVER_OBSERVED = "ineligible-never-observed"
+
+
+def _ever_observed(holder) -> bool:
+    """Whether a genuine consumer-originated observation has ever arrived for
+    this holder (self.ai#105).
+
+    ``last_reported_at`` cannot answer this: ``register()`` writes it, and
+    registration is core asserting a consumer exists from its own configuration,
+    not the consumer saying anything. So a consumer that is registered at boot and
+    never successfully polled becomes indistinguishable from one that reported
+    healthily and then died — both simply age past the staleness bound.
+
+    Force-reap DELETES A POD, so it must not act on that ambiguity. Only
+    ``last_observed_at`` (written by heartbeat / confirmed release, never by
+    registration or a core-side grant) proves the consumer was ever really there.
+    """
+    return getattr(holder, "last_observed_at", None) is not None
+
 
 class HolderAsked(BaseModel):
     """One holder's contribution to a denied grant: who was asked, how much was
@@ -148,6 +205,11 @@ class HolderAsked(BaseModel):
     actually_released: int = 0
     # confirmed | denied | timeout | ineligible-stale
     outcome: str
+    # The holder's own words for WHY, when it gave any (self.ai#88). A holder
+    # that can explain its refusal — "curation pipeline in progress, job X,
+    # running 400s" — turns an opaque denial into something an operator can act
+    # on. Informational only; nothing branches on it.
+    reason: Optional[str] = None
 
 
 class LeaseDenied(BaseModel):
@@ -223,10 +285,17 @@ class ReleaseResponse(BaseModel):
     after freeing, which may be more or less than the amount asked) and ignored
     otherwise. A transport signals a timeout either by returning
     ``outcome=TIMEOUT`` or simply by not returning within ``timeout_seconds``
-    (the broker's ``asyncio.wait_for`` converts the latter into the former)."""
+    (the broker's ``asyncio.wait_for`` converts the latter into the former).
+
+    ``reason`` is the consumer's own explanation, carried through to the
+    ``LeaseDenied`` breakdown so an operator reading a refused grant can see WHY
+    a holder would not yield — not just that it wouldn't (self.ai#88). Optional
+    and purely informational: no decision is made on its contents, and a
+    transport that has nothing to say leaves it ``None``."""
 
     outcome: ReleaseOutcome
     new_held_bytes: Optional[int] = None
+    reason: Optional[str] = None
 
 
 @runtime_checkable
@@ -246,9 +315,56 @@ class ReleaseTransport(Protocol):
     transport and refuses to invent a success (see ``request_release``)."""
 
     async def request_release(
-        self, consumer_id: str, amount_bytes: int, timeout_seconds: float
+        self,
+        consumer_id: str,
+        amount_bytes: int,
+        timeout_seconds: float,
+        force: bool = False,
     ) -> ReleaseResponse:
         ...
+
+
+class _Budget:
+    """Remaining wall-clock for one grant decision (self.ai#80).
+
+    Deliberately NOT an ``asyncio.wait_for`` around the whole decision: cancelling
+    mid-``request_release`` would abandon a consumer in the ``releasing`` state
+    with its true held unknown, which is exactly the ambiguity R2 works to avoid.
+    Instead the budget is *checked between* steps and *shrinks* each step's own
+    bound, so an in-flight release always runs to its own conclusion and the loop
+    simply stops starting new ones once the budget is spent. Running out is not an
+    error — it falls through to the same structured denial as any other
+    exhausted reclamation.
+    """
+
+    def __init__(self, total_seconds: float):
+        self._deadline = time.monotonic() + max(0.0, total_seconds)
+
+    def remaining(self) -> float:
+        return max(0.0, self._deadline - time.monotonic())
+
+    def spent(self) -> bool:
+        return self.remaining() <= 0
+
+    def bound(self, per_call_seconds: float) -> float:
+        """This step's timeout, never longer than what is left overall."""
+        return min(per_call_seconds, self.remaining())
+
+
+def _granted_effective_held(granted, amount_bytes: int) -> int:
+    """The requester's resulting total hold to report back on a grant.
+
+    Since self.ai#76 a grant lands in ``reserved_bytes`` rather than
+    ``held_bytes``, so the figure a caller cares about — "how much do I hold
+    now" — is the effective one: the larger of what the consumer last measured
+    and what core has just reserved for it. ``max`` not a sum, for the same
+    reason ``_effective_held`` uses it — the two describe the SAME VRAM at two
+    different moments, so adding them would double-count the grant the instant
+    the consumer began allocating it.
+    """
+    if granted is None:
+        return amount_bytes
+    return max(granted.held_bytes or 0, granted.reserved_bytes or 0)
 
 
 class VramBrokerImpl:
@@ -279,6 +395,12 @@ class VramBrokerImpl:
         # force-reap is opt-in at the broker level too, and an unconfigured
         # broker can never fabricate a reap success or block the grant.
         self._reaper = reaper
+        # TRUSTED reap targets: {consumer_id: (namespace, selector)}, installed at
+        # startup from core's own env (see set_reap_targets). Empty by default, so
+        # a broker whose targets were never installed reaps NOTHING even if a
+        # reaper is present — the safe direction (see #75/#79 in the module
+        # docstring).
+        self._reap_targets: dict[str, tuple[str, str]] = {}
         # Keyed per consumer_id. get-or-create below does no await between the
         # lookup and the insert, so it is atomic on the event loop — no extra
         # guard lock is needed (mirrors gpu_queue.py's single-loop async style).
@@ -300,10 +422,32 @@ class VramBrokerImpl:
         # a cross-process lock (e.g. the RedisLock gpu_queue.process_gpu_queue_v2
         # already uses) BEFORE going multi-replica.
         self._grant_lock = asyncio.Lock()
+        # {consumer_id: reason} from that consumer's most recent release answer
+        # (self.ai#88), so the HolderAsked breakdown can carry the holder's own
+        # words for why it would not yield. Written in _resolve_response and read
+        # immediately after the awaited request_release in the reclamation loops.
+        # Both loops run under _grant_lock, so only one is ever in flight per
+        # process and the read cannot be crossed by another loop's write.
+        self._last_release_reason: dict[str, Optional[str]] = {}
+
+    def last_release_reason(self, consumer_id: str) -> Optional[str]:
+        """The reason ``consumer_id`` gave for its most recent release answer, if
+        it gave one. Informational — nothing branches on it."""
+        return self._last_release_reason.get(consumer_id)
 
     def set_transport(self, transport: ReleaseTransport) -> None:
         """Install the outbound transport (T-016 wires the llamolotl client)."""
         self._transport = transport
+
+    def get_transport(self) -> Optional[ReleaseTransport]:
+        """The installed outbound transport (the consumer-aware dispatcher in
+        production), or ``None`` if none is wired. Used by the admin e-stop
+        (``routers/vram_leases.py`` ``/release-all``) to issue FORCEFUL releases
+        directly to each consumer's transport, deliberately bypassing the
+        cooperative ``request_lease`` priority/grant machinery. Never fabricates
+        a transport — a caller must handle ``None`` (no forceful release possible
+        this deployment) rather than inventing a success."""
+        return self._transport
 
     def set_reaper(self, reaper: PodReaper) -> None:
         """Install the force-reap capability (R5). Mirrors ``set_transport``:
@@ -312,12 +456,93 @@ class VramBrokerImpl:
         is skipped and the broker behaves exactly as before R5."""
         self._reaper = reaper
 
+    def set_reap_targets(self, targets: dict) -> None:
+        """Install the trusted ``{consumer_id: (namespace, selector)}`` map that
+        force-reap aims at (self.ai#75/#79).
+
+        Startup builds this from core's own environment. Entries with a blank
+        namespace or selector are dropped rather than stored half-formed: a
+        partial target is not something to aim a pod deletion with."""
+        clean = {}
+        for consumer_id, target in (targets or {}).items():
+            if not target:
+                continue
+            namespace, selector = target
+            namespace = (namespace or "").strip()
+            selector = (selector or "").strip()
+            if namespace and selector:
+                clean[consumer_id] = (namespace, selector)
+        self._reap_targets = clean
+        log.info(
+            "vram-reap: trusted reap targets installed for %s",
+            sorted(clean) or "no consumers (force-reap will reap nothing)",
+        )
+
+    def _reap_target_for(self, consumer_id: str):
+        """The trusted ``(namespace, selector)`` for ``consumer_id``, or ``None``
+        when it has no configured pod identity and is therefore never force-reap
+        eligible (R5-AC7). Deliberately does NOT consult the consumer's registry
+        row — see the module docstring."""
+        return self._reap_targets.get(consumer_id)
+
     def _lock_for(self, consumer_id: str) -> asyncio.Lock:
         lock = self._locks.get(consumer_id)
         if lock is None:
             lock = asyncio.Lock()
             self._locks[consumer_id] = lock
         return lock
+
+    def _commit_grant(
+        self,
+        consumer_id: str,
+        amount_bytes: int,
+        priority: int,
+        reclaimed: list,
+        freeable: int,
+        why: str,
+    ) -> LeaseResult:
+        """Write the grant and return the result — a DENIAL if the write did not
+        land (self.ai#77).
+
+        ``record_grant`` swallows DB exceptions and returns ``None`` (and also
+        returns ``None`` if the row vanished between this decision's
+        registration check and the write). Every success return here used to do
+        ``held_bytes=... if granted else amount_bytes``, so a failed registry
+        write still produced a ``LeaseGranted`` carrying a plausible-looking
+        figure for a hold that was never recorded. The consumer would then
+        allocate VRAM the registry does not know about — an untracked hold, which
+        is precisely the over-grant precursor this module refuses everywhere
+        else ("never a silent success", "never invents VRAM").
+
+        A denial here is honest and safe: nothing was written, so there is no
+        phantom hold to unwind, and the caller gets the same structured
+        ``LeaseDenied`` it already knows how to handle.
+        """
+        reg = self._registry
+        granted = reg.record_grant(consumer_id, amount_bytes, priority)
+        if granted is None:
+            log.error(
+                "vram-broker: record_grant FAILED for %r (%dB) — DENYING rather "
+                "than reporting a grant the registry never recorded (#77)",
+                consumer_id,
+                amount_bytes,
+            )
+            return LeaseDenied(
+                requested_bytes=amount_bytes,
+                free_bytes=reg.free_capacity(),
+                freeable_bytes=freeable,
+                holders_asked=reclaimed,
+            )
+        log.info(
+            "vram-broker: GRANT %dB to %r (%s)", amount_bytes, consumer_id, why
+        )
+        return LeaseGranted(
+            consumer_id=consumer_id,
+            granted_bytes=amount_bytes,
+            held_bytes=_granted_effective_held(granted, amount_bytes),
+            priority=priority,
+            reclaimed=reclaimed,
+        )
 
     async def request_release(
         self,
@@ -381,6 +606,9 @@ class VramBrokerImpl:
         (T-008). Confirmed writes the reported new held; denied leaves held
         unchanged; timeout marks stale. Denial and timeout are held strictly
         distinct and neither is ever recorded as freed."""
+        # Record whatever the consumer said about itself, before resolving the
+        # outcome — a reason is worth keeping on every path, not just denials.
+        self._last_release_reason[consumer_id] = resp.reason
         if resp.outcome == ReleaseOutcome.CONFIRMED:
             if resp.new_held_bytes is None:
                 # A confirmed release with no reported held is malformed — we
@@ -431,9 +659,17 @@ class VramBrokerImpl:
         fake). The whole decision runs under the broker-wide grant lock."""
         if release_timeout_seconds is None:
             release_timeout_seconds = GRANT_RELEASE_TIMEOUT_SECONDS
+        # #80: one overall bound for the whole decision, so the grant lock is
+        # never held for (holders x per-release timeout) minutes.
+        budget = _Budget(GRANT_TOTAL_TIMEOUT_SECONDS)
         async with self._grant_lock:
             return await self._decide_lease(
-                consumer_id, amount_bytes, priority, release_timeout_seconds, transport
+                consumer_id,
+                amount_bytes,
+                priority,
+                release_timeout_seconds,
+                transport,
+                budget,
             )
 
     async def _decide_lease(
@@ -443,8 +679,11 @@ class VramBrokerImpl:
         priority: int,
         release_timeout_seconds: float,
         transport: Optional[ReleaseTransport],
+        budget: Optional[_Budget] = None,
     ) -> LeaseResult:
         reg = self._registry
+        if budget is None:
+            budget = _Budget(GRANT_TOTAL_TIMEOUT_SECONDS)
 
         # The requester must be a registered consumer so its granted hold can be
         # tracked (R1 registration precedes an R3 lease request). A protocol
@@ -518,7 +757,15 @@ class VramBrokerImpl:
                 # #3 priority gate: only STRICTLY-lower-priority stale holders are
                 # reap-eligible, mirroring the cooperative `holders` gate above.
                 and h.priority < priority
-                and not (h.k8s_namespace is None and h.k8s_pod_selector is None)
+                # #75: eligibility follows the TRUSTED target map, not the
+                # consumer's (writable) registry row.
+                and self._reap_target_for(h.consumer_id) is not None
+                # #105: never-observed consumers are not reapable, so their held
+                # must not count toward `freeable` either — otherwise the grant
+                # passes the AC7 "can this ever be satisfied" check against
+                # capacity the escalation will then refuse to reclaim, and the
+                # request fails later and less legibly than an up-front denial.
+                and _ever_observed(h)
             )
         freeable = free + releasable + reapable
 
@@ -543,17 +790,13 @@ class VramBrokerImpl:
         # NO release-request issued at all. Record the hold BEFORE returning
         # success (R3-AC6).
         if free >= amount_bytes:
-            granted = reg.record_grant(consumer_id, amount_bytes, priority)
-            log.info(
-                f"vram-broker: GRANT {amount_bytes}B to {consumer_id!r} from free "
-                f"(free {free}, no reclamation)"
-            )
-            return LeaseGranted(
-                consumer_id=consumer_id,
-                granted_bytes=amount_bytes,
-                held_bytes=granted.held_bytes if granted else amount_bytes,
-                priority=priority,
-                reclaimed=[],
+            return self._commit_grant(
+                consumer_id,
+                amount_bytes,
+                priority,
+                [],
+                freeable,
+                f"from free (free {free}, no reclamation)",
             )
 
         # --- R3-AC3/AC4: free is short but free+releasable can cover it. Ask
@@ -568,13 +811,24 @@ class VramBrokerImpl:
         for holder in holders:
             if reg.free_capacity() >= amount_bytes:
                 break
+            # #80: stop starting new releases once the overall budget is spent.
+            # Not an error — it falls through to the structured denial below,
+            # with whatever WAS reclaimed already banked in the registry.
+            if budget.spent():
+                log.warning(
+                    "vram-broker: grant budget exhausted for %r after asking %d "
+                    "holder(s); denying rather than holding the grant lock longer",
+                    consumer_id,
+                    len(asked),
+                )
+                break
             shortfall = amount_bytes - reg.free_capacity()
             before = reg.get(holder.consumer_id)
             before_held = before.held_bytes if before else holder.held_bytes
             outcome = await self.request_release(
                 holder.consumer_id,
                 shortfall,
-                release_timeout_seconds,
+                budget.bound(release_timeout_seconds),
                 transport=transport,
             )
             after = reg.get(holder.consumer_id)
@@ -590,6 +844,7 @@ class VramBrokerImpl:
                     requested_release=shortfall,
                     actually_released=released,
                     outcome=outcome.value,
+                    reason=self.last_release_reason(holder.consumer_id),
                 )
             )
 
@@ -597,17 +852,13 @@ class VramBrokerImpl:
         # which reflects only confirmed releases — never a speculative grant.
         free_after = reg.free_capacity()
         if free_after >= amount_bytes:
-            granted = reg.record_grant(consumer_id, amount_bytes, priority)
-            log.info(
-                f"vram-broker: GRANT {amount_bytes}B to {consumer_id!r} after "
-                f"reclaiming from {len(asked)} holder(s) (free now {free_after})"
-            )
-            return LeaseGranted(
-                consumer_id=consumer_id,
-                granted_bytes=amount_bytes,
-                held_bytes=granted.held_bytes if granted else amount_bytes,
-                priority=priority,
-                reclaimed=asked,
+            return self._commit_grant(
+                consumer_id,
+                amount_bytes,
+                priority,
+                asked,
+                freeable,
+                f"after reclaiming from {len(asked)} holder(s) (free now {free_after})",
             )
 
         # --- R5 FORCE-REAP ESCALATION (AC1/AC2/AC5/AC6/AC7/AC8) ---------------
@@ -639,14 +890,56 @@ class VramBrokerImpl:
             ]:
                 if reg.free_capacity() >= amount_bytes:
                     break
+                # #80: the escalation shares the same overall budget as the
+                # cooperative loop that ran before it — a hung k8s API must not
+                # extend the grant lock past the bound either.
+                if budget.spent():
+                    log.warning(
+                        "vram-broker: grant budget exhausted for %r before "
+                        "force-reap could finish; denying",
+                        consumer_id,
+                    )
+                    break
                 shortfall = amount_bytes - reg.free_capacity()
-                namespace = holder.k8s_namespace
-                selector = holder.k8s_pod_selector
+
+                # #105: refuse to reap a consumer core has never once heard from.
+                # Checked BEFORE the target lookup so the reaper is not even
+                # consulted: a consumer whose endpoint has never answered is
+                # almost certainly not deployed yet, and deleting its pod turns a
+                # rollout-ordering gap into destroyed work.
+                if not _ever_observed(holder):
+                    log.warning(
+                        "vram-reap: %r is stale but has NEVER been observed "
+                        "(no heartbeat or confirmed release since registration) "
+                        "— refusing to force-reap a consumer that may simply not "
+                        "be deployed yet (self.ai#105)",
+                        holder.consumer_id,
+                    )
+                    asked.append(
+                        HolderAsked(
+                            consumer_id=holder.consumer_id,
+                            requested_release=shortfall,
+                            actually_released=0,
+                            outcome=HOLDER_OUTCOME_INELIGIBLE_NEVER_OBSERVED,
+                            reason=(
+                                "never observed since registration — core has "
+                                "had no heartbeat or confirmed release from this "
+                                "consumer, so its pod is not a safe reap target"
+                            ),
+                        )
+                    )
+                    continue
+
+                # #75/#79: the target comes from core's trusted, env-derived map
+                # — NEVER from holder.k8s_namespace / holder.k8s_pod_selector,
+                # which any mesh ticket can rewrite via /register and thereby aim
+                # a pod deletion at something else in the namespace.
+                target = self._reap_target_for(holder.consumer_id)
 
                 # AC7: no configured pod identity -> never eligible for
                 # force-reap. Record it distinguishably and move on; the reaper
                 # is never even called for this holder.
-                if namespace is None and selector is None:
+                if target is None:
                     log.info(
                         "vram-reap: %r is stale but has no configured pod "
                         "identity — ineligible for force-reap (AC7)",
@@ -667,8 +960,9 @@ class VramBrokerImpl:
                 # Bounded by the same release-timeout so a hung k8s API can never
                 # block the grant response indefinitely (AC6). Never raises — the
                 # reaper resolves every failure to a `failed` ReapOutcome.
+                namespace, selector = target
                 reap = await self._reaper.reap(
-                    namespace or "", selector or "", release_timeout_seconds
+                    namespace, selector, budget.bound(release_timeout_seconds)
                 )
                 if reap.status == ReapStatus.CONFIRMED:
                     # AC5: a CONFIRMED deletion clears held via the same
@@ -692,6 +986,7 @@ class VramBrokerImpl:
                             requested_release=shortfall,
                             actually_released=released,
                             outcome=HOLDER_OUTCOME_REAPED,
+                            reason=reap.reason,
                         )
                     )
                 else:
@@ -709,6 +1004,7 @@ class VramBrokerImpl:
                             requested_release=shortfall,
                             actually_released=0,
                             outcome=HOLDER_OUTCOME_REAP_FAILED,
+                            reason=reap.reason,
                         )
                     )
 
@@ -717,17 +1013,13 @@ class VramBrokerImpl:
             # reaps — the grant is never speculative.
             free_after = reg.free_capacity()
             if free_after >= amount_bytes:
-                granted = reg.record_grant(consumer_id, amount_bytes, priority)
-                log.info(
-                    f"vram-broker: GRANT {amount_bytes}B to {consumer_id!r} after "
-                    f"force-reap escalation (free now {free_after})"
-                )
-                return LeaseGranted(
-                    consumer_id=consumer_id,
-                    granted_bytes=amount_bytes,
-                    held_bytes=granted.held_bytes if granted else amount_bytes,
-                    priority=priority,
-                    reclaimed=asked,
+                return self._commit_grant(
+                    consumer_id,
+                    amount_bytes,
+                    priority,
+                    asked,
+                    freeable,
+                    f"after force-reap escalation (free now {free_after})",
                 )
 
         # --- R3-AC5 / R5-AC6: exhausted eligible holders (cooperative AND, when
@@ -780,6 +1072,11 @@ class VramBrokerImpl:
         else mid-acquire). Release with ``release_exclusive`` (T-004)."""
         if release_timeout_seconds is None:
             release_timeout_seconds = GRANT_RELEASE_TIMEOUT_SECONDS
+        # #80: an exclusive acquire holds the SAME broker-wide lock as a grant and
+        # walks every holder, so it needs the same overall bound. Running out
+        # simply means the card was not cleared -> the "confirmed or nothing" bar
+        # below already refuses to mark exclusive on a half-cleared card.
+        budget = _Budget(GRANT_TOTAL_TIMEOUT_SECONDS)
         async with self._grant_lock:
             reg = self._registry
             if reg.get(consumer_id) is None:
@@ -817,10 +1114,17 @@ class VramBrokerImpl:
                 before_held = before.held_bytes if before else holder.held_bytes
                 if before_held <= 0:
                     continue
+                if budget.spent():
+                    log.warning(
+                        "vram-broker: exclusive-acquire budget exhausted for %r; "
+                        "stopping (the card is not cleared, so exclusive is NOT set)",
+                        consumer_id,
+                    )
+                    break
                 outcome = await self.request_release(
                     holder.consumer_id,
                     before_held,
-                    release_timeout_seconds,
+                    budget.bound(release_timeout_seconds),
                     transport=transport,
                 )
                 after = reg.get(holder.consumer_id)
@@ -836,6 +1140,7 @@ class VramBrokerImpl:
                         requested_release=before_held,
                         actually_released=released,
                         outcome=outcome.value,
+                        reason=self.last_release_reason(holder.consumer_id),
                     )
                 )
 
@@ -849,9 +1154,26 @@ class VramBrokerImpl:
                     before_held = before.held_bytes if before else holder.held_bytes
                     if before_held <= 0:
                         continue
-                    namespace = holder.k8s_namespace
-                    selector = holder.k8s_pod_selector
-                    if namespace is None and selector is None:
+                    # #105: same never-observed refusal as the grant path.
+                    if not _ever_observed(holder):
+                        asked.append(
+                            HolderAsked(
+                                consumer_id=holder.consumer_id,
+                                requested_release=before_held,
+                                actually_released=0,
+                                outcome=HOLDER_OUTCOME_INELIGIBLE_NEVER_OBSERVED,
+                                reason=(
+                                    "never observed since registration — core has "
+                                    "had no heartbeat or confirmed release from "
+                                    "this consumer, so its pod is not a safe reap "
+                                    "target"
+                                ),
+                            )
+                        )
+                        continue
+                    # #75/#79: trusted map, not the writable registry row.
+                    target = self._reap_target_for(holder.consumer_id)
+                    if target is None:
                         asked.append(
                             HolderAsked(
                                 consumer_id=holder.consumer_id,
@@ -861,8 +1183,16 @@ class VramBrokerImpl:
                             )
                         )
                         continue
+                    if budget.spent():
+                        log.warning(
+                            "vram-broker: exclusive-acquire budget exhausted for "
+                            "%r during force-reap; stopping",
+                            consumer_id,
+                        )
+                        break
+                    namespace, selector = target
                     reap = await self._reaper.reap(
-                        namespace or "", selector or "", release_timeout_seconds
+                        namespace, selector, budget.bound(release_timeout_seconds)
                     )
                     if reap.status == ReapStatus.CONFIRMED:
                         reg.record_reaped_release(holder.consumer_id)
@@ -874,6 +1204,7 @@ class VramBrokerImpl:
                                 requested_release=before_held,
                                 actually_released=max(0, before_held - after_held),
                                 outcome=HOLDER_OUTCOME_REAPED,
+                                reason=reap.reason,
                             )
                         )
                     else:
@@ -883,6 +1214,7 @@ class VramBrokerImpl:
                                 requested_release=before_held,
                                 actually_released=0,
                                 outcome=HOLDER_OUTCOME_REAP_FAILED,
+                                reason=reap.reason,
                             )
                         )
 
