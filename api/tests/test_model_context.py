@@ -198,3 +198,46 @@ def test_inherited_fields_copy_only_real_values():
     }
     assert inherited_context_fields({"context_length": None}) == {}
     assert inherited_context_fields({}) == {}
+
+
+@pytest.mark.tier0
+def test_get_all_base_models_fans_out_providers_concurrently():
+    """All enabled backend fetches start concurrently, not sequentially.
+
+    Proven by an asyncio.Event gate: _fetch_openai suspends on the gate and
+    only unblocks once _fetch_ollama sets it.  With asyncio.gather both
+    coroutines interleave on the same event loop — Ollama runs while OpenAI
+    is suspended, sets the gate, and unblocks it.  With the old sequential
+    ``await`` path, OpenAI's suspension would be permanent (Ollama never
+    gets the event loop) and the call would raise TimeoutError, failing the
+    test with a clear signal rather than hanging.
+    """
+
+    async def run():
+        gate = asyncio.Event()
+        started: list = []
+
+        async def _openai_wait(request):
+            started.append("openai")
+            # Suspends until Ollama's coroutine releases the gate.  Sequential
+            # scheduling would leave this blocked forever → TimeoutError.
+            await asyncio.wait_for(gate.wait(), timeout=2.0)
+            return {"data": []}
+
+        async def _ollama_signal(request):
+            started.append("ollama")
+            gate.set()
+            return {"models": []}
+
+        with (
+            patch.object(models_util.openai, "get_all_models", _openai_wait),
+            patch.object(models_util.ollama, "get_all_models", _ollama_signal),
+            patch.object(models_util, "get_function_models", AsyncMock(return_value=[])),
+        ):
+            req = _request(ENABLE_OPENAI_API=True, ENABLE_OLLAMA_API=True)
+            await models_util.get_all_base_models(req)
+
+        assert "openai" in started
+        assert "ollama" in started
+
+    asyncio.run(run())

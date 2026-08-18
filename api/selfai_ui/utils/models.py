@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import sys
 import time
@@ -24,24 +25,35 @@ log.setLevel(SRC_LOG_LEVELS["MAIN"])
 
 
 async def get_all_base_models(request: Request):
-    function_models = []
-    openai_models = []
-    ollama_models = []
-    llamolotl_models = []
-    anthropic_models = []
+    """Fetch models from all enabled backends concurrently.
 
-    if request.app.state.config.ENABLE_OPENAI_API:
-        openai_models = await openai.get_all_models(request)
-        openai_models = openai_models["data"]
-        for model in openai_models:
+    The previous implementation awaited each backend sequentially
+    (openai → ollama → llamolotl → anthropic → functions). With several
+    external APIs enabled, total latency was the *sum* of each provider's
+    round-trip time — typically 6-12 s on a cold response, and a primary
+    contributor to the ~35-40 s blank spinner observed on /mods/crew first
+    load (self.ai#135).
+
+    asyncio.gather fires all enabled provider coroutines in parallel so the
+    wall-clock cost drops to max(individual) instead of sum(individual).
+    """
+
+    async def _noop() -> list:
+        return []
+
+    async def _fetch_openai() -> list:
+        result = await openai.get_all_models(request)
+        models = result["data"]
+        for model in models:
             # Gateways publish the served window under different names
             # (OpenRouter's context_length, vLLM's max_model_len); normalize the
             # unambiguous ones and leave the rest with no field (self.ai#87).
             model.update(upstream_context_fields(model, model.get("openai")))
+        return models
 
-    if request.app.state.config.ENABLE_OLLAMA_API:
-        ollama_models = await ollama.get_all_models(request)
-        ollama_models = [
+    async def _fetch_ollama() -> list:
+        result = await ollama.get_all_models(request)
+        return [
             {
                 "id": model["model"],
                 "name": model["name"],
@@ -51,12 +63,12 @@ async def get_all_base_models(request: Request):
                 "ollama": model,
                 **upstream_context_fields(model),
             }
-            for model in ollama_models["models"]
+            for model in result["models"]
         ]
 
-    if request.app.state.config.ENABLE_LLAMOLOTL_API:
-        llamolotl_result = await llamolotl.get_all_models(request)
-        llamolotl_models = [
+    async def _fetch_llamolotl() -> list:
+        result = await llamolotl.get_all_models(request)
+        return [
             {
                 "id": model["id"],
                 "name": model.get("name", model["id"]),
@@ -71,17 +83,25 @@ async def get_all_base_models(request: Request):
                 # below (self.ai#139).
                 **architecture_fields(model),
             }
-            for model in llamolotl_result.get("data", [])
+            for model in result.get("data", [])
         ]
 
-    if request.app.state.config.ENABLE_ANTHROPIC_API:
-        anthropic_result = await anthropic.get_all_models(request)
-        anthropic_models = anthropic_result.get("data", [])
+    async def _fetch_anthropic() -> list:
+        result = await anthropic.get_all_models(request)
+        return result.get("data", [])
 
-    function_models = await get_function_models(request)
-    models = function_models + openai_models + ollama_models + llamolotl_models + anthropic_models
-
-    return models
+    cfg = request.app.state.config
+    # Fan out all enabled backend fetches concurrently.  asyncio.gather
+    # preserves result order, so unpacking matches the insertion order
+    # below and the final list order is identical to the old serial path.
+    function_models, openai_models, ollama_models, llamolotl_models, anthropic_models = await asyncio.gather(
+        get_function_models(request),
+        _fetch_openai() if cfg.ENABLE_OPENAI_API else _noop(),
+        _fetch_ollama() if cfg.ENABLE_OLLAMA_API else _noop(),
+        _fetch_llamolotl() if cfg.ENABLE_LLAMOLOTL_API else _noop(),
+        _fetch_anthropic() if cfg.ENABLE_ANTHROPIC_API else _noop(),
+    )
+    return function_models + openai_models + ollama_models + llamolotl_models + anthropic_models
 
 
 async def get_all_models(request):
